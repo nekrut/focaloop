@@ -1,0 +1,82 @@
+# Dedicated Galaxy 25.0+ server for focaloop (garage: /media/anton/hd2/galaxy-focaloop, or cluster).
+# Installed by galaxy/setup_galaxy25.sh as $GALAXY_ROOT/config/galaxy.yml; __GALAXY_ROOT__ and
+# __FOCALOOP_REPO__ are substituted at install time.
+gravity:
+  process_manager: supervisor
+  galaxy_root: __GALAXY_ROOT__/server
+  virtualenv: __GALAXY_ROOT__/server/.venv
+  app_server: gunicorn
+  gunicorn:
+    bind: 0.0.0.0:8080
+    workers: 2
+    timeout: 300
+  handlers:
+    handler:
+      processes: 2
+      pools: [job-handlers, workflow-schedulers]
+
+galaxy:
+  brand: focaloop
+  database_connection: sqlite:///__GALAXY_ROOT__/data/universe.sqlite?isolation_level=IMMEDIATE
+  file_path: __GALAXY_ROOT__/data/objects
+  new_file_path: __GALAXY_ROOT__/data/tmp
+  job_working_directory: __GALAXY_ROOT__/data/jobs
+  tool_data_path: __GALAXY_ROOT__/data/tool-data
+  admin_users: anton@nekrut.org
+  allow_user_creation: true
+  id_secret: __ID_SECRET__
+
+  # ---- tools: ToolShed-style XML wrappers from this repository ----------------
+  tool_config_file: __GALAXY_ROOT__/config/focaloop_tool_conf.xml,__GALAXY_ROOT__/server/lib/galaxy/config/sample/tool_conf.xml.sample
+  # ---- unprivileged user-defined tools (class: GalaxyUserTool, Galaxy >= 25.0) --
+  # Lets users holding the "Custom Tool Execution" role create/run galaxy_udt.yml via
+  # POST /api/unprivileged_tools or Galaxy MCP create_user_tool / run_user_tool
+  # (role assignment: see README_galaxy25_deploy.md).
+  enable_beta_tool_formats: true
+
+  # ---- containers: every UDT and every focaloop XML tool runs in Apptainer ----
+  enable_mulled_containers: true
+  container_resolvers:
+    - type: explicit_singularity
+    - type: cached_mulled_singularity
+      cache_directory: __GALAXY_ROOT__/data/containers/singularity/mulled
+    - type: mulled_singularity
+      auto_install: true
+      cache_directory: __GALAXY_ROOT__/data/containers/singularity/mulled
+  conda_auto_init: false
+  conda_auto_install: false
+
+  job_config:
+    runners:
+      local:
+        load: galaxy.jobs.runners.local:LocalJobRunner
+        workers: 4
+    execution:
+      default: apptainer_local
+      environments:
+        apptainer_local:
+          runner: local
+          singularity_enabled: true
+          singularity_cmd: apptainer
+          # Host networking (Apptainer default) keeps outbound HTTPS open for
+          # INSDC Range requests: ENA 206 ranges, sra-pub-run-odp S3, remote CRAM.
+          singularity_volumes: $defaults
+          singularity_cleanenv: true
+          singularity_run_extra_arguments: --env FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints
+          require_container: true
+          env:
+            - name: GALAXY_SLOTS
+              value: "4"
+            - name: GALAXY_MEMORY_MB
+              value: "16384"
+    # No TPV here: every tool, including user-defined tools (tool_type_user_defined),
+    # lands in the default apptainer_local environment. If TPV is added later it must
+    # route tool_type_user_defined explicitly or UDT jobs get HTTP 403.
+    limits:
+      - type: registered_user_concurrent_jobs
+        value: 8
+
+  # Large focaloop state archives and FASTQ uploads
+  max_upload_size: 50000000000
+  cleanup_job: onsuccess
+  watch_tools: auto
