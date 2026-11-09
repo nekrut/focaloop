@@ -344,13 +344,26 @@ class FocaloopRun:
             cnt = probes.count([r for r, d in zip(block.reads, res.decoy) if not d])
             acc.alleles[part] = acc.alleles.get(part, np.zeros_like(cnt)) + cnt
 
+    def inference_partitions(self, has_discovery: bool) -> tuple[str, ...]:
+        """Partitions that adaptive decisions (stop gate, primary table) may read.
+
+        With a reusable holdout (``holdout_fraction > 0``) only ``discovery`` is used, so the holdout
+        stays conditionally independent of every adaptive choice until `focaloop query` (Dwork et al.
+        2015). Pooling happens only without a holdout or before any discovery data exists.
+        """
+        if self.bp.stop_gate.holdout_fraction > 0 and has_discovery:
+            return ("discovery",)
+        return ("discovery", "holdout")
+
     def _per_sample_frame(self, accs: dict[str, SampleAcc], target_ids: list[str], group_of: dict[str, str],
                           index: KmerIndex) -> pd.DataFrame:
         rows = []
+        parts = self.inference_partitions(any(a.unique["discovery"] or a.eq["discovery"] for a in accs.values()))
+        self.telemetry["gate_partitions"] = list(parts)
         for s, acc in accs.items():
             eff = {t: 0.0 for t in target_ids}
             var = {t: 0.0 for t in target_ids}
-            for part in ("discovery", "holdout"):
+            for part in parts:
                 uniq = {index.ids[t]: c[0] + c[1] for t, c in acc.unique[part].items()}
                 classes = [EqClass(k[0], k[1], k[2], v) for k, v in acc.eq[part].items()]
                 r = solve_em(target_ids, uniq, classes, None, self.bp.conditioner.dirichlet_alpha,
@@ -439,12 +452,17 @@ class FocaloopRun:
         write_json(store.dir / STATE_META, meta)
 
     def _write_table(self, store, sample_cond, contrast, lengths, probes) -> None:
-        acc = store.read("target_accumulators").to_pandas()
+        acc_all = store.read("target_accumulators").to_pandas()
+        disc = acc_all[acc_all["partition"] == "discovery"]
+        parts = self.inference_partitions(bool(disc["effective_count"].sum() > 0))
+        acc = acc_all[acc_all["partition"].isin(parts)]
+        self.telemetry["table_partitions"] = list(parts)
         if self.bp.modality == "variants":
             eff = acc.groupby(["sample", "group_id"], as_index=False)["effective_count"].sum()
-            glen = acc.groupby("group_id")["length_bp"].max().to_dict()
+            glen = acc_all.groupby("group_id")["length_bp"].max().to_dict()
             alleles = store.read("allele_counts").to_pandas() if store.exists("allele_counts") else \
                 pd.DataFrame(columns=ALLELE_COUNTS_SCHEMA.names)
+            alleles = alleles[alleles["partition"].isin(parts)]
             tbl = variant_table(alleles, eff, glen, self.bp.variants)
         else:
             tbl = contrast_table(acc, sample_cond, contrast) if contrast else pd.DataFrame()

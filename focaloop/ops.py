@@ -150,14 +150,19 @@ def run_steer(state_ref: str | Path, coords_bed: str | Path, out_bed: str | Path
     try:
         meta = _meta(state_dir)
         store = FocaloopStateStore(state_dir)
-        acc = store.read("target_accumulators").to_pandas()
+        acc_all = store.read("target_accumulators").to_pandas()
+        disc = acc_all[acc_all["partition"] == "discovery"]
+        holdout_fraction = float(meta.get("stop_gate", {}).get("holdout_fraction", 0.0))
+        # Steering is an adaptive decision: never let holdout counts influence it.
+        use_disc = holdout_fraction > 0 and not disc.empty and disc["effective_count"].sum() > 0
+        acc = disc if use_disc else acc_all
         thr = float(min_precision if min_precision is not None else meta["stop_gate"]["min_posterior_precision"])
         g = acc.groupby("group_id")[["effective_count", "assignment_variance"]].sum()
         tech = (g["assignment_variance"] + g["effective_count"]) / (g["effective_count"] + 0.5) ** 2
         precision = 1.0 / tech.clip(lower=1e-12)
         settled = set(precision[precision >= thr].index)
         seqs = {tid: seq for tid, seq, _ in read_fasta(state_dir / meta["targets_file"])}
-        group_targets: dict[str, list[str]] = acc.groupby("group_id")["target_id"].unique().apply(list).to_dict()
+        group_targets: dict[str, list[str]] = acc_all.groupby("group_id")["target_id"].unique().apply(list).to_dict()
         enrich = {t: seqs[t] for gid, ts in group_targets.items() if gid not in settled for t in ts if t in seqs}
         deplete = {t: seqs[t] for gid, ts in group_targets.items() if gid in settled for t in ts if t in seqs}
         mask = SteeringMask(enrich, deplete)
@@ -181,6 +186,7 @@ def run_steer(state_ref: str | Path, coords_bed: str | Path, out_bed: str | Path
             "n_enrich_targets": len(mask.enrich_targets), "n_deplete_targets": len(mask.deplete_targets),
             "n_enrich_kmers": int(mask.enrich_kmers.size), "n_deplete_kmers": int(mask.deplete_kmers.size),
             "min_posterior_precision": thr, "reason": reason, "new_bytes": 0,
+            "partitions": ["discovery"] if use_disc else ["discovery", "holdout"],
             "group_precision": {k: float(v) for k, v in precision.items()},
         }
         if out_telemetry:
