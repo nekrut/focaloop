@@ -11,6 +11,7 @@ dependencies:
   - pyarrow=18.1.0
   - scipy=1.14.1
   - pyyaml=6.0.2
+  - bwa=0.7.19          # classic bwa: bwa_spa kernel = bwa mem -S -P -a
   - bwa-mem2=2.2.1
   - strobealign=0.14.0
   - minimap2=2.28
@@ -21,3 +22,5 @@ dependencies:
   - bcftools=1.21
   - htslib=1.21
   - pip
+# xsra (Tier-2 SRA decoder, `xsra dump -Q -P https`) is not on bioconda; install with
+# `cargo install xsra` if wanted. Without it, accessions stream from ENA HTTPS 206.

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gzip
+import os
+import stat
 import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -18,8 +20,11 @@ from focaloop.streamer import (
     coalesce_residual_spans,
     ena_fastq_urls,
     is_holdout_block,
+    XsraSource,
     open_source,
     resolve_tiers,
+    s3_odp_url,
+    xsra_argv,
 )
 
 from .conftest import BLUEPRINTS
@@ -113,3 +118,57 @@ def test_residual_spans_coalesce_and_persist(tmp_path: Path) -> None:
                                     merge_gap_bytes=65536, store=store)
     assert [(s.byte_start, s.byte_end, s.n_reads) for s in spans] == [(0, 300, 2), (400_000, 400_100, 1)]
     assert store.read("residual_spans").num_rows == 2
+
+
+def _fake_xsra(bindir: Path, body: str) -> Path:
+    bindir.mkdir(parents=True, exist_ok=True)
+    exe = bindir / "xsra"
+    exe.write_text("#!/bin/sh\n" + body)
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+    return exe
+
+
+def test_tier2_odp_url_and_full_quality_argv() -> None:
+    assert s3_odp_url("SRR27592687") == "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR27592687/SRR27592687"
+    argv = xsra_argv("SRR27592687")
+    assert argv == ["xsra", "dump", "-Q", "-P", "https", "SRR27592687"]
+    assert "-Q" in argv  # full Illumina qualities, never SRA-lite '?'
+    with pytest.raises(ValueError):
+        s3_odp_url("not_a_run")
+
+
+def test_open_source_prefers_xsra_on_path(tmp_path: Path, monkeypatch) -> None:
+    fq = tmp_path / "plain.fastq"
+    fq.write_bytes(gzip.decompress(FQ.read_bytes()))
+    log = tmp_path / "argv.txt"
+    _fake_xsra(tmp_path / "bin", f'echo "$@" > {log}\ncat {fq}\n')
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    (src,) = open_source("SRR27592687")
+    assert isinstance(src, XsraSource) and src.tier == "s3_odp_spot"
+    rd = FastqBlockReader(src, "SRR27592687", block_bytes=4096, holdout_fraction=0.0)
+    n = sum(len(b.reads) for b in rd)
+    assert log.read_text().split() == ["dump", "-Q", "-P", "https", "SRR27592687"]
+    assert rd.exhausted and src.total_bytes == fq.stat().st_size == rd.consumed_bytes
+    ref = FastqBlockReader(LocalFileSource(fq), "x", block_bytes=4096, holdout_fraction=0.0)
+    assert n == sum(len(b.reads) for b in ref) > 0
+
+
+@pytest.mark.parametrize("body", [None, "echo 'error: lite-only object' >&2\nexit 3\n"])
+def test_open_source_falls_back_to_ena(tmp_path: Path, monkeypatch, body) -> None:
+    if body is None:
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))  # no xsra anywhere
+    else:
+        _fake_xsra(tmp_path / "bin", body)
+        monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    monkeypatch.setattr(HttpRangeSource, "_probe_size", lambda self: 1234)  # no network in tests
+    srcs = open_source("SRR123456")
+    assert [type(s) for s in srcs] == [HttpRangeSource]
+    assert srcs[0].tier == "ena_https_range" and srcs[0].url == ena_fastq_urls("SRR123456", "SE")[0]
+
+
+def test_xsra_truncated_stream_raises(tmp_path: Path, monkeypatch) -> None:
+    _fake_xsra(tmp_path / "bin", "printf '@r1\\nACGT\\n+\\nIIII\\n'\nexit 2\n")
+    src = XsraSource("SRR123456", str(tmp_path / "bin" / "xsra"))
+    rd = FastqBlockReader(src, "SRR123456", block_bytes=4096, holdout_fraction=0.0)
+    with pytest.raises(RuntimeError, match="rc=2"):
+        rd.next_block()

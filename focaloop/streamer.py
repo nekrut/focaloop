@@ -3,7 +3,10 @@
 Resolution order for a public run accession:
 
   Tier 1 ``cram_range``   remote CRAM/BAM over HTTP ``Range`` (when an aligned URL is known)
-  Tier 2 ``s3_odp_spot``  AWS ``sra-pub-run-odp`` SRA object, spot-aligned byte slices
+  Tier 2 ``s3_odp_spot``  AWS Open Data ``sra-pub-run-odp`` SRA object
+                          (``https://sra-pub-run-odp.s3.amazonaws.com/sra/<RUN>/<RUN>``), decoded by
+                          ``xsra dump -Q -P https <RUN>`` when ``xsra`` is on ``PATH``; ``-Q`` is mandatory
+                          so full Illumina qualities are kept instead of SRA-lite ``?`` placeholders
   Tier 3 ``ena_https_range``  ENA FASTQ (gzip) over HTTPS ``206 Partial Content``
 
 plus ``local_file`` for staged FASTQ / FASTQ.gz (the deterministic offline path
@@ -17,6 +20,8 @@ from __future__ import annotations
 
 import gzip
 import re
+import shutil
+import subprocess
 import urllib.request
 import zlib
 from dataclasses import dataclass, field
@@ -35,6 +40,9 @@ __all__ = [
     "FastqBlockReader",
     "resolve_tiers",
     "ena_fastq_urls",
+    "s3_odp_url",
+    "xsra_argv",
+    "XsraSource",
     "open_source",
     "coalesce_residual_spans",
     "is_holdout_block",
@@ -67,13 +75,25 @@ def ena_fastq_urls(acc: str, layout: str = "PE") -> list[str]:
     return [f"{base}/{acc}_1.fastq.gz", f"{base}/{acc}_2.fastq.gz"]
 
 
+def s3_odp_url(acc: str) -> str:
+    """AWS Open Data SRA object for a run: ``https://sra-pub-run-odp.s3.amazonaws.com/sra/<RUN>/<RUN>``."""
+    if not ACC_RE.match(acc):
+        raise ValueError(f"not an INSDC run accession: {acc!r}")
+    return f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}"
+
+
+def xsra_argv(acc: str, binary: str = "xsra") -> list[str]:
+    """``xsra dump -Q -P https <RUN>``: full-quality SRA only (never SRA-lite), HTTPS provider, FASTQ to stdout."""
+    return [binary, "dump", "-Q", "-P", "https", acc]
+
+
 def resolve_tiers(acc: str, layout: str = "PE", cram_url: str | None = None) -> list[TierPlan]:
     """Ordered tier plans for one run accession (first available tier wins at stream time)."""
     plans: list[TierPlan] = []
     if cram_url:
         plans.append(TierPlan("cram_range", acc, (cram_url,)))
     if ACC_RE.match(acc):
-        plans.append(TierPlan("s3_odp_spot", acc, (f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}",)))
+        plans.append(TierPlan("s3_odp_spot", acc, (s3_odp_url(acc),)))
         plans.append(TierPlan("ena_https_range", acc, tuple(ena_fastq_urls(acc, layout))))
     else:
         raise ValueError(f"cannot resolve {acc!r}: not an SRR/ERR/DRR accession")
@@ -150,12 +170,88 @@ class HttpRangeSource(ByteSource):
         raise RuntimeError(f"range fetch failed for {self.url}: {last}")
 
 
-def open_source(ref: str | Path, layout: str = "SE") -> list[ByteSource]:
-    """Local path -> LocalFileSource; http(s) URL -> HttpRangeSource; accession -> tier-3 ENA sources."""
+class XsraSource(ByteSource):
+    """Tier 2: sequential FASTQ stream from ``xsra dump -Q -P https <RUN>`` (AWS ODP / NCBI full-quality SRA).
+
+    Byte accounting counts decoded FASTQ bytes. Reads must be sequential; the total size is unknown until
+    ``xsra`` exits, so ``total_bytes`` is a sentinel until EOF and then equals the bytes streamed. The
+    constructor primes the first chunk and raises ``RuntimeError`` if ``xsra`` produces no FASTQ, so
+    :func:`open_source` can fall back to ENA HTTPS 206 cleanly.
+    """
+
+    tier = "s3_odp_spot"
+    UNKNOWN = 1 << 62
+
+    def __init__(self, acc: str, binary: str = "xsra", prime_bytes: int = 1 << 16) -> None:
+        self.acc = acc
+        self.url = s3_odp_url(acc)
+        self.argv = xsra_argv(acc, binary)
+        self.bytes_read = 0
+        self.total_bytes = self.UNKNOWN
+        self._pos = 0
+        self._buf = b""
+        self._proc = subprocess.Popen(self.argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._buf = self._pull(prime_bytes)
+        if not self._buf.startswith(b"@"):
+            err = self._finish()
+            raise RuntimeError(f"xsra produced no FASTQ for {acc} (rc={self._proc.returncode}): {err[-300:]!r}")
+
+    def _pull(self, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n and self._proc.stdout is not None:
+            chunk = self._proc.stdout.read(n - len(out))
+            if not chunk:
+                break
+            out += chunk
+        return bytes(out)
+
+    def _finish(self) -> bytes:
+        if self._proc.poll() is None:
+            self._proc.kill()
+        _, err = self._proc.communicate()
+        return err or b""
+
+    def read_range(self, start: int, end_exclusive: int) -> bytes:
+        if start != self._pos:
+            raise ValueError(f"XsraSource is sequential: asked for {start}, stream is at {self._pos}")
+        want = end_exclusive - start
+        data = self._buf[:want]
+        self._buf = self._buf[want:]
+        if len(data) < want:
+            data += self._pull(want - len(data))
+        if len(data) < want:  # EOF: the stream size is now known
+            err = self._finish()
+            if self._proc.returncode != 0:  # never pass a truncated run off as complete
+                raise RuntimeError(f"xsra dump exited rc={self._proc.returncode} for {self.acc} after "
+                                   f"{self._pos + len(data)} bytes: {err[-300:]!r}")
+            self.total_bytes = self._pos + len(data)
+        self._pos += len(data)
+        self.bytes_read += len(data)
+        return data
+
+    def close(self) -> None:
+        if self._proc.poll() is None:
+            self._finish()
+
+    def __del__(self) -> None:
+        proc = getattr(self, "_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+
+
+def open_source(ref: str | Path, layout: str = "SE", xsra: str | None = "xsra") -> list[ByteSource]:
+    """Local path -> LocalFileSource; http(s) URL -> HttpRangeSource; accession -> Tier 2 ``xsra`` when on
+    ``PATH`` (full qualities via ``-Q``), else / on failure Tier 3 ENA HTTPS 206 range sources."""
     s = str(ref)
     if s.startswith(("http://", "https://")):
         return [HttpRangeSource(s)]
     if ACC_RE.match(s):
+        binary = shutil.which(xsra) if xsra else None
+        if binary:
+            try:
+                return [XsraSource(s, binary)]
+            except (OSError, RuntimeError):
+                pass  # fall through to ENA
         plan = [p for p in resolve_tiers(s, layout) if p.tier == "ena_https_range"][0]
         return [HttpRangeSource(u, tier=plan.tier) for u in plan.urls]
     return [LocalFileSource(s)]

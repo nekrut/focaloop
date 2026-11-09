@@ -6,7 +6,7 @@ Builtin kernels are pure numpy and always available:
 * ``kmer_besthit`` the same index but reports one best target (ties broken by index),
                    the behaviour of pair-rescue aligners that silently collapse ties
 
-External aligners (``bwa-mem2``, ``strobealign``, ``minimap2``, ``bowtie2``,
+External aligners (``bwa_spa`` = ``bwa mem -S -P -a``, ``bwa-mem2``, ``strobealign``, ``minimap2``, ``bowtie2``,
 ``salmon``, ``piscem``) are registered by name; they report ``available() is False``
 unless an adapter and binary are present, and the tournament skips them.
 """
@@ -254,12 +254,19 @@ class ExternalKernel(Kernel):
 
 
 EXTERNAL_BINARIES = {
+    "bwa_spa": "bwa",
     "bwa-mem2": "bwa-mem2",
     "strobealign": "strobealign",
     "minimap2": "minimap2",
     "bowtie2": "bowtie2",
     "salmon": "salmon",
     "piscem": "piscem",
+}
+
+
+# Fixed argv prefixes for adapters whose name is not just the binary.
+EXTERNAL_ARGV = {
+    "bwa_spa": ("bwa", "mem", "-S", "-P", "-a"),  # skip mate rescue + pairing, report all alignments
 }
 
 

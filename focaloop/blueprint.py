@@ -23,6 +23,7 @@ KNOWN_KERNELS = (
     "kmer_eq",        # builtin tie-retaining canonical k-mer equivalence-class kernel
     "kmer_besthit",   # builtin best-hit kernel (breaks ties; tournament baseline)
     "kmer_bait",      # builtin Stage-0 bait screen
+    "bwa_spa",        # classic bwa, single-end + all hits: bwa mem -S -P -a (no pair rescue / tie collapse)
     "bwa-mem2",
     "strobealign",
     "minimap2",

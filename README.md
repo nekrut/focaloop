@@ -31,7 +31,7 @@ pip install .            # provides the `focaloop` entry point
 | `focaloop/state.py` | 9 Zstd-Parquet schemas + `FocaloopStateStore` |
 | `focaloop/hooks.py` | 5 capability hooks: `BaitPrefilter`, `EqClassBackendProtocol` + `HolobiontLocusRegistry`, `coalesce_residual_spans` + `apply_external_priors`, `SteeringMask`, `HypothesisLedger` |
 | `focaloop/blueprint.py` | typed blueprint model, `load_blueprint`, `validate_blueprint`, regime rules |
-| `focaloop/streamer.py` | 3-tier resolver (CRAM/BAM range → S3 `sra-pub-run-odp` → ENA HTTPS 206) + local files; byte-accounted blocks, discovery/holdout split |
+| `focaloop/streamer.py` | 3-tier resolver (CRAM/BAM range → AWS ODP `https://sra-pub-run-odp.s3.amazonaws.com/sra/<RUN>/<RUN>` via `xsra dump -Q -P https` when `xsra` is on `PATH` → ENA HTTPS 206 fallback) + local files; byte-accounted blocks, discovery/holdout split |
 | `focaloop/kernels.py`, `tournament.py` | k-mer kernels + external aligner registry; 25,000 real + 5 × 600 synthetic read tournament with the ≥ 0.80 mate-tie symmetry gate |
 | `focaloop/conditioner.py`, `stop_gate.py` | backward EM with external log-priors; stop gate and design checks |
 | `focaloop/engine.py`, `ops.py`, `cli.py` | `run`; `query`, `bait`, `steer`; CLI |

@@ -32,7 +32,7 @@ ENV FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints \
 # Smoke test at build time: CLI + every bundled blueprint + every aligner binary resolves.
 RUN focaloop --version \
     && focaloop validate panexpr malariavar focaloop_query focaloop_bait \
-    && bwa-mem2 version && strobealign --version && minimap2 --version && bowtie2 --version \
+    && (bwa 2>&1 | grep -q '^Version: 0.7') && bwa-mem2 version && strobealign --version && minimap2 --version && bowtie2 --version \
     && salmon --version && piscem --version && samtools --version && bcftools --version
 
 WORKDIR /data
