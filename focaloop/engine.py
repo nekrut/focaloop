@@ -118,6 +118,10 @@ class SampleAcc:
     total: int = 0
     mapped: int = 0
     decoy: int = 0
+    # discovery-only counters: the only read counts any runtime branch or trap may look at
+    disc_total: int = 0
+    disc_mapped: int = 0
+    disc_decoy: int = 0
 
 
 def load_targets(path: Path) -> list[TargetRec]:
@@ -233,6 +237,7 @@ class FocaloopRun:
         tcfg = bp.kernel_pool.tournament
         pending: dict[str, list[FastqBlock]] = {k_: [] for k_ in readers}
         real: list[str] = []
+        run_parts = self.inference_partitions()
         while len(real) < tcfg.real_reads:
             progressed = False
             for name, rd in readers.items():
@@ -241,7 +246,8 @@ class FocaloopRun:
                 b = rd.next_block()
                 if b is not None:
                     pending[name].append(b)
-                    real.extend(b.reads)
+                    if b.partition in run_parts:  # holdout reads never pick the kernel
+                        real.extend(b.reads)
                     progressed = True
             if not progressed:
                 break
@@ -270,6 +276,9 @@ class FocaloopRun:
         tel_rows: list[dict] = []
         iteration = 0
         map_trap = bp.trap("LOW_MAP_RATE")
+        map_thr = map_trap.threshold if map_trap.threshold is not None else 0.3
+        map_checked = False
+        map_rate = float("nan")
         decision = None
         while True:
             iteration += 1
@@ -286,9 +295,12 @@ class FocaloopRun:
             per_sample = self._per_sample_frame(accs, target_ids, group_of, index)
             decision = gate.evaluate(per_sample, sample_cond, iteration, cum, exhausted)
             tot = sum(a.total for a in accs.values())
-            mapped = sum(a.mapped for a in accs.values())
-            decoy = sum(a.decoy for a in accs.values())
-            map_rate = mapped / max(1, tot - decoy)
+            mapped = sum(a.mapped for a in accs.values())  # pooled counts: telemetry only
+            # LOW_MAP_RATE reads discovery counters only (holdout is write-only during `run`)
+            d_tot = sum(a.disc_total for a in accs.values())
+            d_den = d_tot - sum(a.disc_decoy for a in accs.values())
+            if d_den > 0:
+                map_rate = sum(a.disc_mapped for a in accs.values()) / d_den
             m = decision.metrics
             tel_rows.append({
                 "iteration": iteration, "modality": bp.modality, "stage": f"stream:{winner_name}",
@@ -300,11 +312,12 @@ class FocaloopRun:
             })
             self.telemetry["iterations"].append({**tel_rows[-1], "map_rate": map_rate,
                                                  "median_posterior_precision": m.median_posterior_precision})
-            if iteration == 1 or decision.stop:
-                thr = map_trap.threshold if map_trap.threshold is not None else 0.3
-                if tot > 0 and map_rate < thr:
+            if d_den > 0 and (not map_checked or decision.stop):
+                map_checked = True
+                if map_rate < map_thr:
                     self._persist(store, accs, tel_rows, targets, sample_cond, contrast, probes, index, readers)
-                    self._trap("LOW_MAP_RATE", f"map rate {map_rate:.3f} < {thr} after {tot} reads")
+                    self._trap("LOW_MAP_RATE", f"discovery map rate {map_rate:.3f} < {map_thr} after {d_tot} "
+                                               f"discovery reads")
             if decision.stop:
                 break
         for code in decision.traps:
@@ -314,6 +327,7 @@ class FocaloopRun:
         self.telemetry["consumed_bytes"] = {k_: r.consumed_bytes for k_, r in readers.items()}
         self.telemetry["total_consumed_bytes"] = sum(r.consumed_bytes for r in readers.values())
         self.telemetry["map_rate"] = map_rate
+        self.telemetry["map_rate_partitions"] = ["discovery"]
         self._persist(store, accs, tel_rows, targets, sample_cond, contrast, probes, index, readers)
         self._write_table(store, sample_cond, contrast, lengths, probes)
         if self.state_archive:
@@ -324,15 +338,19 @@ class FocaloopRun:
     def _ingest(self, acc: SampleAcc, block: FastqBlock, kernel, index: KmerIndex, probes) -> None:
         res = kernel.map_reads(block.reads)
         part = block.partition
+        disc = part == "discovery"
         acc.total += len(block.reads)
+        acc.disc_total += len(block.reads) if disc else 0
         for seq, cand, dec in zip(block.reads, res.candidates, res.decoy):
             if dec:
                 acc.decoy += 1
+                acc.disc_decoy += disc
                 continue
             if cand is None:
                 acc.residual.append((block.byte_start, block.byte_end, seq))
                 continue
             acc.mapped += 1
+            acc.disc_mapped += disc
             ts, lls, fs = cand
             if len(ts) == 1:
                 u = acc.unique[part].setdefault(ts[0], [0.0, 0.0])
@@ -344,21 +362,21 @@ class FocaloopRun:
             cnt = probes.count([r for r, d in zip(block.reads, res.decoy) if not d])
             acc.alleles[part] = acc.alleles.get(part, np.zeros_like(cnt)) + cnt
 
-    def inference_partitions(self, has_discovery: bool) -> tuple[str, ...]:
-        """Partitions that adaptive decisions (stop gate, primary table) may read.
+    def inference_partitions(self) -> tuple[str, ...]:
+        """Partitions that runtime decisions (tournament, LOW_MAP_RATE, stop gate, primary table) may read.
 
-        With a reusable holdout (``holdout_fraction > 0``) only ``discovery`` is used, so the holdout
-        stays conditionally independent of every adaptive choice until `focaloop query` (Dwork et al.
-        2015). Pooling happens only without a holdout or before any discovery data exists.
+        With a reusable holdout (``holdout_fraction > 0``) only ``discovery`` is used, so the holdout is
+        write-only during `focaloop run` and conditionally independent of every adaptive choice until
+        `focaloop query` (Dwork et al. 2015). Without a holdout every block is ``discovery`` anyway.
         """
-        if self.bp.stop_gate.holdout_fraction > 0 and has_discovery:
+        if self.bp.stop_gate.holdout_fraction > 0:
             return ("discovery",)
         return ("discovery", "holdout")
 
     def _per_sample_frame(self, accs: dict[str, SampleAcc], target_ids: list[str], group_of: dict[str, str],
                           index: KmerIndex) -> pd.DataFrame:
         rows = []
-        parts = self.inference_partitions(any(a.unique["discovery"] or a.eq["discovery"] for a in accs.values()))
+        parts = self.inference_partitions()
         self.telemetry["gate_partitions"] = list(parts)
         for s, acc in accs.items():
             eff = {t: 0.0 for t in target_ids}
@@ -453,8 +471,7 @@ class FocaloopRun:
 
     def _write_table(self, store, sample_cond, contrast, lengths, probes) -> None:
         acc_all = store.read("target_accumulators").to_pandas()
-        disc = acc_all[acc_all["partition"] == "discovery"]
-        parts = self.inference_partitions(bool(disc["effective_count"].sum() > 0))
+        parts = self.inference_partitions()
         acc = acc_all[acc_all["partition"].isin(parts)]
         self.telemetry["table_partitions"] = list(parts)
         if self.bp.modality == "variants":

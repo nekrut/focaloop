@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
@@ -13,6 +14,7 @@ from focaloop.archive import pack_state, unpack_state
 from focaloop.blueprint import load_blueprint
 from focaloop.engine import FocaloopRun, RunSpec
 from focaloop.ops import run_steer
+from focaloop.streamer import FastqBlockReader
 from focaloop.state import TARGET_ACCUMULATOR_SCHEMA, FocaloopStateStore
 from focaloop.variants import ALLELE_COUNTS_SCHEMA
 
@@ -77,10 +79,9 @@ def test_stop_gate_sees_only_discovery(tmp_path: Path, monkeypatch) -> None:
 def test_pooling_only_without_holdout(tmp_path: Path) -> None:
     run = FocaloopRun.__new__(FocaloopRun)
     run.bp = load_blueprint("panexpr")
-    assert run.inference_partitions(True) == ("discovery",)
-    assert run.inference_partitions(False) == ("discovery", "holdout")
-    run.bp = load_blueprint("focaloop_bait")  # holdout_fraction 0.0
-    assert run.inference_partitions(True) == ("discovery", "holdout")
+    assert run.inference_partitions() == ("discovery",)
+    run.bp = load_blueprint("focaloop_bait")  # holdout_fraction 0.0: every block is discovery
+    assert run.inference_partitions() == ("discovery", "holdout")
 
 
 def test_steer_ignores_holdout(panexpr_run, tmp_path: Path) -> None:
@@ -106,3 +107,38 @@ def test_unpack_state_caps_decompressed_size(tmp_path: Path) -> None:
     assert not (tmp_path / "out").exists()
     out = unpack_state(arc, tmp_path / "ok", max_bytes=1_000_000)
     assert (out / "big.bin").stat().st_size == 200_000
+
+
+def _junk_holdout(monkeypatch, copies: int = 40) -> set[str]:
+    """Replace every holdout block with `copies`x as many random (unmappable) reads."""
+    rng = np.random.default_rng(7)
+    made: set[str] = set()
+    orig = FastqBlockReader.next_block
+
+    def junk(self):
+        b = orig(self)
+        if b is not None and b.partition == "holdout" and b.reads:
+            n, ln = len(b.reads) * copies, len(b.reads[0])
+            b.reads = ["".join(rng.choice(list("ACGT"), ln)) for _ in range(n)]
+            made.update(b.reads)
+        return b
+
+    monkeypatch.setattr(FastqBlockReader, "next_block", junk)
+    return made
+
+
+def test_low_map_rate_ignores_unmapped_holdout(tmp_path: Path, monkeypatch) -> None:
+    junk = _junk_holdout(monkeypatch)
+    seen: list[str] = []
+    orig_t = eng.run_tournament
+    monkeypatch.setattr(eng, "run_tournament", lambda k, i, real, **kw: (seen.extend(real), orig_t(k, i, real, **kw))[1])
+    run = _run("panexpr", tmp_path)
+    tel = run.telemetry
+    thr = run.bp.trap("LOW_MAP_RATE").threshold
+    assert "LOW_MAP_RATE" not in tel["trap_codes"] and tel["status"] != "aborted"
+    assert tel["map_rate_partitions"] == ["discovery"] and tel["map_rate"] >= thr
+    # pooled (discovery + junk holdout) rate is far below the threshold: a pooled check would have aborted
+    for it in tel["iterations"]:
+        assert it["mapped_reads"] / it["total_reads"] < thr <= it["map_rate"]
+    # the tournament (kernel choice, TIE_SYMMETRY_FAIL) never saw a holdout read
+    assert junk and seen and not junk.intersection(seen)

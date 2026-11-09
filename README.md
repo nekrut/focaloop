@@ -56,7 +56,7 @@ pip install .            # provides the `focaloop` entry point
 
 | Code | Fires when | Default action |
 |------|-----------|----------------|
-| `LOW_MAP_RATE` | non-decoy map rate below threshold after the first iteration or at stop | abort |
+| `LOW_MAP_RATE` | discovery-partition non-decoy map rate below threshold (first iteration with discovery reads, and at stop); holdout reads never count | abort |
 | `TIE_SYMMETRY_FAIL` | every kernel keeps < 80% of strain/paralog ties while conditioning is active | abort |
 | `BYTE_CAP_UNCONVERGED` | byte budget hit before the stop gate converged | warn |
 | `CONFOUNDED_DESIGN` | contrast level missing, or condition perfectly confounded with batch | abort |
