@@ -7,7 +7,10 @@ gravity:
   virtualenv: __GALAXY_ROOT__/server/.venv
   app_server: gunicorn
   gunicorn:
-    bind: 0.0.0.0:8080
+    # Loopback only. Expose through a TLS reverse proxy (nginx: proxy_pass http://127.0.0.1:8080;
+    # see https://docs.galaxyproject.org/en/master/admin/nginx.html) or an SSH tunnel
+    # (ssh -L 8080:127.0.0.1:8080 garage). Binding 0.0.0.0 is an explicit, deliberate override.
+    bind: 127.0.0.1:8080
     workers: 2
     timeout: 300
   handlers:
@@ -23,13 +26,15 @@ galaxy:
   job_working_directory: __GALAXY_ROOT__/data/jobs
   tool_data_path: __GALAXY_ROOT__/data/tool-data
   admin_users: anton@nekrut.org
-  allow_user_creation: true
+  # Closed registration: the admin creates accounts (Admin -> Users -> Create), or bootstrap
+  # the first admin with GALAXY_CONFIG_OVERRIDE_ALLOW_USER_CREATION=true for one start only.
+  allow_user_creation: false
   id_secret: __ID_SECRET__
 
   # ---- tools: ToolShed-style XML wrappers from this repository ----------------
   tool_config_file: __GALAXY_ROOT__/config/focaloop_tool_conf.xml,__GALAXY_ROOT__/server/lib/galaxy/config/sample/tool_conf.xml.sample
   # ---- unprivileged user-defined tools (class: GalaxyUserTool, Galaxy >= 25.0) --
-  # Lets users holding the "Custom Tool Execution" role create/run galaxy_udt.yml via
+  # Lets users holding a role of type user_tool_execute create/run galaxy_udt.yml via
   # POST /api/unprivileged_tools or Galaxy MCP create_user_tool / run_user_tool
   # (role assignment: see README_galaxy25_deploy.md).
   enable_beta_tool_formats: true
@@ -71,7 +76,7 @@ galaxy:
               value: "16384"
     # No TPV here: every tool, including user-defined tools (tool_type_user_defined),
     # lands in the default apptainer_local environment. If TPV is added later it must
-    # route tool_type_user_defined explicitly or UDT jobs get HTTP 403.
+    # add tool_type_user_defined to the destination's scheduling.accept (TPV rejects it by default).
     limits:
       - type: registered_user_concurrent_jobs
         value: 8
