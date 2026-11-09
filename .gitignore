@@ -6,3 +6,5 @@ __pycache__/
 dist/
 build/
 .venv/
+uv.lock
+*.tar.zst.tmp

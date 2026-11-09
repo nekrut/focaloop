@@ -1,5 +1,7 @@
 """Shared 5-stage Focaloop core schemas and next-horizon capability hooks."""
 
+__version__ = "0.1.0"
+
 from .hooks import (
     BaitHitSummary,
     BaitPrefilter,
@@ -17,6 +19,7 @@ from .hooks import (
     is_holdout_block,
     sketch_residual_kmers,
 )
+from .blueprint import Blueprint, BlueprintError, load_blueprint, validate_blueprint
 from .state import (
     AMBIGUOUS_EQ_SCHEMA,
     BAIT_PREFILTER_SCHEMA,
@@ -31,6 +34,11 @@ from .state import (
 )
 
 __all__ = [
+    "Blueprint",
+    "BlueprintError",
+    "load_blueprint",
+    "validate_blueprint",
+    "__version__",
     "AMBIGUOUS_EQ_SCHEMA",
     "BAIT_PREFILTER_SCHEMA",
     "BaitHitSummary",
