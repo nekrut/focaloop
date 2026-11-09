@@ -106,6 +106,8 @@ def lint_user_tool(doc: Any) -> list[str]:
     cont = doc.get("container")
     if not isinstance(cont, str) or not cont.strip():
         errors.append("container must be a non-blank string (dynamic_tool.blank_container)")
+    elif cont.startswith(("docker://", "oras://", "library://")):
+        errors.append("container must be a bare image reference; explicit_singularity adds docker:// itself")
     elif cont.endswith(":latest") or ":" not in cont:
         errors.append("container must be pinned to a tag")
     cmd = doc.get("shell_command")
@@ -120,9 +122,15 @@ def lint_user_tool(doc: Any) -> list[str]:
         for ref in REF_RE.findall(txt):
             if ref not in names:
                 errors.append(f"dynamic_tool.undeclared_input_ref: inputs.{ref}")
+    for m in re.finditer(r"(?<!\\)\$\((?!\()([^)]*)", cmd):
+        body = m.group(1).strip()
+        if not re.match(r"^(inputs\b|JSON\.|[A-Za-z_][A-Za-z0-9_]*\()", body) or re.match(r"^(pwd|date|cat|echo|ls|basename|dirname|nproc|which)\b", body):
+            errors.append(f"bash command substitution $({body[:20]}...) in shell_command is parsed as a CWL JS "
+                          "expression (ReferenceError); use $PWD, shell variables or backticks")
     if "$(outputs." in cmd:
         errors.append("$(outputs.X) is not available in UDT templating")
-    if re.search(r"(?<![\\(])\$[A-Za-z_][A-Za-z0-9_]*\b", cmd.replace("$GALAXY_SLOTS", "").replace("$GALAXY_MEMORY_MB", "")):
+    # Cheetah params are lowercase ($threads); upper-case shell variables ($PWD, $GALAXY_SLOTS) are fine
+    if any(v != v.upper() for v in re.findall(r"(?<![\\(])\$([A-Za-z_][A-Za-z0-9_]*)\b", cmd)):
         errors.append("Cheetah-style $param reference in shell_command (use $(inputs.x))")
     if "#for" in cmd or "#if" in cmd:
         errors.append("Cheetah directives are not supported in shell_command")

@@ -40,7 +40,8 @@ blueprint reproduces the workflow's primary table on shared test data and all th
    Record the comparison in the blueprint `description`.
 10. **Package for Galaxy.**
     - `galaxy_udt.yml`: `class: GalaxyUserTool`, `shell_command` with `\` line continuations, quoted
-      `$(inputs.x)` text, every output claimed by `from_work_dir`, a real `help` object; validate with
+      `$(inputs.x)` text, no bash `$(cmd)` substitution (CWL parses it; use `$PWD`/backticks), a bare
+      `container:` without `docker://`, every output claimed by `from_work_dir`, a real `help` object; validate with
       the udt-authoring `scripts/validate.py` (or `focaloop.galaxy_lint.official_udt_errors`).
     - `galaxy_tool.xml`: `<requirements>`, `<command detect_errors="exit_code">`, inputs/outputs,
       `<tests>` with `expect_num_outputs` and assertions against `test-data/`, markdown `<help>`,

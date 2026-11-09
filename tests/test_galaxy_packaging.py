@@ -87,3 +87,15 @@ def test_blueprint_dir_is_complete(bid: str) -> None:
     for name in ("blueprint.focaloop.yml", "galaxy_udt.yml", "galaxy_tool.xml"):
         assert (d / name).is_file()
     assert any((d / "test-data").iterdir())
+
+
+def test_udt_linter_catches_live_galaxy_gotchas() -> None:
+    base = yaml.safe_load((BLUEPRINTS / "panexpr" / "galaxy_udt.yml").read_text())
+    assert lint_user_tool(base) == []
+    bad = dict(base, container="docker://ghcr.io/galaxyproject/focaloop:0.1.0")
+    assert any("explicit_singularity adds docker://" in e for e in lint_user_tool(bad))
+    for sub in ("$(pwd)", "$(date +%s)", "$(nproc)"):
+        bad = dict(base, shell_command="echo " + sub + " > log.txt && " + base["shell_command"])
+        assert any("bash command substitution" in e for e in lint_user_tool(bad)), sub
+    ok = dict(base, shell_command="echo \\$(date) `pwd` $PWD > log.txt && " + base["shell_command"])
+    assert lint_user_tool(ok) == []
