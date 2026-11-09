@@ -1,0 +1,2 @@
+group_id	target_id	sample	modality	log_prior_weight	confidence	source_uri
+g1	g1.strainB	*	wgs_copy_number	-2.0	0.9	synthetic:wgs

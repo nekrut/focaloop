@@ -1,0 +1,38 @@
+# Zero-byte warm-state follow-up query over a saved focaloop_state.
+id: focaloop_query
+name: Focaloop warm-state contrast and F_ST query
+version: "0.1.0"
+modality: query
+description: >-
+  Answers a follow-up contrast (log2 fold change per group) or spatiotemporal
+  Hudson F_ST question against a saved focaloop_state without streaming a single
+  new byte. Every query is estimated on the discovery partition, re-tested on the
+  reusable holdout, and charged against the HypothesisLedger alpha-wealth.
+container: ghcr.io/galaxyproject/focaloop:0.1.0
+regime_rules:
+  - name: fst_when_alleles
+    when: has_allele_counts == true
+    set: {mode: fst}
+  - name: contrast_default
+    when: always
+    set: {mode: contrast}
+kernel_pool:
+  kernels: []
+conditioner:
+  method: em
+  max_iter: 200
+  tol: 1.0e-6
+  dirichlet_alpha: 0.5
+  external_priors: true
+stop_gate:
+  max_bytes: 0
+  holdout_fraction: 0.25
+traps:
+  LOW_MAP_RATE: {action: warn}
+  TIE_SYMMETRY_FAIL: {action: warn, threshold: 0.80}
+  BYTE_CAP_UNCONVERGED: {action: warn}
+  CONFOUNDED_DESIGN: {action: abort}
+outputs:
+  - {name: query_table, kind: table, format: tabular}
+  - {name: verdict, kind: telemetry, format: json}
+  - {name: state, kind: state, format: tar.zst}

@@ -1,0 +1,78 @@
+<tool id="focaloop_bait" name="Focaloop Stage-0 31-mer bait scanner" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>screen the first bytes of many runs for a query locus</description>
+    <macros>
+        <token name="@TOOL_VERSION@">0.1.0</token>
+        <token name="@VERSION_SUFFIX@">0</token>
+        <token name="@PROFILE@">25.0</token>
+    </macros>
+    <requirements>
+        <requirement type="package" version="@TOOL_VERSION@">focaloop</requirement>
+        <container type="docker">ghcr.io/galaxyproject/focaloop:@TOOL_VERSION@</container>
+    </requirements>
+    <version_command>focaloop --version</version_command>
+    <command detect_errors="exit_code"><![CDATA[
+focaloop bait
+    --query-fasta '$query'
+    --inputs
+    #for $r in $reads
+        '$r'
+    #end for
+    --run-ids
+    #for $r in $reads
+        '$r.element_identifier'
+    #end for
+    --probe-bytes \$(( $probe_kb * 1024 ))
+    --min-hit-reads $min_hit_reads
+    --state-dir bait_state
+    --out-tsv '$bait_hits'
+    ]]></command>
+    <inputs>
+        <param name="query" type="data" format="fasta" label="Query locus (FASTA)"/>
+        <param name="reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" label="FASTQ datasets to screen"/>
+        <param name="probe_kb" type="integer" min="4" max="1048576" value="1024" label="Probe size per run (KiB of compressed input)"/>
+        <param name="min_hit_reads" type="integer" min="1" max="100000" value="2" label="Minimum hit reads for a run to pass"/>
+    </inputs>
+    <outputs>
+        <data name="bait_hits" format="tabular" label="${tool.name} on ${on_string}"/>
+    </outputs>
+    <tests>
+        <test expect_num_outputs="1">
+            <param name="query" value="query.fa"/>
+            <param name="reads" value="run_hit.fastq.gz,run_miss.fastq.gz" ftype="fastqsanger.gz"/>
+            <output name="bait_hits">
+                <assert_contents>
+                    <has_line_matching expression="pfk13_propeller\trun_hit.fastq.gz\tlocal_file\t.*\tTrue"/>
+                    <has_line_matching expression="pfk13_propeller\trun_miss.fastq.gz\tlocal_file\t.*\tFalse"/>
+                </assert_contents>
+            </output>
+        </test>
+        <test expect_num_outputs="1">
+            <param name="query" value="query.fa"/>
+            <param name="reads" value="run_weak.fastq" ftype="fastqsanger"/>
+            <param name="min_hit_reads" value="10"/>
+            <output name="bait_hits">
+                <assert_contents>
+                    <has_text text="False"/>
+                </assert_contents>
+            </output>
+        </test>
+    </tests>
+    <help format="markdown"><![CDATA[
+**What it does**
+
+Stage-0 pan-repository screen. Reads the first *probe size* KiB of every input, counts reads sharing at
+least two canonical 31-mers with the query, and reports the hit rate with a Wilson 95% lower bound. Runs
+that pass are worth a full focal loop; the rest are dropped after a few hundred KiB.
+
+-----
+
+**Output**
+
+One row per run: `run_id`, `stream_tier`, `probe_bytes`, `probe_reads`, `hit_reads`, `hit_rate`,
+`wilson_ci95_low`, `pass_gate` (passing runs first). For SRA/ENA accessions streamed over HTTPS range
+requests, use the user-defined tool variant.
+    ]]></help>
+    <citations>
+        <citation type="doi">10.1038/s41587-018-0010-1</citation>
+    </citations>
+</tool>

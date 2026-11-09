@@ -1,0 +1,82 @@
+class: GalaxyUserTool
+id: focaloop-query
+version: "0.1.0"
+name: Focaloop warm-state contrast and F_ST query
+description: Zero-new-byte follow-up contrast or spatiotemporal F_ST over a saved focaloop state, verified on the reusable holdout
+container: ghcr.io/galaxyproject/focaloop:0.1.0
+configfiles:
+  - name: query_args
+    filename: query_args.json
+    content: |
+      {"contrast": $(JSON.stringify(inputs.contrast)), "actor": $(JSON.stringify(inputs.actor)), "hypothesis": $(JSON.stringify(inputs.hypothesis || ""))}
+    eval_engine: ecmascript
+shell_command: |
+  python3 -c "import json, subprocess, sys; a = json.load(open('query_args.json')); cmd = ['focaloop', 'query', '--state-dir', sys.argv[1], '--contrast', a['contrast'], '--actor', a['actor'], '--mode', sys.argv[2], '--out-table', 'query_table.tsv', '--out-verdict', 'verdict.json', '--out-state-archive', 'focaloop_state.tar.zst'] + (['--hypothesis', a['hypothesis']] if a['hypothesis'] else []); sys.exit(subprocess.call(cmd))" '$(inputs.state.path)' $(inputs.mode)
+inputs:
+  - name: state
+    type: data
+    format: data
+    label: Focaloop warm state (.tar.zst)
+  - name: contrast
+    type: text
+    value: "treated:control"
+    label: Contrast
+    help: "A:B on the condition column, or field=A:B on any sample-sheet column (e.g. site=Ghana:Mali)."
+    validators:
+      - type: regex
+        expression: "^([A-Za-z0-9_]+=)?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$"
+        message: "Use A:B or field=A:B"
+  - name: actor
+    type: text
+    value: human
+    label: Actor recorded in the hypothesis ledger
+    validators:
+      - type: regex
+        expression: "^(human|agent:[A-Za-z0-9_.-]+)$"
+        message: "Use 'human' or 'agent:<name>'"
+  - name: hypothesis
+    type: text
+    optional: true
+    label: Group to test (optional; default is the top discovery hit)
+  - name: mode
+    type: select
+    options:
+      - { label: "Auto (F_ST when allele counts exist)", value: auto, selected: true }
+      - { label: Contrast, value: contrast, selected: false }
+      - { label: F_ST, value: fst, selected: false }
+    label: Query mode
+outputs:
+  - name: query_table
+    type: data
+    format: tabular
+    from_work_dir: query_table.tsv
+    label: Focaloop query table
+  - name: verdict
+    type: data
+    format: json
+    from_work_dir: verdict.json
+    label: Focaloop ledger verdict
+  - name: state_out
+    type: data
+    format: data
+    from_work_dir: focaloop_state.tar.zst
+    label: Focaloop state with ledger entry (.tar.zst)
+help:
+  format: markdown
+  content: |
+    Answers a follow-up question against a saved focaloop state without streaming new bytes. Contrast
+    mode estimates group-level log2 fold changes on the discovery partition, re-tests the chosen group
+    on the holdout partition, and charges the query against the HypothesisLedger alpha-wealth. F_ST mode
+    computes Hudson F_ST between two sample groups from saved allele counts with a permutation p-value.
+
+    **Inputs** -- `state`: `.tar.zst` from a focaloop run (or a previous query); `contrast`; `actor`;
+    optional `hypothesis`; `mode`.
+    **Outputs** -- `query_table`: discovery and holdout estimates; `verdict`: JSON with `confirmed`,
+    alpha allocated and remaining wealth, `new_bytes: 0`; `state_out`: the state with the ledger row
+    appended, to chain the next query.
+
+    Free text is passed through a JSON config file, never interpolated into the shell.
+citations:
+  - type: doi
+    content: 10.1126/science.aaa9375
+license: MIT

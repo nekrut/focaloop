@@ -1,0 +1,6 @@
+site_id	target_id	pos	ref	alt	kind
+pfcrt_K76T	pfcrt	228	C	G	snp
+pfmdr1_N86Y	pfmdr1	256	A	C	snp
+ctrl1_snp	ctrl_1	300	C	G	snp
+ctrl2_snp	ctrl_2	310	A	C	snp
+ctrl3_del	ctrl_3	280	AAT	A	indel

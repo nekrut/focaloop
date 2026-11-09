@@ -1,0 +1,100 @@
+class: GalaxyUserTool
+id: focaloop-panexpr
+version: "0.1.0"
+name: PanExpr focal-loop differential expression
+description: Byte-budgeted multi-strain, host-virus differential expression with tie-preserving EM and a replicate-variance stop gate
+container: ghcr.io/galaxyproject/focaloop:0.1.0
+shell_command: |
+  focaloop run \
+  --blueprint panexpr \
+  --targets '$(inputs.targets.path)' \
+  --sample-sheet '$(inputs.sample_sheet.path)' \
+  --reads $(inputs.reads.map((d) => "'" + d.path + "'").join(' ')) \
+  --contrast '$(inputs.contrast_a):$(inputs.contrast_b)' \
+  $(inputs.priors ? "--priors '" + inputs.priors.path + "'" : '') \
+  --max-bytes $(inputs.max_mb * 1048576) \
+  --state-dir focaloop_state \
+  --state-archive focaloop_state.tar.zst \
+  --out-table de_table.tsv \
+  --out-telemetry telemetry.json
+inputs:
+  - name: targets
+    type: data
+    format: fasta
+    label: Target catalog (FASTA)
+    help: "Transcripts / gene bodies from every strain, release and host/virus assembly. Header attributes group=, assembly=, kind=, kingdom= drive tie grouping."
+  - name: sample_sheet
+    type: data
+    format: tabular
+    label: Sample sheet
+    help: "Tab-separated with header: sample, condition[, batch]. Rows must be in the same order as the selected read datasets."
+  - name: reads
+    type: data
+    format: [fastqsanger, fastqsanger.gz]
+    multiple: true
+    label: Single-end reads, one dataset per sample-sheet row
+  - name: contrast_a
+    type: text
+    value: treated
+    label: Numerator condition
+    validators:
+      - type: regex
+        expression: "^[A-Za-z0-9_.-]+$"
+        message: Use letters, digits, '_', '.', '-' only
+  - name: contrast_b
+    type: text
+    value: control
+    label: Denominator condition
+    validators:
+      - type: regex
+        expression: "^[A-Za-z0-9_.-]+$"
+        message: Use letters, digits, '_', '.', '-' only
+  - name: priors
+    type: data
+    format: tabular
+    optional: true
+    label: External log-priors (optional)
+    help: "EXTERNAL_PRIORS columns: target_id, log_prior_weight[, group_id, sample, modality, confidence, source_uri]."
+  - name: max_mb
+    type: integer
+    value: 256
+    min: 1
+    max: 1048576
+    label: Byte budget (MiB of compressed input)
+outputs:
+  - name: de_table
+    type: data
+    format: tabular
+    from_work_dir: de_table.tsv
+    label: PanExpr differential expression
+  - name: telemetry
+    type: data
+    format: json
+    from_work_dir: telemetry.json
+    label: PanExpr telemetry and trap codes
+  - name: state
+    type: data
+    format: data
+    from_work_dir: focaloop_state.tar.zst
+    label: PanExpr warm state (.tar.zst)
+help:
+  format: markdown
+  content: |
+    Runs the `panexpr` focal loop: streams FASTQ blocks until the stop gate says more bytes no longer
+    change the answer, maps them with the kernel that wins a 28,000-read tournament (25,000 real + 5 x 600
+    synthetic reads; kernels breaking more than 20% of strain/paralog ties are disqualified), resolves
+    multi-strain placement with backward EM, and reports group-level log2 fold changes.
+
+    **Inputs** -- `targets`: target FASTA; `sample_sheet`: sample/condition/batch TSV in read order;
+    `reads`: one FASTQ per sample; `contrast_a`/`contrast_b`: condition levels; `priors`: optional
+    cross-modal log-priors; `max_mb`: compressed byte budget.
+    **Outputs** -- `de_table`: log2FC, SE, Wald p, BH-adjusted p, placement-variance fraction per group;
+    `telemetry`: tournament scoreboard, per-iteration gate metrics, `trap_codes`; `state`: Zstd-Parquet
+    warm state for zero-byte follow-up queries.
+
+    The job exits with code 3 when an abort trap fires (`LOW_MAP_RATE`, `TIE_SYMMETRY_FAIL`,
+    `CONFOUNDED_DESIGN`); the telemetry output names the trap.
+citations:
+  - type: doi
+    content: 10.1038/nmeth.4197
+license: MIT

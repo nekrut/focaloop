@@ -1,0 +1,34 @@
+# Stage-0 canonical 31-mer pan-repository SRA/ENA run scanner.
+id: focaloop_bait
+name: Focaloop Stage-0 31-mer bait scanner
+version: "0.1.0"
+modality: bait
+description: >-
+  Screens the first probe_bytes of each candidate run (local FASTQ, URL, or
+  SRR/ERR/DRR accession streamed via ENA HTTPS 206 ranges) for reads sharing
+  canonical 31-mers with a query sequence, reporting Wilson 95% lower bounds so
+  only runs that carry the locus are passed to a full focal loop.
+container: ghcr.io/galaxyproject/focaloop:0.1.0
+regime_rules:
+  - name: k31
+    when: always
+    set: {k: 31}
+kernel_pool:
+  kernels: [kmer_bait]
+  tournament:
+    real_reads: 0
+    synthetic_per_regime: 0
+conditioner:
+  method: none
+stop_gate:
+  block_bytes: 1048576
+  max_bytes: 1048576
+  holdout_fraction: 0.0
+traps:
+  LOW_MAP_RATE: {action: warn}
+  TIE_SYMMETRY_FAIL: {action: warn, threshold: 0.80}
+  BYTE_CAP_UNCONVERGED: {action: warn}
+  CONFOUNDED_DESIGN: {action: warn}
+outputs:
+  - {name: bait_hits, kind: table, format: tabular}
+  - {name: telemetry, kind: telemetry, format: json}

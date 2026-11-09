@@ -1,0 +1,76 @@
+class: GalaxyUserTool
+id: focaloop-bait
+version: "0.1.0"
+name: Focaloop Stage-0 31-mer bait scanner
+description: Screen the first bytes of many FASTQ datasets or SRA/ENA runs for reads sharing canonical 31-mers with a query
+container: ghcr.io/galaxyproject/focaloop:0.1.0
+shell_command: |
+  focaloop bait \
+  --query-fasta '$(inputs.query.path)' \
+  --inputs $(inputs.reads ? inputs.reads.map((d) => "'" + d.path + "'").join(' ') : '') $(inputs.accessions || '') \
+  --probe-bytes $(inputs.probe_kb * 1024) \
+  --min-hit-reads $(inputs.min_hit_reads) \
+  --state-dir bait_state \
+  --out-tsv bait_hits.tsv \
+  && tar -cf bait_state.tar bait_state
+inputs:
+  - name: query
+    type: data
+    format: fasta
+    label: Query locus (FASTA)
+  - name: reads
+    type: data
+    format: [fastqsanger, fastqsanger.gz]
+    multiple: true
+    optional: true
+    label: FASTQ datasets to screen (optional)
+  - name: accessions
+    type: text
+    optional: true
+    label: SRA/ENA run accessions (optional)
+    help: "Space-separated SRR/ERR/DRR ids, streamed via ENA HTTPS 206 range requests; needs outbound network."
+    validators:
+      - type: regex
+        expression: "^((SRR|ERR|DRR)[0-9]{6,}( (SRR|ERR|DRR)[0-9]{6,})*)?$"
+        message: Space-separated SRR/ERR/DRR accessions only
+  - name: probe_kb
+    type: integer
+    value: 1024
+    min: 4
+    max: 1048576
+    label: Probe size per run (KiB of compressed input)
+  - name: min_hit_reads
+    type: integer
+    value: 2
+    min: 1
+    max: 100000
+    label: Minimum hit reads for a run to pass
+outputs:
+  - name: bait_hits
+    type: data
+    format: tabular
+    from_work_dir: bait_hits.tsv
+    label: Bait screen hits
+  - name: bait_state
+    type: data
+    format: tar
+    from_work_dir: bait_state.tar
+    label: Bait prefilter state (Parquet)
+help:
+  format: markdown
+  content: |
+    Stage-0 pan-repository screen: reads the first `probe_kb` KiB of every input, counts reads sharing at
+    least two canonical 31-mers with the query, and reports the hit rate with a Wilson 95% lower bound.
+    Runs passing the gate are worth a full focal loop; the rest are skipped after a few hundred KiB.
+
+    **Inputs** -- `query`: locus FASTA; `reads` and/or `accessions`; `probe_kb`; `min_hit_reads`.
+    **Outputs** -- `bait_hits`: one row per run (`run_id`, `stream_tier`, `probe_bytes`, `hit_reads`,
+    `hit_rate`, `wilson_ci95_low`, `pass_gate`), passing runs first; `bait_state`: the
+    `bait_prefilter.parquet` table.
+
+    Provide at least one of `reads` or `accessions`. Accession streaming requires the Galaxy job
+    destination to allow outbound HTTPS.
+citations:
+  - type: doi
+    content: 10.1038/s41587-018-0010-1
+license: MIT

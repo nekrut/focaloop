@@ -1,0 +1,91 @@
+<tool id="focaloop_malariavar" name="MalariaVar focal-loop cohort variant calling" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>SNP, indel, F_WS, CNV and hrp2/3 deletion calls with a host-decoy sieve</description>
+    <macros>
+        <token name="@TOOL_VERSION@">0.1.0</token>
+        <token name="@VERSION_SUFFIX@">0</token>
+        <token name="@PROFILE@">25.0</token>
+    </macros>
+    <requirements>
+        <requirement type="package" version="@TOOL_VERSION@">focaloop</requirement>
+        <container type="docker">ghcr.io/galaxyproject/focaloop:@TOOL_VERSION@</container>
+    </requirements>
+    <version_command>focaloop --version</version_command>
+    <command detect_errors="exit_code"><![CDATA[
+focaloop run
+    --blueprint '$__tool_directory__/blueprint.focaloop.yml'
+    --targets '$targets'
+    --sample-sheet '$sample_sheet'
+    --reads
+    #for $r in $reads
+        '$r'
+    #end for
+    --read-ids
+    #for $r in $reads
+        '$r.element_identifier'
+    #end for
+    --variant-sites '$sites'
+    --max-bytes \$(( $max_mb * 1048576 ))
+    --state-dir focaloop_state
+    --state-archive '$state'
+    --out-table '$variant_table'
+    --out-telemetry '$telemetry'
+    ]]></command>
+    <inputs>
+        <param name="targets" type="data" format="fasta" label="Parasite gene bodies plus host decoy (FASTA)" help="Mark host sequences with kind=host_decoy in the header"/>
+        <param name="sample_sheet" type="data" format="tabular" label="Sample sheet" help="Header: sample, condition[, site, year, ...]"/>
+        <param name="reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" label="Reads, one dataset per sample"/>
+        <param name="sites" type="data" format="tabular" label="Variant sites" help="site_id, target_id, pos (0-based), ref, alt[, kind]"/>
+        <param name="max_mb" type="integer" min="1" max="1048576" value="512" label="Byte budget (MiB of compressed input)"/>
+    </inputs>
+    <outputs>
+        <data name="variant_table" format="tabular" label="${tool.name} on ${on_string}: calls"/>
+        <data name="telemetry" format="json" label="${tool.name} on ${on_string}: telemetry"/>
+        <data name="state" format="data" label="${tool.name} on ${on_string}: warm state (.tar.zst)"/>
+    </outputs>
+    <tests>
+        <test expect_num_outputs="3">
+            <param name="targets" value="targets.fa"/>
+            <param name="sample_sheet" value="samples.tsv"/>
+            <param name="reads" value="ML02.fastq.gz,ML03.fastq.gz,GH01.fastq.gz,GH05.fastq.gz" ftype="fastqsanger.gz"/>
+            <param name="sites" value="sites.tsv"/>
+            <output name="variant_table">
+                <assert_contents>
+                    <has_text text="pfcrt_K76T"/>
+                    <has_line_matching expression="GH01\tcnv\tpfmdr1\tpfmdr1\t[0-9.]+\t0\t0\tamplified"/>
+                    <has_line_matching expression="GH05\tdeletion\thrp2\thrp2\t0\t0\t0\tdeleted"/>
+                    <has_line_matching expression="ML03\tfws\tF_WS\t\t[0-9.]+\t0\t0\tpolyclonal"/>
+                </assert_contents>
+            </output>
+            <output name="telemetry">
+                <assert_contents>
+                    <has_text text="&quot;trap_codes&quot;: []"/>
+                </assert_contents>
+            </output>
+            <output name="state">
+                <assert_contents>
+                    <has_size min="1000"/>
+                </assert_contents>
+            </output>
+        </test>
+    </tests>
+    <help format="markdown"><![CDATA[
+**What it does**
+
+Runs the `malariavar` focal loop over a *Plasmodium falciparum* cohort. Allele-specific 31-mer probes
+count reference and alternate support at each declared SNP or indel. Effective depth relative to
+single-copy control genes gives copy ratios for *crt*, *mdr1*, *gch1* and *plasmepsin 2/3*; *hrp2* and
+*hrp3* are called deleted below 0.1x. F_WS summarises within-host diversity (below 0.95 = polyclonal).
+Reads whose best k-mer hit is a host decoy are sieved out before calling.
+
+-----
+
+**Outputs**
+
+- *Calls*: one row per sample x feature (`snp`, `indel`, `cnv`, `deletion`, `fws`).
+- *Telemetry*: tournament scoreboard, gate metrics and `trap_codes`.
+- *Warm state*: includes allele counts for the spatiotemporal F_ST query tool.
+    ]]></help>
+    <citations>
+        <citation type="doi">10.1038/nature11174</citation>
+    </citations>
+</tool>

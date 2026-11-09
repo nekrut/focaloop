@@ -1,0 +1,27 @@
+targets: targets.fa
+contrast: [treated, control]
+samples:
+  - sample: ctrl1
+    condition: control
+    batch: b1
+    reads: ctrl1.fastq.gz
+  - sample: ctrl2
+    condition: control
+    batch: b2
+    reads: ctrl2.fastq.gz
+  - sample: ctrl3
+    condition: control
+    batch: b1
+    reads: ctrl3.fastq.gz
+  - sample: trt1
+    condition: treated
+    batch: b1
+    reads: trt1.fastq.gz
+  - sample: trt2
+    condition: treated
+    batch: b2
+    reads: trt2.fastq.gz
+  - sample: trt3
+    condition: treated
+    batch: b2
+    reads: trt3.fastq.gz

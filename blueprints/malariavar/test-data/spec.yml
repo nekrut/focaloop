@@ -1,0 +1,23 @@
+targets: targets.fa
+variant_sites: sites.tsv
+samples:
+  - sample: ML02
+    condition: Mali
+    site: Mali
+    year: '2019'
+    reads: ML02.fastq.gz
+  - sample: ML03
+    condition: Mali
+    site: Mali
+    year: '2019'
+    reads: ML03.fastq.gz
+  - sample: GH01
+    condition: Ghana
+    site: Ghana
+    year: '2021'
+    reads: GH01.fastq.gz
+  - sample: GH05
+    condition: Ghana
+    site: Ghana
+    year: '2021'
+    reads: GH05.fastq.gz

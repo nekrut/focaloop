@@ -1,0 +1,52 @@
+# Bulk multi-strain / multi-release / host-virus differential expression focal loop.
+id: panexpr
+name: PanExpr multi-strain differential expression
+version: "0.1.0"
+modality: expression
+description: >-
+  Streams FASTQ blocks from staged files or INSDC byte ranges, maps them with the
+  tournament-selected kernel into tie-preserving equivalence classes across strains,
+  releases and host/virus catalogs, resolves placement with backward EM, and stops
+  once replicate variance dominates placement + Poisson variance.
+container: ghcr.io/galaxyproject/focaloop:0.1.0
+regime_rules:
+  - name: multi_assembly_conditioning
+    when: n_assemblies > 1
+    set: {conditioning: strain_aware}
+  - name: small_catalog_k
+    when: n_targets < 50
+    set: {k: 31}
+kernel_pool:
+  kernels: [kmer_eq, kmer_besthit, salmon, piscem, bwa-mem2, strobealign, minimap2, bowtie2]
+  tournament:
+    real_reads: 25000
+    synthetic_per_regime: 600
+    n_regimes: 5
+    tie_symmetry_min: 0.80
+    k: 31
+    seed: 42
+conditioner:
+  method: em
+  max_iter: 200
+  tol: 1.0e-6
+  dirichlet_alpha: 0.5
+  external_priors: true
+stop_gate:
+  block_bytes: 8192
+  max_bytes: 268435456
+  holdout_fraction: 0.25
+  min_posterior_precision: 25.0
+  max_tech_var_fraction: 0.25
+  delta_tol: 0.02
+  min_iterations: 3
+traps:
+  LOW_MAP_RATE: {action: abort, threshold: 0.30}
+  TIE_SYMMETRY_FAIL: {action: abort, threshold: 0.80}
+  BYTE_CAP_UNCONVERGED: {action: warn}
+  CONFOUNDED_DESIGN: {action: abort}
+outputs:
+  - {name: de_table, kind: table, format: tabular}
+  - {name: telemetry, kind: telemetry, format: json}
+  - {name: state, kind: state, format: tar.zst}
+citations:
+  - 10.1038/nmeth.4197

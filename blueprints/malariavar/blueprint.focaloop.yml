@@ -1,0 +1,59 @@
+# P. falciparum / eukaryotic cohort variant focal loop with host-decoy k-mer sieve.
+id: malariavar
+name: MalariaVar cohort SNP, indel, CNV and deletion calling
+version: "0.1.0"
+modality: variants
+description: >-
+  Calls SNPs and indels at declared sites with allele-specific 31-mer probes,
+  within-host F_WS polyclonality, crt/mdr1/gch1/plasmepsin2-3 copy number relative to
+  single-copy controls, and hrp2/hrp3 deletions, after sieving host reads with
+  a human decoy k-mer catalog.
+container: ghcr.io/galaxyproject/focaloop:0.1.0
+regime_rules:
+  - name: host_decoy_sieve
+    when: has_decoy == true
+    set: {decoy_sieve: true}
+  - name: k31
+    when: always
+    set: {k: 31}
+kernel_pool:
+  kernels: [kmer_eq, kmer_besthit, bwa-mem2, minimap2, strobealign]
+  tournament:
+    real_reads: 25000
+    synthetic_per_regime: 600
+    n_regimes: 5
+    tie_symmetry_min: 0.80
+    k: 31
+    seed: 42
+conditioner:
+  method: em
+  max_iter: 200
+  tol: 1.0e-6
+  dirichlet_alpha: 0.5
+  external_priors: false
+stop_gate:
+  block_bytes: 8192
+  max_bytes: 536870912
+  holdout_fraction: 0.25
+  min_posterior_precision: 400.0
+  max_tech_var_fraction: 0.25
+  delta_tol: 0.01
+  min_iterations: 3
+traps:
+  LOW_MAP_RATE: {action: abort, threshold: 0.30}
+  TIE_SYMMETRY_FAIL: {action: abort, threshold: 0.80}
+  BYTE_CAP_UNCONVERGED: {action: warn}
+  CONFOUNDED_DESIGN: {action: warn}
+variants:
+  min_alt_reads: 3
+  cnv_genes: [pfcrt, pfmdr1, gch1, pm2, pm3]
+  deletion_genes: [hrp2, hrp3]
+  single_copy_controls: [ctrl_1, ctrl_2, ctrl_3]
+  host_decoy: human_decoy
+  fws: {min_depth: 10}
+outputs:
+  - {name: variant_table, kind: table, format: tabular}
+  - {name: telemetry, kind: telemetry, format: json}
+  - {name: state, kind: state, format: tar.zst}
+citations:
+  - 10.1038/nature11174
