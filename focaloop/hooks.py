@@ -474,6 +474,17 @@ class HypothesisLedger:
         self.holdout_alpha = holdout_alpha
         self._query_index = 0
 
+    @classmethod
+    def from_store(cls, store: FocaloopStateStore, **kwargs: float) -> "HypothesisLedger":
+        """Resume alpha-wealth and query index from a persisted `hypothesis_ledger` table."""
+        ledger = cls(**kwargs)
+        if store.exists("hypothesis_ledger"):
+            tbl = store.read("hypothesis_ledger")
+            if tbl.num_rows:
+                ledger.wealth = float(tbl.column("alpha_wealth_after")[-1].as_py())
+                ledger._query_index = int(tbl.column("query_index")[-1].as_py())
+        return ledger
+
     def evaluate_query(
         self,
         query_id: str,
