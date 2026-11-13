@@ -709,39 +709,36 @@ def _resolve_ena_or_odp_for_malariavar(acc: str) -> dict[str, Any]:
     }
 
 
-def _cpu_has_avx2() -> bool:
+def _mapper_runs_cleanly(cand: str) -> bool:
+    exe = shutil.which(cand)
+    if not exe:
+        return False
     try:
-        cpuinfo = Path("/proc/cpuinfo")
-        if cpuinfo.is_file():
-            return "avx2" in cpuinfo.read_text(errors="ignore").lower().split()
+        if cand in ("strobealign", "minimap2"):
+            with tempfile.TemporaryDirectory(prefix=f"focaloop_{cand}_chk_") as td:
+                fa = Path(td) / "r.fa"
+                fq = Path(td) / "q.fq"
+                seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+                fa.write_text(f">chr1\n{seq * 4}\n")
+                fq.write_text(f"@r1\n{seq}\n+\n{'I' * len(seq)}\n")
+                cmd = [exe, "-t", "1", str(fa), str(fq)] if cand == "strobealign" else [exe, "-t", "1", "-ax", "sr", str(fa), str(fq)]
+                rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode
+                return rc == 0
+        args = ["version"] if cand == "bwa-mem2" else ([] if cand == "bwa" else ["--version"])
+        rc = subprocess.run([exe, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode
+        return rc >= 0 and rc not in (126, 127, 132, 134, 139)
     except Exception:
-        pass
-    return True
+        return False
 
 
 def _select_malariavar_mapper(requested: str) -> str:
-    has_avx2 = _cpu_has_avx2()
-    if requested == "strobealign" and not has_avx2:
-        print(
-            "[focaloop-malariavar] Host CPU lacks AVX2 (bioconda strobealign requires AVX2); "
-            "falling back to ISA-portable minimap2",
-            flush=True,
-        )
-        requested = "minimap2"
     if requested and requested != "auto":
-        if shutil.which(requested):
+        if _mapper_runs_cleanly(requested):
             return requested
-    cands = ("strobealign", "minimap2", "bwa-mem2", "bwa") if has_avx2 else ("minimap2", "bwa-mem2", "bwa")
-    for cand in cands:
-        exe = shutil.which(cand)
-        if exe:
-            try:
-                args = ["version"] if cand == "bwa-mem2" else ([] if cand == "bwa" else ["--version"])
-                rc = subprocess.run([exe, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode
-                if rc >= 0 and rc not in (126, 127, 132, 134, 139):
-                    return cand
-            except Exception:
-                continue
+        print(f"[focaloop-malariavar] Requested mapper {requested!r} failed runtime probe; falling back automatically", flush=True)
+    for cand in ("strobealign", "minimap2", "bwa-mem2", "bwa"):
+        if _mapper_runs_cleanly(cand):
+            return cand
     raise RuntimeError("No supported short-read mapper (strobealign/minimap2/bwa-mem2/bwa) found in PATH")
 
 

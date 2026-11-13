@@ -992,7 +992,7 @@ def mapper_cmd(threads, paired, ref=None, mapper="strobealign"):
             cmd.append("-p")
         return cmd + [ref, "-"]
     if mapper == "minimap2":
-        return ["minimap2", "-t", t, "-ax", "sr", ref, "-"]
+        return ["minimap2", "-t", t, "-K", "20M", "-ax", "sr", ref, "-"]
     raise ValueError(f"unknown mapper: {mapper}")
 
 

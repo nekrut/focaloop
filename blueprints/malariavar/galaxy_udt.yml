@@ -44,7 +44,7 @@ inputs:
     type: select
     label: Short-read aligner for Mode B raw streaming
     options:
-      - { label: "Auto (ISA-aware: minimap2 on non-AVX2, strobealign on AVX2)", value: auto, selected: true }
+      - { label: "Auto (probe-verified strobealign / minimap2 / bwa-mem2)", value: auto, selected: true }
       - { label: "strobealign", value: strobealign, selected: false }
       - { label: "minimap2", value: minimap2, selected: false }
       - { label: "bwa-mem2", value: bwa-mem2, selected: false }

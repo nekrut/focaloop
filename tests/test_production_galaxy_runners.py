@@ -274,15 +274,13 @@ def test_who_resistance_classifier_and_malariavar_report(tmp_path: Path) -> None
     assert "Focaloop MalariaVar" in txt and "PH1387-C" in txt and "C580Y" in txt
 
 
-def test_malariavar_mapper_falls_back_on_non_avx2(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_malariavar_mapper_probe_fallback_and_minimap2_batch_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     import focaloop.galaxy_runners as gr
+    from focaloop.malariavar.streamer import mapper_cmd
 
-    monkeypatch.setattr(gr, "_cpu_has_avx2", lambda: False)
-    monkeypatch.setattr(gr.shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("strobealign", "minimap2") else None)
+    mm_cmd = mapper_cmd(4, paired=True, ref="Pf3D7.fasta", mapper="minimap2")
+    assert "-K" in mm_cmd and "20M" in mm_cmd
+
+    monkeypatch.setattr(gr, "_mapper_runs_cleanly", lambda cand: cand == "minimap2")
     assert gr._select_malariavar_mapper("strobealign") == "minimap2"
-    monkeypatch.setattr(
-        gr.subprocess,
-        "run",
-        lambda *args, **kwargs: type("R", (), {"returncode": 0})(),
-    )
     assert gr._select_malariavar_mapper("auto") == "minimap2"

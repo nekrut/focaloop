@@ -36,7 +36,7 @@ focaloop malariavar
         </param>
         <param name="target_depth" type="float" min="5.0" max="100.0" value="24.0" label="Target median core depth (Mode B stop gate)"/>
         <param name="mapper" type="select" label="Short-read aligner (Mode B)">
-            <option value="auto" selected="true">Auto (ISA-aware: minimap2 on non-AVX2, strobealign on AVX2)</option>
+            <option value="auto" selected="true">Auto (probe-verified strobealign / minimap2 / bwa-mem2)</option>
             <option value="strobealign">strobealign</option>
             <option value="minimap2">minimap2</option>
             <option value="bwa-mem2">bwa-mem2</option>
