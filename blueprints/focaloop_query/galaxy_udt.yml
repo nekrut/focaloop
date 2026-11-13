@@ -1,35 +1,42 @@
 class: GalaxyUserTool
 id: focaloop-query
-version: "0.1.0"
-name: Focaloop warm-state contrast and F_ST query
-description: Zero-new-byte follow-up contrast or spatiotemporal F_ST over a saved focaloop state, verified on the reusable holdout
-container: ghcr.io/galaxyproject/focaloop:0.1.0
+version: "0.2.0"
+name: Focaloop Query warm-state instant contrast and sub-cohort comparison
+description: Zero-network-byte follow-up differential expression contrast or sub-cohort WHO resistance and Hudson F_ST query guarded by HypothesisLedger
+container: ghcr.io/galaxyproject/focaloop:0.2.0
 configfiles:
   - name: query_args
     filename: query_args.json
     content: |
-      {"contrast": $(JSON.stringify(inputs.contrast)), "actor": $(JSON.stringify(inputs.actor)), "hypothesis": $(JSON.stringify(inputs.hypothesis || ""))}
+      {"contrast": $(JSON.stringify(inputs.contrast)), "actor": $(JSON.stringify(inputs.actor)), "hypothesis": $(JSON.stringify(inputs.hypothesis || "")), "design": $(JSON.stringify(inputs.design || ""))}
     eval_engine: ecmascript
 shell_command: |
-  python3 -c "import json, subprocess, sys; a = json.load(open('query_args.json')); cmd = ['focaloop', 'query', '--state-dir', sys.argv[1], '--contrast', a['contrast'], '--actor', a['actor'], '--mode', sys.argv[2], '--out-table', 'query_table.tsv', '--out-verdict', 'verdict.json', '--out-state-archive', 'focaloop_state.tar.zst'] + (['--hypothesis', a['hypothesis']] if a['hypothesis'] else []); sys.exit(subprocess.call(cmd))" '$(inputs.state.path)' $(inputs.mode)
+  focaloop query \
+  --state-dir '$(inputs.state.path)' \
+  --args-json query_args.json \
+  --mode $(inputs.mode) \
+  --out-table query_table.tsv \
+  --out-verdict verdict.json \
+  --out-report query_report.html \
+  --out-state-archive focaloop_state.tar.zst
 inputs:
   - name: state
     type: data
     format: data
-    label: Focaloop warm state (.tar.zst)
+    label: Saved Focaloop state bundle (.focaloop.tar.zst)
   - name: contrast
     type: text
-    value: "treated:control"
-    label: Contrast
-    help: "A:B on the condition column, or field=A:B on any sample-sheet column (e.g. site=Ghana:Mali)."
+    value: "condition:treated:control"
+    label: Contrast or sub-cohort comparison
+    help: "PanExpr: condition:AR0387:AR0382 (or A:B). MalariaVar: Population:AS-SE-E:AF-W or Country:Cambodia,Vietnam:Ghana,Mali."
     validators:
       - type: regex
-        expression: "^([A-Za-z0-9_]+=)?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$"
-        message: "Use A:B or field=A:B"
+        expression: "^([A-Za-z0-9_]+[:=])?[A-Za-z0-9_,.-]+:[A-Za-z0-9_,.-]+$"
+        message: "Use A:B, factor:A:B, or factor=A:B"
   - name: actor
     type: text
     value: human
-    label: Actor recorded in the hypothesis ledger
+    label: Actor recorded in HypothesisLedger
     validators:
       - type: regex
         expression: "^(human|agent:[A-Za-z0-9_.-]+)$"
@@ -37,45 +44,51 @@ inputs:
   - name: hypothesis
     type: text
     optional: true
-    label: Group to test (optional; default is the top discovery hit)
+    label: Specific gene / group to test on holdout (optional; defaults to top discovery hit)
+  - name: design
+    type: text
+    optional: true
+    label: Optional Wilkinson formula override for multi-factor PanExpr contrasts (e.g. ~donor + condition)
   - name: mode
     type: select
     options:
-      - { label: "Auto (F_ST when allele counts exist)", value: auto, selected: true }
-      - { label: Contrast, value: contrast, selected: false }
-      - { label: F_ST, value: fst, selected: false }
+      - { label: "Auto-detect from saved state", value: auto, selected: true }
+      - { label: "Differential expression contrast", value: contrast, selected: false }
+      - { label: "Sub-cohort F_ST and prevalence comparison", value: fst, selected: false }
     label: Query mode
 outputs:
   - name: query_table
     type: data
     format: tabular
     from_work_dir: query_table.tsv
-    label: Focaloop query table
+    label: "Focaloop Query: query_table.tsv"
   - name: verdict
     type: data
     format: json
     from_work_dir: verdict.json
-    label: Focaloop ledger verdict
+    label: "Focaloop Query: verdict.json (HypothesisLedger)"
+  - name: query_report
+    type: data
+    format: html
+    from_work_dir: query_report.html
+    label: "Focaloop Query: query_report.html"
   - name: state_out
     type: data
     format: data
     from_work_dir: focaloop_state.tar.zst
-    label: Focaloop state with ledger entry (.tar.zst)
+    label: "Focaloop Query: updated state (.focaloop.tar.zst)"
 help:
   format: markdown
   content: |
-    Answers a follow-up question against a saved focaloop state without streaming new bytes. Contrast
-    mode estimates group-level log2 fold changes on the discovery partition, re-tests the chosen group
-    on the holdout partition, and charges the query against the HypothesisLedger alpha-wealth. F_ST mode
-    computes Hudson F_ST between two sample groups from saved allele counts with a permutation p-value.
+    Executes an instant warm-state follow-up query over any `*.focaloop.tar.zst` bundle from **Focaloop PanExpr**
+    or **Focaloop MalariaVar** with network sockets blocked (`0` network bytes downloaded):
 
-    **Inputs** -- `state`: `.tar.zst` from a focaloop run (or a previous query); `contrast`; `actor`;
-    optional `hypothesis`; `mode`.
-    **Outputs** -- `query_table`: discovery and holdout estimates; `verdict`: JSON with `confirmed`,
-    alpha allocated and remaining wealth, `new_bytes: 0`; `state_out`: the state with the ledger row
-    appended, to chain the next query.
+    - **On PanExpr state bundles:** Runs a new `PyDESeq2` pairwise or multi-factor contrast with placement-ambiguity
+      error propagation, orthology bridge lookup, and reusable-holdout validation.
+    - **On MalariaVar state bundles:** Computes sub-cohort WHO drug-resistance & deletion prevalence differences
+      (Fisher exact test + BH FDR) alongside genome-wide and per-locus Hudson $F_{ST}$ with label-permutation p-values.
 
-    Free text is passed through a JSON config file, never interpolated into the shell.
+    Every query is recorded in the persisted `HypothesisLedger` (online generalized alpha-investing).
 citations:
   - type: doi
     content: 10.1126/science.aaa9375

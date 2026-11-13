@@ -127,6 +127,11 @@ def lint_user_tool(doc: Any) -> list[str]:
         if not re.match(r"^(inputs\b|JSON\.|[A-Za-z_][A-Za-z0-9_]*\()", body) or re.match(r"^(pwd|date|cat|echo|ls|basename|dirname|nproc|which)\b", body):
             errors.append(f"bash command substitution $({body[:20]}...) in shell_command is parsed as a CWL JS "
                           "expression (ReferenceError); use $PWD, shell variables or backticks")
+    for m in re.finditer(r"(?<!\\)\$\{([^}]*)\}", cmd):
+        body = m.group(1).strip()
+        if "return " not in body:
+            errors.append(f"bash parameter expansion ${{{body[:24]}}} in shell_command is parsed by cwl_utils as a JS "
+                          "function block (evaluates to null); handle env defaults inside the tool CLI")
     if "$(outputs." in cmd:
         errors.append("$(outputs.X) is not available in UDT templating")
     # Cheetah params are lowercase ($threads); upper-case shell variables ($PWD, $GALAXY_SLOTS) are fine

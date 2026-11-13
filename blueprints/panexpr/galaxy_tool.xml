@@ -1,7 +1,7 @@
-<tool id="focaloop_panexpr" name="PanExpr focal-loop differential expression" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
-    <description>multi-strain, host-virus DE with tie-preserving EM and a byte-budget stop gate</description>
+<tool id="focaloop_panexpr" name="Focaloop PanExpr RNA-seq differential expression loop" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>adaptive SRA/ENA streaming DE with aligner tournament, multi-reference EM and 31-mer zoom</description>
     <macros>
-        <token name="@TOOL_VERSION@">0.1.0</token>
+        <token name="@TOOL_VERSION@">0.2.0</token>
         <token name="@VERSION_SUFFIX@">0</token>
         <token name="@PROFILE@">25.0</token>
     </macros>
@@ -11,92 +11,99 @@
     </requirements>
     <version_command>focaloop --version</version_command>
     <command detect_errors="exit_code"><![CDATA[
-focaloop run
-    --blueprint '$__tool_directory__/blueprint.focaloop.yml'
-    --targets '$targets'
-    --sample-sheet '$sample_sheet'
-    --reads
-    #for $r in $reads
-        '$r'
-    #end for
-    --read-ids
-    #for $r in $reads
-        '$r.element_identifier'
-    #end for
-    --contrast '$contrast_a:$contrast_b'
-    #if $priors
-        --priors '$priors'
+focaloop panexpr
+    --manifest '$manifest'
+    --ref-fasta '$ref_fasta'
+    --ref-gtf '$ref_gtf'
+    #if $secondary_fasta
+        --secondary-fasta '$secondary_fasta'
     #end if
-    --max-bytes \$(( $max_mb * 1048576 ))
-    --state-dir focaloop_state
-    --state-archive '$state'
-    --out-table '$de_table'
-    --out-telemetry '$telemetry'
+    #if $secondary_gtf
+        --secondary-gtf '$secondary_gtf'
+    #end if
+    --primary-label '$primary_label'
+    --secondary-label '$secondary_label'
+    #if $reads
+        --reads
+        #for $r in $reads
+            '$r'
+        #end for
+        --read-ids
+        #for $r in $reads
+            '$r.element_identifier'
+        #end for
+    #end if
+    --contrast '$contrast'
+    --organism-mode '$organism_mode'
+    --source-mode '$source_mode'
+    --max-byte-fraction $max_byte_fraction
+    --v-tech-target $v_tech_target
+    #if not $enable_zoom
+        --no-zoom
+    #end if
+    --threads \${GALAXY_SLOTS:-8}
+    --state-dir panexpr_state_dir
+    --state-archive '$panexpr_state'
+    --out-de '$de_results'
+    --out-report '$focaloop_report'
     ]]></command>
     <inputs>
-        <param name="targets" type="data" format="fasta" label="Target catalog (FASTA)" help="Header attributes group=, assembly=, kind=, kingdom= drive tie grouping"/>
-        <param name="sample_sheet" type="data" format="tabular" label="Sample sheet" help="Header: sample, condition[, batch]; sample must equal the read dataset name (extension stripped)"/>
-        <param name="reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" label="Single-end reads, one dataset per sample"/>
-        <param name="contrast_a" type="text" value="treated" label="Numerator condition">
+        <param name="manifest" type="data" format="tabular" label="Sample manifest (TSV)" help="Columns: sample_id, condition, run_or_url (SRR/ERR accession, HTTPS URL, or History dataset name)"/>
+        <param name="ref_fasta" type="data" format="fasta,fasta.gz" label="Reference genome FASTA"/>
+        <param name="ref_gtf" type="data" format="gtf,gff,gff3" label="Reference annotation (GTF / GFF3)"/>
+        <param name="secondary_fasta" type="data" format="fasta,fasta.gz" optional="true" label="Secondary strain / release / virus FASTA (optional)"/>
+        <param name="secondary_gtf" type="data" format="gtf,gff,gff3" optional="true" label="Secondary annotation GTF / GFF3 (optional)"/>
+        <param name="primary_label" type="text" value="primary" label="Primary assembly label">
             <validator type="regex" message="Letters, digits, '_', '.', '-' only">[A-Za-z0-9_.-]+</validator>
         </param>
-        <param name="contrast_b" type="text" value="control" label="Denominator condition">
+        <param name="secondary_label" type="text" value="secondary" label="Secondary assembly label">
             <validator type="regex" message="Letters, digits, '_', '.', '-' only">[A-Za-z0-9_.-]+</validator>
         </param>
-        <param name="priors" type="data" format="tabular" optional="true" label="External log-priors" help="target_id, log_prior_weight[, group_id, sample, modality, confidence, source_uri]"/>
-        <param name="max_mb" type="integer" min="1" max="1048576" value="256" label="Byte budget (MiB of compressed input)"/>
+        <param name="reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" optional="true" label="Optional History FASTQ datasets"/>
+        <param name="contrast" type="text" value="condition:treated:control" label="Primary contrast (factor:treated:control)">
+            <validator type="regex" message="Use factor:A:B or A:B">([A-Za-z0-9_]+[:=])?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+</validator>
+        </param>
+        <param name="organism_mode" type="select" label="Organism splicing regime">
+            <option value="auto" selected="true">Auto-detect from GTF/GFF3</option>
+            <option value="eukaryotic">Eukaryotic (spliced cDNA + decoys)</option>
+            <option value="prokaryotic">Prokaryotic / compact CDS</option>
+        </param>
+        <param name="source_mode" type="select" label="Archive streaming transport">
+            <option value="auto" selected="true">Auto (History FASTQ or ENA HTTPS 206)</option>
+            <option value="http_range">ENA HTTPS 206 byte-range</option>
+            <option value="sra_odp">AWS SRA Open Data spot blocks (xsra)</option>
+            <option value="local_bytes">Local History FASTQ bytes</option>
+        </param>
+        <param name="max_byte_fraction" type="float" min="0.005" max="1.0" value="0.12" label="Max archive byte fraction (0.12 = 12%)"/>
+        <param name="v_tech_target" type="float" min="0.02" max="0.9" value="0.25" label="Stopping threshold on median V_tech / (V_tech + V_bio)"/>
+        <param name="enable_zoom" type="boolean" checked="true" label="Enable Stage-5 31-mer borderline zoom"/>
     </inputs>
     <outputs>
-        <data name="de_table" format="tabular" label="${tool.name} on ${on_string}: DE table"/>
-        <data name="telemetry" format="json" label="${tool.name} on ${on_string}: telemetry"/>
-        <data name="state" format="data" label="${tool.name} on ${on_string}: warm state (.tar.zst)"/>
+        <data name="de_results" format="tabular" label="${tool.name} on ${on_string}: de_results.tsv"/>
+        <data name="focaloop_report" format="html" label="${tool.name} on ${on_string}: focaloop_report.html"/>
+        <data name="panexpr_state" format="data" label="${tool.name} on ${on_string}: panexpr_state.focaloop.tar.zst"/>
     </outputs>
     <tests>
         <test expect_num_outputs="3">
-            <param name="targets" value="targets.fa"/>
-            <param name="sample_sheet" value="samples.tsv"/>
+            <param name="manifest" value="manifest_local.tsv"/>
+            <param name="ref_fasta" value="targets.fa"/>
+            <param name="ref_gtf" value="ref_genes.gtf"/>
             <param name="reads" value="ctrl1.fastq.gz,ctrl2.fastq.gz,ctrl3.fastq.gz,trt1.fastq.gz,trt2.fastq.gz,trt3.fastq.gz" ftype="fastqsanger.gz"/>
-            <param name="contrast_a" value="treated"/>
-            <param name="contrast_b" value="control"/>
-            <output name="de_table">
+            <param name="contrast" value="condition:treated:control"/>
+            <param name="max_byte_fraction" value="1.0"/>
+            <output name="de_results">
                 <assert_contents>
-                    <has_text text="log2fc"/>
-                    <has_text text="g2"/>
-                    <has_text text="g4"/>
+                    <has_text text="log2FoldChange"/>
                 </assert_contents>
             </output>
-            <output name="telemetry">
+            <output name="focaloop_report">
                 <assert_contents>
-                    <has_text text="&quot;winner&quot;: &quot;kmer_eq&quot;"/>
-                    <has_text text="&quot;trap_codes&quot;: []"/>
+                    <has_text text="Focaloop PanExpr"/>
                 </assert_contents>
             </output>
-            <output name="state">
+            <output name="panexpr_state">
                 <assert_contents>
-                    <has_size min="1000"/>
-                </assert_contents>
-            </output>
-        </test>
-        <test expect_num_outputs="3">
-            <param name="targets" value="targets.fa"/>
-            <param name="sample_sheet" value="samples.tsv"/>
-            <param name="reads" value="ctrl1.fastq.gz,ctrl2.fastq.gz,ctrl3.fastq.gz,trt1.fastq.gz,trt2.fastq.gz,trt3.fastq.gz" ftype="fastqsanger.gz"/>
-            <param name="contrast_a" value="treated"/>
-            <param name="contrast_b" value="control"/>
-            <param name="priors" value="priors.tsv"/>
-            <output name="de_table">
-                <assert_contents>
-                    <has_text text="g2"/>
-                </assert_contents>
-            </output>
-            <output name="telemetry">
-                <assert_contents>
-                    <has_text text="&quot;status&quot;: &quot;ok&quot;"/>
-                </assert_contents>
-            </output>
-            <output name="state">
-                <assert_contents>
-                    <has_size min="1000"/>
+                    <has_size min="500"/>
                 </assert_contents>
             </output>
         </test>
@@ -104,29 +111,10 @@ focaloop run
     <help format="markdown"><![CDATA[
 **What it does**
 
-Runs the `panexpr` focal loop. FASTQ blocks are streamed until the stop gate decides that more bytes no
-longer change the answer. A 28,000-read kernel tournament (25,000 real reads + 5 regimes x 600 synthetic
-reads) picks the mapping kernel; kernels that collapse more than 20% of strain/paralog ties are disqualified.
-Multi-strain placement is resolved by backward EM and group-level log2 fold changes are reported.
-
------
-
-**Inputs**
-
-- *Target catalog*: transcripts / gene bodies from every strain, release and host/virus assembly.
-- *Sample sheet*: `sample`, `condition`, optional `batch`; `sample` must match the read dataset names.
-- *Reads*: one FASTQ per sample.
-- *Priors*: optional cross-modal log-priors (WGS copy number, proteomics, chromatin).
-
------
-
-**Outputs**
-
-- *DE table*: log2FC, SE, Wald p, BH-adjusted p and placement-variance fraction per group.
-- *Telemetry*: tournament scoreboard, per-iteration gate metrics and `trap_codes`.
-- *Warm state*: Zstd-Parquet state archive for zero-byte follow-up queries.
-
-The job fails (exit code 3) when an abort trap fires: `LOW_MAP_RATE`, `TIE_SYMMETRY_FAIL` or `CONFOUNDED_DESIGN`.
+Runs the 5-stage **Focaloop PanExpr** differential expression loop directly against SRA/ENA accessions
+(streamed via HTTPS `Range` or `xsra`) or Galaxy History FASTQ datasets, emitting `de_results.tsv`,
+a self-contained `focaloop_report.html`, and a compact `panexpr_state.focaloop.tar.zst` warm state bundle
+for zero-byte follow-up contrasts in **Focaloop Query**.
     ]]></help>
     <citations>
         <citation type="doi">10.1038/nmeth.4197</citation>

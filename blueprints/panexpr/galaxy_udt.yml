@@ -1,99 +1,147 @@
 class: GalaxyUserTool
 id: focaloop-panexpr
-version: "0.1.0"
-name: PanExpr focal-loop differential expression
-description: Byte-budgeted multi-strain, host-virus differential expression with tie-preserving EM and a replicate-variance stop gate
-container: ghcr.io/galaxyproject/focaloop:0.1.0
+version: "0.2.0"
+name: Focaloop PanExpr RNA-seq differential expression loop
+description: Adaptive 5-stage RNA-seq differential expression from SRA/ENA streams or FASTQs with multi-reference EM conditioning and 31-mer zoom
+container: ghcr.io/galaxyproject/focaloop:0.2.0
 shell_command: |
-  focaloop run \
-  --blueprint panexpr \
-  --targets '$(inputs.targets.path)' \
-  --sample-sheet '$(inputs.sample_sheet.path)' \
-  --reads $(inputs.reads.map((d) => "'" + d.path + "'").join(' ')) \
-  --contrast '$(inputs.contrast_a):$(inputs.contrast_b)' \
-  $(inputs.priors ? "--priors '" + inputs.priors.path + "'" : '') \
-  --max-bytes $(inputs.max_mb * 1048576) \
-  --state-dir focaloop_state \
-  --state-archive focaloop_state.tar.zst \
-  --out-table de_table.tsv \
-  --out-telemetry telemetry.json
+  focaloop panexpr \
+  --manifest '$(inputs.manifest.path)' \
+  --ref-fasta '$(inputs.ref_fasta.path)' \
+  --ref-gtf '$(inputs.ref_gtf.path)' \
+  $(inputs.secondary_fasta ? "--secondary-fasta '" + inputs.secondary_fasta.path + "'" : '') \
+  $(inputs.secondary_gtf ? "--secondary-gtf '" + inputs.secondary_gtf.path + "'" : '') \
+  --primary-label '$(inputs.primary_label)' \
+  --secondary-label '$(inputs.secondary_label)' \
+  $(inputs.reads ? "--reads " + inputs.reads.map((d) => "'" + d.path + "'").join(' ') : '') \
+  $(inputs.reads ? "--read-ids " + inputs.reads.map((d) => "'" + (d.basename || d.nameroot || 'read') + "'").join(' ') : '') \
+  --contrast '$(inputs.contrast)' \
+  --organism-mode $(inputs.organism_mode) \
+  --source-mode $(inputs.source_mode) \
+  --max-byte-fraction $(inputs.max_byte_fraction) \
+  --v-tech-target $(inputs.v_tech_target) \
+  $(inputs.enable_zoom ? '' : '--no-zoom') \
+  --state-dir panexpr_state_dir \
+  --state-archive panexpr_state.focaloop.tar.zst \
+  --out-de de_results.tsv \
+  --out-report focaloop_report.html
 inputs:
-  - name: targets
-    type: data
-    format: fasta
-    label: Target catalog (FASTA)
-    help: "Transcripts / gene bodies from every strain, release and host/virus assembly. Header attributes group=, assembly=, kind=, kingdom= drive tie grouping."
-  - name: sample_sheet
+  - name: manifest
     type: data
     format: tabular
-    label: Sample sheet
-    help: "Tab-separated with header: sample, condition[, batch]. Rows must be in the same order as the selected read datasets."
+    label: Sample manifest (TSV)
+    help: "Tab-separated manifest with header: sample_id, condition, run_or_url (SRR/ERR accession, HTTPS FASTQ URL, or History dataset name)."
+  - name: ref_fasta
+    type: data
+    format: [fasta, fasta.gz]
+    label: Reference genome FASTA
+  - name: ref_gtf
+    type: data
+    format: [gtf, gff, gff3]
+    label: Reference annotation (GTF / GFF3)
+  - name: secondary_fasta
+    type: data
+    format: [fasta, fasta.gz]
+    optional: true
+    label: Secondary strain / assembly / virus FASTA (optional)
+    help: "Supply a second assembly or annotation release (e.g., paper legacy assembly v2 alongside current v3) for sequence-identity + RBH orthology bridging and multi-reference EM conditioning."
+  - name: secondary_gtf
+    type: data
+    format: [gtf, gff, gff3]
+    optional: true
+    label: Secondary annotation GTF / GFF3 (optional)
+  - name: primary_label
+    type: text
+    value: primary
+    label: Primary assembly label
+    validators:
+      - type: regex
+        expression: "^[A-Za-z0-9_.-]+$"
+  - name: secondary_label
+    type: text
+    value: secondary
+    label: Secondary assembly label
+    validators:
+      - type: regex
+        expression: "^[A-Za-z0-9_.-]+$"
   - name: reads
     type: data
     format: [fastqsanger, fastqsanger.gz]
     multiple: true
-    label: Single-end reads, one dataset per sample-sheet row
-  - name: contrast_a
-    type: text
-    value: treated
-    label: Numerator condition
-    validators:
-      - type: regex
-        expression: "^[A-Za-z0-9_.-]+$"
-        message: Use letters, digits, '_', '.', '-' only
-  - name: contrast_b
-    type: text
-    value: control
-    label: Denominator condition
-    validators:
-      - type: regex
-        expression: "^[A-Za-z0-9_.-]+$"
-        message: Use letters, digits, '_', '.', '-' only
-  - name: priors
-    type: data
-    format: tabular
     optional: true
-    label: External log-priors (optional)
-    help: "EXTERNAL_PRIORS columns: target_id, log_prior_weight[, group_id, sample, modality, confidence, source_uri]."
-  - name: max_mb
-    type: integer
-    value: 256
-    min: 1
-    max: 1048576
-    label: Byte budget (MiB of compressed input)
+    label: Optional Galaxy History FASTQ datasets (leave empty when streaming SRR/ERR or URLs)
+  - name: contrast
+    type: text
+    value: "condition:treated:control"
+    label: Primary differential expression contrast
+    help: "Format: condition:treated:control (or treated:control)."
+    validators:
+      - type: regex
+        expression: "^([A-Za-z0-9_]+[:=])?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$"
+  - name: organism_mode
+    type: select
+    label: Organism splicing regime
+    options:
+      - { label: "Auto-detect from GTF/GFF3", value: auto, selected: true }
+      - { label: "Eukaryotic (spliced cDNA + intron/intergenic decoys)", value: eukaryotic, selected: false }
+      - { label: "Prokaryotic / compact CDS", value: prokaryotic, selected: false }
+  - name: source_mode
+    type: select
+    label: Archive streaming transport
+    options:
+      - { label: "Auto (local History FASTQ or ENA HTTPS 206 byte-range)", value: auto, selected: true }
+      - { label: "ENA HTTPS 206 byte-range streaming", value: http_range, selected: false }
+      - { label: "AWS SRA Open Data spot-block streaming (xsra)", value: sra_odp, selected: false }
+      - { label: "Local History FASTQ bytes", value: local_bytes, selected: false }
+  - name: max_byte_fraction
+    type: float
+    value: 0.12
+    min: 0.005
+    max: 1.0
+    label: Maximum archive byte fraction to stream (0.12 = 12%)
+  - name: v_tech_target
+    type: float
+    value: 0.25
+    min: 0.02
+    max: 0.9
+    label: Stopping threshold on median V_tech / (V_tech + V_bio)
+  - name: enable_zoom
+    type: boolean
+    value: true
+    label: Enable Stage-5 targeted 31-mer borderline gene zoom
 outputs:
-  - name: de_table
+  - name: de_results
     type: data
     format: tabular
-    from_work_dir: de_table.tsv
-    label: PanExpr differential expression
-  - name: telemetry
+    from_work_dir: de_results.tsv
+    label: "Focaloop PanExpr: de_results.tsv"
+  - name: focaloop_report
     type: data
-    format: json
-    from_work_dir: telemetry.json
-    label: PanExpr telemetry and trap codes
-  - name: state
+    format: html
+    from_work_dir: focaloop_report.html
+    label: "Focaloop PanExpr: focaloop_report.html"
+  - name: panexpr_state
     type: data
     format: data
-    from_work_dir: focaloop_state.tar.zst
-    label: PanExpr warm state (.tar.zst)
+    from_work_dir: panexpr_state.focaloop.tar.zst
+    label: "Focaloop PanExpr: panexpr_state.focaloop.tar.zst"
 help:
   format: markdown
   content: |
-    Runs the `panexpr` focal loop: streams FASTQ blocks until the stop gate says more bytes no longer
-    change the answer, maps them with the kernel that wins a 28,000-read tournament (25,000 real + 5 x 600
-    synthetic reads; kernels breaking more than 20% of strain/paralog ties are disqualified), resolves
-    multi-strain placement with backward EM, and reports group-level log2 fold changes.
+    Runs the 5-stage **Focaloop PanExpr** adaptive RNA-seq differential expression engine without requiring
+    multi-gigabyte FASTQ uploads into Galaxy:
 
-    **Inputs** -- `targets`: target FASTA; `sample_sheet`: sample/condition/batch TSV in read order;
-    `reads`: one FASTQ per sample; `contrast_a`/`contrast_b`: condition levels; `priors`: optional
-    cross-modal log-priors; `max_mb`: compressed byte budget.
-    **Outputs** -- `de_table`: log2FC, SE, Wald p, BH-adjusted p, placement-variance fraction per group;
-    `telemetry`: tournament scoreboard, per-iteration gate metrics, `trap_codes`; `state`: Zstd-Parquet
-    warm state for zero-byte follow-up queries.
-
-    The job exits with code 3 when an abort trap fires (`LOW_MAP_RATE`, `TIE_SYMMETRY_FAIL`,
-    `CONFOUNDED_DESIGN`); the telemetry output names the trap.
+    1. **Stage 1 — Regime Classifier & Empirical Tournament:** Samples ~25,000 real reads plus synthetic ground-truth
+       reads from your catalog to benchmark candidate aligners (`strobealign`, `salmon`, `piscem`, `bwa-mem2`, `hisat2`, `minimap2`)
+       on accuracy, paralog/strain tie symmetry, and speed.
+    2. **Stage 2 — Inverse-Depth Byte-Range Streaming:** Streams compressed byte prefixes (`HTTP 206` or `xsra`)
+       allocated inversely to each library's mapped depth so shallow libraries catch up automatically.
+    3. **Stage 3 — C99 Sparse CSR EM Conditioning & Orthology Bridging:** Resolves isoform/paralog/multi-assembly
+       equivalence classes and links re-numbered assemblies via sequence-identity + reciprocal-best-hit ortholog groups.
+    4. **Stage 4 — PyDESeq2 + Variance-Ratio Stop Gate:** Propagates placement ambiguity into `lfcSE_total` and halts
+       streaming once median `V_tech / (V_tech + V_bio)` and `|Δlog2FC|` converge.
+    5. **Stage 5 — 31-mer Borderline Zoom & Warm State:** Scans an extra slice with a C canonical 31-mer filter for
+       borderline genes and saves a compact `.focaloop.tar.zst` bundle for instant 0-byte follow-up contrasts in **Focaloop Query**.
 citations:
   - type: doi
     content: 10.1038/nmeth.4197

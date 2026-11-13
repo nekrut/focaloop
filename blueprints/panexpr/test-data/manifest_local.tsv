@@ -1,0 +1,7 @@
+sample_id	condition	run_or_url
+ctrl1	control	ctrl1.fastq.gz
+ctrl2	control	ctrl2.fastq.gz
+ctrl3	control	ctrl3.fastq.gz
+trt1	treated	trt1.fastq.gz
+trt2	treated	trt2.fastq.gz
+trt3	treated	trt3.fastq.gz

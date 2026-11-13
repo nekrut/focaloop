@@ -18,7 +18,7 @@ def test_udt_is_strict_galaxy_user_tool(bid: str) -> None:
     doc = yaml.safe_load(path.read_text())
     assert doc["class"] == "GalaxyUserTool"
     assert isinstance(doc["version"], str)
-    assert doc["container"] == "ghcr.io/galaxyproject/focaloop:0.1.0"
+    assert doc["container"] == "ghcr.io/galaxyproject/focaloop:0.2.0"
     assert load_and_lint_user_tool(path) == []
     for o in doc["outputs"]:
         assert o.get("from_work_dir") or o.get("discover_datasets")
@@ -38,7 +38,7 @@ def test_udt_official_schema_when_available(bid: str) -> None:
 def test_udt_linter_rejects_xml_habits() -> None:
     bad = {
         "class": "GalaxyUserTool", "id": "Bad Tool", "version": 1, "name": "abc", "container": "",
-        "command": "x", "shell_command": "tool $threads '$(inputs.missing.path)' --label $(inputs.label)",
+        "command": "x", "shell_command": "tool $threads ${GALAXY_SLOTS:-8} '$(inputs.missing.path)' --label $(inputs.label)",
         "inputs": [{"name": "flag", "type": "boolean", "truevalue": "--x"},
                    {"name": "reads", "type": "data", "min": 1},
                    {"name": "label", "type": "text"}],
@@ -48,7 +48,8 @@ def test_udt_linter_rejects_xml_habits() -> None:
     errs = "\n".join(lint_user_tool(bad))
     for needle in ("unknown top-level field 'command'", "id 'Bad Tool'", "version", "name must be",
                    "blank_container", "truevalue", "'min' not allowed on data", "undeclared_input_ref: inputs.missing",
-                   "output_unclaimed", "help must be", "Cheetah-style", "interpolated unquoted"):
+                   "output_unclaimed", "help must be", "Cheetah-style", "interpolated unquoted",
+                   "bash parameter expansion"):
         assert needle in errs, needle
 
 
@@ -92,7 +93,7 @@ def test_blueprint_dir_is_complete(bid: str) -> None:
 def test_udt_linter_catches_live_galaxy_gotchas() -> None:
     base = yaml.safe_load((BLUEPRINTS / "panexpr" / "galaxy_udt.yml").read_text())
     assert lint_user_tool(base) == []
-    bad = dict(base, container="docker://ghcr.io/galaxyproject/focaloop:0.1.0")
+    bad = dict(base, container="docker://ghcr.io/galaxyproject/focaloop:0.2.0")
     assert any("explicit_singularity adds docker://" in e for e in lint_user_tool(bad))
     for sub in ("$(pwd)", "$(date +%s)", "$(nproc)"):
         bad = dict(base, shell_command="echo " + sub + " > log.txt && " + base["shell_command"])

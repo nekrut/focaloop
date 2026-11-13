@@ -8,3 +8,6 @@ build/
 .venv/
 uv.lock
 *.tar.zst.tmp
+*.so
+*.dylib
+

@@ -1,7 +1,7 @@
 <tool id="focaloop_bait" name="Focaloop Stage-0 31-mer bait scanner" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
     <description>screen the first bytes of many runs for a query locus</description>
     <macros>
-        <token name="@TOOL_VERSION@">0.1.0</token>
+        <token name="@TOOL_VERSION@">0.2.0</token>
         <token name="@VERSION_SUFFIX@">0</token>
         <token name="@PROFILE@">25.0</token>
     </macros>

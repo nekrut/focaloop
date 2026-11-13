@@ -18,9 +18,11 @@ pip install .            # provides the `focaloop` entry point
 
 | Command | Purpose |
 |---------|---------|
+| `focaloop panexpr --manifest M --ref-fasta F --ref-gtf G ...` | 5-stage adaptive RNA-seq differential expression loop (Stage-1 empirical aligner tournament, Stage-2 inverse-depth HTTP 206 / `xsra` streaming, Stage-3 C99 CSR EM + multi-reference orthology bridge, Stage-4 `PyDESeq2` + `V_tech/(V_tech+V_bio)` stop gate, Stage-5 31-mer zoom + `.focaloop.tar.zst` warm state) |
+| `focaloop malariavar --manifest M [--ref-fasta F] --mode focused_cram\|wgs_stream ...` | *P. falciparum* variation & WHO drug-resistance loop (Mode A 55-window `.crai` CRAM HTTP Range surveillance or Mode B raw SRA streaming + C 31-mer/PLA human host sieve + depth stop gate) |
+| `focaloop query --state-dir D\|A (--contrast A:B \| --args-json J) --out-table T --out-verdict V [--out-report R]` | zero-network-byte warm-state `PyDESeq2` contrast or sub-cohort WHO prevalence & Hudson $F_{ST}$ query guarded by `HypothesisLedger` |
 | `focaloop validate <blueprint>...` | strict blueprint validation (all violations at once) |
-| `focaloop run --blueprint B --spec S --state-dir D --out-table T --out-telemetry J [--state-archive A]` | stream, map, condition, gate; exit 3 on an abort trap |
-| `focaloop query --state-dir D\|A --contrast A:B --actor X --out-table T --out-verdict V` | zero-new-byte contrast / F_ST query guarded by the hypothesis ledger |
+| `focaloop run --blueprint B --spec S --state-dir D --out-table T --out-telemetry J [--state-archive A]` | declarative blueprint runner; exit 3 on an abort trap |
 | `focaloop bait --query-fasta Q --inputs ... --state-dir D --out-tsv T` | Stage-0 canonical 31-mer screen of many runs |
 | `focaloop steer --state-dir D --coords-bed B --out-bed O [--out-telemetry J]` | ONT ReadUntil enrich/deplete BED + `halt_run` |
 
@@ -28,20 +30,22 @@ pip install .            # provides the `focaloop` entry point
 
 | Path | Contents |
 |------|----------|
+| `focaloop/panexpr/` | production 5-stage RNA-seq engine (`piscem`/`salmon`/`strobealign`/`bwa-mem2`/`hisat2`/`minimap2` tournament, C99 CSR EM `_em_accel.c` + `_fast_c.c`, `PyDESeq2` variance-ratio stop gate, 31-mer borderline zoom) |
+| `focaloop/malariavar/` | production *P. falciparum* surveillance engine (55-window `.crai` CRAM HTTP Range fetcher, `xsra`/HTTPS streamer, C canonical 31-mer/PLA human host sieve `_sieve.c` + `_pla_sieve.c`, Dirichlet-multinomial diploid/polyclonal caller, WHO DRM + CNV + *hrp2/3* deletion + $F_{WS}$) |
+| `focaloop/galaxy_runners.py`, `reports.py` | ergonomic manifest-driven Galaxy orchestrators, self-contained HTML telemetry reports, `.focaloop.tar.zst` state packaging, and zero-network-byte warm queries |
 | `focaloop/state.py` | 9 Zstd-Parquet schemas + `FocaloopStateStore` |
 | `focaloop/hooks.py` | 5 capability hooks: `BaitPrefilter`, `EqClassBackendProtocol` + `HolobiontLocusRegistry`, `coalesce_residual_spans` + `apply_external_priors`, `SteeringMask`, `HypothesisLedger` |
 | `focaloop/blueprint.py` | typed blueprint model, `load_blueprint`, `validate_blueprint`, regime rules |
-| `focaloop/streamer.py` | 3-tier resolver (CRAM/BAM range → AWS ODP `https://sra-pub-run-odp.s3.amazonaws.com/sra/<RUN>/<RUN>` via `xsra dump -Q -P https` when `xsra` is on `PATH` → ENA HTTPS 206 fallback) + local files; byte-accounted blocks, discovery/holdout split |
-| `focaloop/kernels.py`, `tournament.py` | k-mer kernels + external aligner registry; 25,000 real + 5 × 600 synthetic read tournament with the ≥ 0.80 mate-tie symmetry gate |
-| `focaloop/conditioner.py`, `stop_gate.py` | backward EM with external log-priors; stop gate and design checks |
-| `focaloop/engine.py`, `ops.py`, `cli.py` | `run`; `query`, `bait`, `steer`; CLI |
-| `focaloop/variants.py`, `stats.py` | allele probes, CNV, deletions, F_WS; contrasts, BH, Hudson F_ST |
+| `focaloop/streamer.py` | 3-tier resolver (CRAM/BAM range → AWS ODP via `xsra` → ENA HTTPS 206 fallback) + local files |
+| `focaloop/kernels.py`, `tournament.py` | k-mer fallback kernels + tournament helpers |
+| `focaloop/conditioner.py`, `stop_gate.py` | blueprint backward EM + stop gate |
+| `focaloop/engine.py`, `ops.py`, `cli.py` | blueprint engine, `query`/`bait`/`steer`, unified `focaloop` CLI |
 | `focaloop/galaxy_lint.py` | offline strict UDT and XML checks (+ official `galaxy-tool-util` when installed) |
-| `blueprints/<id>/` | `blueprint.focaloop.yml`, `galaxy_udt.yml`, `galaxy_tool.xml`, `test-data/` |
-| `container/` | `Dockerfile` + pinned `environment.yml` for `ghcr.io/galaxyproject/focaloop:0.1.0` |
-| `galaxy/` | dedicated Galaxy 25.0+ config, tool panel, setup script, deploy notes |
+| `blueprints/<id>/` | `blueprint.focaloop.yml`, `galaxy_udt.yml` (`GalaxyUserTool`), `galaxy_tool.xml` (Tool Panel XML), `test-data/` |
+| `container/` | `Dockerfile`, `Apptainer.def`, and pinned `environment.yml` for `ghcr.io/galaxyproject/focaloop:0.2.0` |
+| `galaxy/` | Galaxy 25.0+/27.0+ config, tool panel, TPV rules, and deployment notes |
 | `skills/` | agent skills: `focaloop-run`, `focaloop-query`, `focaloop-distill` |
-| `scripts/make_test_data.py` | regenerates all seeded fixtures (`--state` also rebuilds query states) |
+| `scripts/make_test_data.py` | regenerates seeded fixtures |
 
 ## Blueprints
 
@@ -61,13 +65,10 @@ pip install .            # provides the `focaloop` entry point
 | `BYTE_CAP_UNCONVERGED` | byte budget hit before the stop gate converged | warn |
 | `CONFOUNDED_DESIGN` | contrast level missing, or condition perfectly confounded with batch | abort |
 
-## Status and limits
+## Galaxy deployment (`0.2.0`)
 
-- Builtin kernels (`kmer_eq`, `kmer_besthit`) are pure numpy. External aligners are registered by name and
-  report unavailable until SAM/PAF adapters land; the tournament skips them and records a warning.
-- Tier 1 (CRAM/BAM) and tier 2 (S3 SRA objects) are resolved but not yet decoded; streaming reads FASTQ
-  via local files, plain URLs and ENA tier 3.
-- The container image and the `focaloop` bioconda recipe are not published yet; the Galaxy XML
-  `<requirement>` resolves only once they are.
+- **Dual tool surfaces:** Every blueprint ships both a zero-admin `class: GalaxyUserTool` (`galaxy_udt.yml`, deployable via `POST /api/unprivileged_tools`) and a classic Galaxy Tool Panel XML wrapper (`galaxy_tool.xml`, profile `25.0`).
+- **Production engines:** `focaloop panexpr` (5-stage RNA-seq differential expression with external aligner tournament, C99 CSR EM, `PyDESeq2` variance-ratio stop gate, and 31-mer borderline zoom) and `focaloop malariavar` (55-window `.crai` CRAM HTTP Range surveillance + raw SRA `xsra`/HTTPS streaming through a C canonical 31-mer/PLA human host sieve, WHO DRM/CNV/*hrp2-3*/$F_{WS}$ caller) emit compact `.focaloop.tar.zst` warm-state bundles queried in seconds with `0` network bytes by `focaloop query`.
+- **Container resolution:** Build locally via `container/Dockerfile` or `container/Apptainer.def`; on Slurm + Apptainer clusters without public registry pushes, point TPV `singularity_container_id_override` at the shared `.sif` image.
 
 License: MIT.

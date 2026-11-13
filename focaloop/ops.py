@@ -41,11 +41,28 @@ def _meta(state_dir: Path) -> dict[str, Any]:
 
 def run_query(state_ref: str | Path, contrast: str, actor: str, out_table: str | Path, out_verdict: str | Path,
               hypothesis: str | None = None, mode: str = "auto", out_state_archive: str | Path | None = None,
-              alpha_budget: float = 0.05, n_perm: int = 199) -> dict[str, Any]:
+              alpha_budget: float = 0.05, n_perm: int = 199, out_report: str | Path | None = None,
+              design: str | None = None) -> dict[str, Any]:
     t0 = time.time()
     state_dir, tmp = materialize_state(state_ref)
     try:
         meta = _meta(state_dir)
+        if meta.get("engine") in ("panexpr", "malariavar"):
+            from .galaxy_runners import run_warm_engine_query
+
+            return run_warm_engine_query(
+                state_dir=state_dir,
+                meta=meta,
+                contrast=contrast,
+                actor=actor,
+                out_table=out_table,
+                out_verdict=out_verdict,
+                hypothesis=hypothesis,
+                design_override=design,
+                out_report=out_report,
+                out_state_archive=out_state_archive,
+                alpha_budget=alpha_budget,
+            )
         store = FocaloopStateStore(state_dir)
         field, (a, b) = parse_contrast(contrast)
         level = {s["sample"]: str(s.get(field, "")) for s in meta["samples"]}

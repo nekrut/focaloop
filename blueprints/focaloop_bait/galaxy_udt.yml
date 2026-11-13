@@ -1,9 +1,9 @@
 class: GalaxyUserTool
 id: focaloop-bait
-version: "0.1.0"
+version: "0.2.0"
 name: Focaloop Stage-0 31-mer bait scanner
 description: Screen the first bytes of many FASTQ datasets or SRA/ENA runs for reads sharing canonical 31-mers with a query
-container: ghcr.io/galaxyproject/focaloop:0.1.0
+container: ghcr.io/galaxyproject/focaloop:0.2.0
 shell_command: |
   focaloop bait \
   --query-fasta '$(inputs.query.path)' \

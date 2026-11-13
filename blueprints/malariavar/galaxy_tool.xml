@@ -1,7 +1,7 @@
-<tool id="focaloop_malariavar" name="MalariaVar focal-loop cohort variant calling" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
-    <description>SNP, indel, F_WS, CNV and hrp2/3 deletion calls with a host-decoy sieve</description>
+<tool id="focaloop_malariavar" name="Focaloop MalariaVar Plasmodium variation and drug-resistance loop" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>focused .crai CRAM range surveillance and host-sieved SRA streaming for WHO DRMs, CNVs, hrp2/3 and F_WS</description>
     <macros>
-        <token name="@TOOL_VERSION@">0.1.0</token>
+        <token name="@TOOL_VERSION@">0.2.0</token>
         <token name="@VERSION_SUFFIX@">0</token>
         <token name="@PROFILE@">25.0</token>
     </macros>
@@ -11,59 +11,66 @@
     </requirements>
     <version_command>focaloop --version</version_command>
     <command detect_errors="exit_code"><![CDATA[
-focaloop run
-    --blueprint '$__tool_directory__/blueprint.focaloop.yml'
-    --targets '$targets'
-    --sample-sheet '$sample_sheet'
-    --reads
-    #for $r in $reads
-        '$r'
-    #end for
-    --read-ids
-    #for $r in $reads
-        '$r.element_identifier'
-    #end for
-    --variant-sites '$sites'
-    --max-bytes \$(( $max_mb * 1048576 ))
-    --state-dir focaloop_state
-    --state-archive '$state'
-    --out-table '$variant_table'
-    --out-telemetry '$telemetry'
+focaloop malariavar
+    --manifest '$manifest'
+    #if $ref_fasta
+        --ref-fasta '$ref_fasta'
+    #end if
+    --mode '$mode'
+    --target-depth $target_depth
+    --mapper '$mapper'
+    --threads \${GALAXY_SLOTS:-8}
+    --state-dir malariavar_state_dir
+    --state-archive '$malariavar_state'
+    --out-drm '$drm_calls'
+    --out-variants '$variants_summary'
+    --out-report '$malariavar_report'
     ]]></command>
     <inputs>
-        <param name="targets" type="data" format="fasta" label="Parasite gene bodies plus host decoy (FASTA)" help="Mark host sequences with kind=host_decoy in the header"/>
-        <param name="sample_sheet" type="data" format="tabular" label="Sample sheet" help="Header: sample, condition[, site, year, ...]"/>
-        <param name="reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" label="Reads, one dataset per sample"/>
-        <param name="sites" type="data" format="tabular" label="Variant sites" help="site_id, target_id, pos (0-based), ref, alt[, kind]"/>
-        <param name="max_mb" type="integer" min="1" max="1048576" value="512" label="Byte budget (MiB of compressed input)"/>
+        <param name="manifest" type="data" format="tabular" label="Isolate manifest (TSV)" help="Columns: sample_id, country_or_group, source_uri_or_srr[, crai_uri_optional, population, sample_type]"/>
+        <param name="ref_fasta" type="data" format="fasta,fasta.gz" optional="true" label="Pf3D7 reference FASTA (optional; uses bundled Pf3D7 if omitted)"/>
+        <param name="mode" type="select" label="Surveillance streaming mode">
+            <option value="auto" selected="true">Auto-detect per isolate (.cram vs ERR/SRR)</option>
+            <option value="focused_cram">Mode A: Focused .crai CRAM HTTP Range surveillance</option>
+            <option value="wgs_stream">Mode B: Raw SRA/FASTQ streaming + C host sieve</option>
+        </param>
+        <param name="target_depth" type="float" min="5.0" max="100.0" value="24.0" label="Target median core depth (Mode B stop gate)"/>
+        <param name="mapper" type="select" label="Short-read aligner (Mode B)">
+            <option value="auto" selected="true">Auto (ISA-aware: minimap2 on non-AVX2, strobealign on AVX2)</option>
+            <option value="strobealign">strobealign</option>
+            <option value="minimap2">minimap2</option>
+            <option value="bwa-mem2">bwa-mem2</option>
+        </param>
     </inputs>
     <outputs>
-        <data name="variant_table" format="tabular" label="${tool.name} on ${on_string}: calls"/>
-        <data name="telemetry" format="json" label="${tool.name} on ${on_string}: telemetry"/>
-        <data name="state" format="data" label="${tool.name} on ${on_string}: warm state (.tar.zst)"/>
+        <data name="drm_calls" format="tabular" label="${tool.name} on ${on_string}: drm_calls.tsv"/>
+        <data name="variants_summary" format="tabular" label="${tool.name} on ${on_string}: variants_summary.tsv"/>
+        <data name="malariavar_report" format="html" label="${tool.name} on ${on_string}: malariavar_report.html"/>
+        <data name="malariavar_state" format="data" label="${tool.name} on ${on_string}: malariavar_state.focaloop.tar.zst"/>
     </outputs>
     <tests>
-        <test expect_num_outputs="3">
-            <param name="targets" value="targets.fa"/>
-            <param name="sample_sheet" value="samples.tsv"/>
-            <param name="reads" value="ML02.fastq.gz,ML03.fastq.gz,GH01.fastq.gz,GH05.fastq.gz" ftype="fastqsanger.gz"/>
-            <param name="sites" value="sites.tsv"/>
-            <output name="variant_table">
+        <test expect_num_outputs="4">
+            <param name="manifest" value="manifest_pf8.tsv"/>
+            <param name="ref_fasta" value="targets.fa"/>
+            <param name="mode" value="focused_cram"/>
+            <output name="drm_calls">
                 <assert_contents>
-                    <has_text text="pfcrt_K76T"/>
-                    <has_line_matching expression="GH01\tcnv\tpfmdr1\tpfmdr1\t[0-9.]+\t0\t0\tamplified"/>
-                    <has_line_matching expression="GH05\tdeletion\thrp2\thrp2\t0\t0\t0\tdeleted"/>
-                    <has_line_matching expression="ML03\tfws\tF_WS\t\t[0-9.]+\t0\t0\tpolyclonal"/>
+                    <has_text text="who_artemisinin"/>
                 </assert_contents>
             </output>
-            <output name="telemetry">
+            <output name="variants_summary">
                 <assert_contents>
-                    <has_text text="&quot;trap_codes&quot;: []"/>
+                    <has_text text="sample_id"/>
                 </assert_contents>
             </output>
-            <output name="state">
+            <output name="malariavar_report">
                 <assert_contents>
-                    <has_size min="1000"/>
+                    <has_text text="Focaloop MalariaVar"/>
+                </assert_contents>
+            </output>
+            <output name="malariavar_state">
+                <assert_contents>
+                    <has_size min="500"/>
                 </assert_contents>
             </output>
         </test>
@@ -71,21 +78,11 @@ focaloop run
     <help format="markdown"><![CDATA[
 **What it does**
 
-Runs the `malariavar` focal loop over a *Plasmodium falciparum* cohort. Allele-specific 31-mer probes
-count reference and alternate support at each declared SNP or indel. Effective depth relative to
-single-copy control genes gives copy ratios for *crt*, *mdr1*, *gch1* and *plasmepsin 2/3*; *hrp2* and
-*hrp3* are called deleted below 0.1x. F_WS summarises within-host diversity (below 0.95 = polyclonal).
-Reads whose best k-mer hit is a host decoy are sieved out before calling.
-
------
-
-**Outputs**
-
-- *Calls*: one row per sample x feature (`snp`, `indel`, `cnv`, `deletion`, `fws`).
-- *Telemetry*: tournament scoreboard, gate metrics and `trap_codes`.
-- *Warm state*: includes allele counts for the spatiotemporal F_ST query tool.
+Runs **Focaloop MalariaVar** in either focused `.crai` CRAM HTTP Range surveillance mode (55 curated drug-resistance,
+CNV, *hrp2/3* deletion, and core barcode windows) or raw SRA/ENA streaming mode with an inline C 31-mer / PLA human
+host-depletion sieve and adaptive depth stop gate.
     ]]></help>
     <citations>
-        <citation type="doi">10.1038/nature11174</citation>
+        <citation type="doi">10.12688/wellcomeopenres.18681.1</citation>
     </citations>
 </tool>

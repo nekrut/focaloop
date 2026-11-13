@@ -1,7 +1,7 @@
-<tool id="focaloop_query" name="Focaloop warm-state contrast and F_ST query" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
-    <description>zero-new-byte follow-up verified on the reusable holdout</description>
+<tool id="focaloop_query" name="Focaloop Query warm-state instant contrast and sub-cohort comparison" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>zero-network-byte follow-up contrast or sub-cohort F_ST guarded by HypothesisLedger</description>
     <macros>
-        <token name="@TOOL_VERSION@">0.1.0</token>
+        <token name="@TOOL_VERSION@">0.2.0</token>
         <token name="@VERSION_SUFFIX@">0</token>
         <token name="@PROFILE@">25.0</token>
     </macros>
@@ -18,48 +18,59 @@ focaloop query
     #if str($hypothesis).strip()
         --hypothesis '$hypothesis'
     #end if
+    #if str($design).strip()
+        --design '$design'
+    #end if
     --mode '$mode'
     --out-table '$query_table'
     --out-verdict '$verdict'
+    --out-report '$query_report'
     --out-state-archive '$state_out'
     ]]></command>
     <inputs>
-        <param name="state" type="data" format="data" label="Focaloop warm state (.tar.zst)"/>
-        <param name="contrast" type="text" value="treated:control" label="Contrast" help="A:B on the condition column, or field=A:B (e.g. site=Ghana:Mali)">
-            <validator type="regex" message="Use A:B or field=A:B">([A-Za-z0-9_]+=)?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+</validator>
+        <param name="state" type="data" format="data" label="Saved Focaloop state (.focaloop.tar.zst)"/>
+        <param name="contrast" type="text" value="condition:treated:control" label="Contrast or sub-cohort comparison" help="e.g. condition:AR0387:AR0382 or Population:AS-SE-E:AF-W">
+            <validator type="regex" message="Use A:B, factor:A:B, or factor=A:B">([A-Za-z0-9_]+[:=])?[A-Za-z0-9_,.-]+:[A-Za-z0-9_,.-]+</validator>
         </param>
-        <param name="actor" type="text" value="human" label="Actor recorded in the hypothesis ledger">
+        <param name="actor" type="text" value="human" label="Actor recorded in HypothesisLedger">
             <validator type="regex" message="Use 'human' or 'agent:name'">(human|agent:[A-Za-z0-9_.-]+)</validator>
         </param>
-        <param name="hypothesis" type="text" value="" label="Group to test" help="Leave empty to test the top discovery hit">
-            <validator type="regex" message="Letters, digits, '_', '.', '-', '=' only">[A-Za-z0-9_.=-]*</validator>
+        <param name="hypothesis" type="text" value="" label="Specific gene / group to test (optional)">
+            <validator type="regex" message="Letters, digits, '_', ':', '.', '-', '=' only">[A-Za-z0-9_:.=-]*</validator>
+        </param>
+        <param name="design" type="text" value="" label="Optional Wilkinson formula override (PanExpr)">
+            <validator type="regex" message="Formula characters only">[A-Za-z0-9_ +~:*()-]*</validator>
         </param>
         <param name="mode" type="select" label="Query mode">
-            <option value="auto" selected="true">Auto (F_ST when allele counts exist)</option>
-            <option value="contrast">Contrast</option>
-            <option value="fst">F_ST</option>
+            <option value="auto" selected="true">Auto-detect from saved state</option>
+            <option value="contrast">Differential expression contrast</option>
+            <option value="fst">Sub-cohort F_ST and prevalence</option>
         </param>
     </inputs>
     <outputs>
-        <data name="query_table" format="tabular" label="${tool.name} on ${on_string}: table"/>
-        <data name="verdict" format="json" label="${tool.name} on ${on_string}: verdict"/>
-        <data name="state_out" format="data" label="${tool.name} on ${on_string}: state with ledger entry"/>
+        <data name="query_table" format="tabular" label="${tool.name} on ${on_string}: query_table.tsv"/>
+        <data name="verdict" format="json" label="${tool.name} on ${on_string}: verdict.json"/>
+        <data name="query_report" format="html" label="${tool.name} on ${on_string}: query_report.html"/>
+        <data name="state_out" format="data" label="${tool.name} on ${on_string}: updated state (.focaloop.tar.zst)"/>
     </outputs>
     <tests>
-        <test expect_num_outputs="3">
+        <test expect_num_outputs="4">
             <param name="state" value="panexpr_state.tar.zst" ftype="data"/>
             <param name="contrast" value="treated:control"/>
             <param name="actor" value="agent:planemo"/>
             <output name="query_table">
                 <assert_contents>
-                    <has_text text="log2fc_holdout"/>
                     <has_text text="g2"/>
                 </assert_contents>
             </output>
             <output name="verdict">
                 <assert_contents>
                     <has_text text="&quot;new_bytes&quot;: 0"/>
-                    <has_text text="&quot;confirmed&quot;: true"/>
+                </assert_contents>
+            </output>
+            <output name="query_report">
+                <assert_contents>
+                    <has_text text="0 B"/>
                 </assert_contents>
             </output>
             <output name="state_out">
@@ -68,7 +79,7 @@ focaloop query
                 </assert_contents>
             </output>
         </test>
-        <test expect_num_outputs="3">
+        <test expect_num_outputs="4">
             <param name="state" value="malariavar_state.tar.zst" ftype="data"/>
             <param name="contrast" value="site=Ghana:Mali"/>
             <param name="actor" value="human"/>
@@ -83,6 +94,11 @@ focaloop query
                     <has_text text="&quot;mode&quot;: &quot;fst&quot;"/>
                 </assert_contents>
             </output>
+            <output name="query_report">
+                <assert_contents>
+                    <has_text text="0 B"/>
+                </assert_contents>
+            </output>
             <output name="state_out">
                 <assert_contents>
                     <has_size min="1000"/>
@@ -93,19 +109,9 @@ focaloop query
     <help format="markdown"><![CDATA[
 **What it does**
 
-Answers a follow-up question against a saved focaloop state without streaming new bytes.
-*Contrast* mode estimates group-level log2 fold changes on the discovery partition, re-tests the chosen
-group on the holdout partition, and charges the query against the HypothesisLedger alpha-wealth
-(online alpha-investing). *F_ST* mode computes Hudson F_ST between two sample groups from saved allele
-counts, with a label-permutation p-value, on both partitions.
-
------
-
-**Outputs**
-
-- *Table*: discovery and holdout estimates.
-- *Verdict*: JSON with `confirmed`, alpha allocated, remaining wealth and `new_bytes: 0`.
-- *State with ledger entry*: chain it into the next query so alpha-wealth carries over.
+Executes a zero-network-byte follow-up contrast (`PanExpr`) or sub-cohort WHO resistance & Hudson $F_{ST}$
+comparison (`MalariaVar`) against a saved `.focaloop.tar.zst` warm state bundle, charging alpha-wealth in
+the persisted `HypothesisLedger`.
     ]]></help>
     <citations>
         <citation type="doi">10.1126/science.aaa9375</citation>

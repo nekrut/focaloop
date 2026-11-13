@@ -1,0 +1,12 @@
+g1.strainA	focaloop	exon	1	900	.	+	.	gene_id "g1"; transcript_id "g1.strainA"; gene_name "g1";
+g2.strainA	focaloop	exon	1	900	.	+	.	gene_id "g2"; transcript_id "g2.strainA"; gene_name "g2";
+g3.strainA	focaloop	exon	1	900	.	+	.	gene_id "g3"; transcript_id "g3.strainA"; gene_name "g3";
+g4.strainA	focaloop	exon	1	900	.	+	.	gene_id "g4"; transcript_id "g4.strainA"; gene_name "g4";
+g5.strainA	focaloop	exon	1	900	.	+	.	gene_id "g5"; transcript_id "g5.strainA"; gene_name "g5";
+g6.strainA	focaloop	exon	1	900	.	+	.	gene_id "g6"; transcript_id "g6.strainA"; gene_name "g6";
+g7.strainA	focaloop	exon	1	900	.	+	.	gene_id "g7"; transcript_id "g7.strainA"; gene_name "g7";
+g8.strainA	focaloop	exon	1	900	.	+	.	gene_id "g8"; transcript_id "g8.strainA"; gene_name "g8";
+g1.strainB	focaloop	exon	1	900	.	+	.	gene_id "g1_B"; transcript_id "g1.strainB"; gene_name "g1_B";
+g2.strainB	focaloop	exon	1	900	.	+	.	gene_id "g2_B"; transcript_id "g2.strainB"; gene_name "g2_B";
+g3.strainB	focaloop	exon	1	900	.	+	.	gene_id "g3_B"; transcript_id "g3.strainB"; gene_name "g3_B";
+phage_v1	focaloop	exon	1	900	.	+	.	gene_id "phage_v1"; transcript_id "phage_v1"; gene_name "phage_v1";
