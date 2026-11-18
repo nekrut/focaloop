@@ -1,13 +1,13 @@
 # Dedicated Galaxy 25.0+ server for focaloop
 
-This directory holds a ready-to-run configuration for a Galaxy `25.0+` instance that serves the four
-focaloop blueprints both ways: as ToolShed-style XML tools in a **Focaloop** tool panel section, and as
+This directory holds a ready-to-run configuration for a Galaxy `25.0+` instance that serves the
+focaloop tools both ways: as ToolShed-style XML tools in a **Focaloop** tool panel section (`tools/focaloop/*.xml`), and as
 unprivileged user-defined tools (UDTs) that users register from `blueprints/*/galaxy_udt.yml`.
 
 | File | Purpose |
 |------|---------|
 | `galaxy_25_focaloop.yml` | `galaxy.yml` template: gravity on 127.0.0.1, closed registration, SQLite, UDTs on, Apptainer-only jobs |
-| `focaloop_tool_conf.xml` | Tool panel section pointing at `blueprints/*/galaxy_tool.xml` in this checkout |
+| `focaloop_tool_conf.xml` | Tool panel section pointing at `tools/focaloop/{expressionloop,variationloop,geneloop,focaloop_query}.xml` in this checkout |
 | `setup_galaxy25.sh` | Clones Galaxy `release_25.0`, renders the config, pulls the focaloop image, probes HTTP 206 |
 
 ## Targets
@@ -21,11 +21,11 @@ unprivileged user-defined tools (UDTs) that users register from `blueprints/*/ga
 
 1. Build and push the image (from the repository root), or build the `.sif` locally:
    ```bash
-   docker build -f container/Dockerfile -t ghcr.io/galaxyproject/focaloop:0.1.0 .
-   docker push ghcr.io/galaxyproject/focaloop:0.1.0          # needs push rights to the org
+   docker build -f container/Dockerfile -t ghcr.io/galaxyproject/focaloop:0.3.0 .
+   docker push ghcr.io/galaxyproject/focaloop:0.3.0          # needs push rights to the org
    ```
    Without push rights, build the `.sif` on the host and skip the pull:
-   `apptainer build $GALAXY_ROOT/images/focaloop_0.1.0.sif docker-daemon://ghcr.io/galaxyproject/focaloop:0.1.0`.
+   `apptainer build $GALAXY_ROOT/images/focaloop_0.3.0.sif docker-daemon://ghcr.io/galaxyproject/focaloop:0.3.0`.
 2. Install: `GALAXY_ROOT=/media/anton/hd2/galaxy-focaloop galaxy/setup_galaxy25.sh`.
 3. Start: `GALAXY_CONFIG_FILE=$GALAXY_ROOT/config/galaxy.yml $GALAXY_ROOT/server/.venv/bin/galaxyctl start`.
    Gunicorn binds `127.0.0.1:8080` only; reach it through an nginx TLS reverse proxy or

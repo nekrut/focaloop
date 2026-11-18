@@ -82,7 +82,7 @@ def ensure_shared_lib(
     last_err = ""
     try:
         for extra in attempts:
-            cmd = base_cmd + extra + [str(p) for p in src_paths] + ["-lm", "-o", str(tmp_out)]
+            cmd = base_cmd + extra + [str(p) for p in src_paths] + ["-lpthread", "-lm", "-o", str(tmp_out)]
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0 and tmp_out.exists():
                 os.replace(tmp_out, target)

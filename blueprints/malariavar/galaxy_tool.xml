@@ -1,5 +1,5 @@
 <tool id="focaloop_malariavar" name="Focaloop MalariaVar Plasmodium variation and drug-resistance loop" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
-    <description>focused .crai CRAM range surveillance and host-sieved SRA streaming for WHO DRMs, CNVs, hrp2/3 and F_WS</description>
+    <description>focused .crai CRAM range surveillance and host-depleted SRA streaming for WHO DRMs, CNVs, hrp2/3 and F_WS</description>
     <macros>
         <token name="@TOOL_VERSION@">0.2.0</token>
         <token name="@VERSION_SUFFIX@">0</token>
@@ -32,7 +32,7 @@ focaloop malariavar
         <param name="mode" type="select" label="Surveillance streaming mode">
             <option value="auto" selected="true">Auto-detect per isolate (.cram vs ERR/SRR)</option>
             <option value="focused_cram">Mode A: Focused .crai CRAM HTTP Range surveillance</option>
-            <option value="wgs_stream">Mode B: Raw SRA/FASTQ streaming + C host sieve</option>
+            <option value="wgs_stream">Mode B: Raw SRA/FASTQ streaming + C host depletion filter</option>
         </param>
         <param name="target_depth" type="float" min="5.0" max="100.0" value="24.0" label="Target median core depth (Mode B stop gate)"/>
         <param name="mapper" type="select" label="Short-read aligner (Mode B)">
@@ -80,7 +80,7 @@ focaloop malariavar
 
 Runs **Focaloop MalariaVar** in either focused `.crai` CRAM HTTP Range surveillance mode (55 curated drug-resistance,
 CNV, *hrp2/3* deletion, and core barcode windows) or raw SRA/ENA streaming mode with an inline C 31-mer / PLA human
-host-depletion sieve and adaptive depth stop gate.
+host-depletion filter and adaptive depth stop gate.
     ]]></help>
     <citations>
         <citation type="doi">10.12688/wellcomeopenres.18681.1</citation>

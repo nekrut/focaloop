@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import threading
@@ -208,7 +209,7 @@ class XsraRunStream:
         self._holdout = set(self.plan.holdout)
         self.bytes_per_spot = run.total_bytes / max(1, run.read_count)
         self.threads = int(threads) if threads is not None else int(os.environ.get("PANEXPR_XSRA_THREADS", "4"))
-        self.max_concurrent_procs = max(1, int(os.environ.get("PANEXPR_MAX_XSRA_PROCS", "8")))
+        self.max_concurrent_procs = max(1, int(os.environ.get("PANEXPR_MAX_XSRA_PROCS", "24")))
         self.cache_dir = cache_dir
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
@@ -263,12 +264,11 @@ class XsraRunStream:
             xsra_dump_command(self.run.run_id, None, self.threads),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1 << 20,
+            bufsize=0,
         )
 
-    def _iter_lines(self):
-        if self._lines is None:
+    def _ensure_proc(self):
+        if self._proc is None:
             cond = XsraRunStream._PROC_COND
             active = XsraRunStream._ACTIVE_STREAMS
             with cond:
@@ -277,14 +277,61 @@ class XsraRunStream:
                     if vic is not None:
                         active.remove(vic)
                         vic._lines = None
-                        # Kill outside lock? Wait briefly while holding/killing so OS PIDs stay <= max_concurrent_procs.
+                        vic._bin_rem = b""
+                        vic._bin_batch = []
+                        vic._bin_idx = 0
                         vic._terminate_proc_only()
                         break
                     cond.wait(timeout=0.5)
                 self._proc = self._spawn_proc()
+                self._bin_rem = b""
+                self._bin_batch = []
+                self._bin_idx = 0
                 active.append(self)
-                self._lines = iter(self._proc.stdout)
+        return self._proc
+
+    def _iter_lines(self):
         return self._lines
+
+    def _read_pipe_chunk(self) -> list[bytes] | None:
+        """Read up to 4 MiB of binary FASTQ from xsra stdout with a hard select() timeout watchdog."""
+        timeout_s = float(os.environ.get("PANEXPR_XSRA_TIMEOUT_S", "90.0"))
+        proc = self._ensure_proc()
+        if proc.stdout is None:
+            return None
+        fd = None
+        try:
+            fd = proc.stdout.fileno()
+        except Exception:
+            fd = None
+        if fd is not None:
+            try:
+                rdy, _, _ = select.select([fd], [], [], timeout_s)
+            except Exception:
+                rdy = [fd]
+            if not rdy:
+                # Socket stalled for timeout_s seconds: kill subprocess so caller retries or falls back cleanly
+                self._terminate_proc_only()
+                with XsraRunStream._PROC_COND:
+                    if self in XsraRunStream._ACTIVE_STREAMS:
+                        XsraRunStream._ACTIVE_STREAMS.remove(self)
+                        XsraRunStream._PROC_COND.notify_all()
+                return b"__TIMEOUT__"  # type: ignore[return-value]
+            try:
+                raw = os.read(fd, 4 << 20)
+            except Exception:
+                raw = b""
+        else:
+            # In-memory test stream (e.g. io.StringIO / io.BytesIO without OS file descriptor)
+            chunk = proc.stdout.read(4 << 20)
+            raw = chunk.encode("latin-1") if isinstance(chunk, str) else (chunk or b"")
+        if not raw:
+            return None
+        rem = getattr(self, "_bin_rem", b"")
+        buf = (rem + raw) if rem else raw
+        lines = buf.split(b"\n")
+        self._bin_rem = lines[-1]
+        return lines[:-1]
 
     def _terminate_proc_only(self) -> None:
         proc = self._proc
@@ -347,43 +394,89 @@ class XsraRunStream:
         return False
 
     def _next_record(self):
-        while True:
-            it = self._iter_lines()
-            try:
-                h = next(it)
-                while not h.startswith("@"):
+        if self._custom_line_source:
+            it = self._lines
+            while True:
+                try:
                     h = next(it)
-                sq = next(it)
-                if sq.startswith("+"):
-                    # Guard against xsra 3-line zero-length segment quirk (@hdr / + / qual)
-                    next(it)
-                    continue
-                plus = next(it)
-                if not plus.startswith("+"):
-                    continue
-                q = next(it)
-                sq_s = sq.rstrip("\n")
-                q_s = q.rstrip("\n")
-                if not sq_s or len(sq_s) != len(q_s):
-                    continue
-                self.network_bytes += len(h) + len(sq_s) + len(q_s) + 4
-                return h[1:].rstrip("\n"), sq_s, q_s
-            except StopIteration:
-                if self._custom_line_source:
+                    while not h.startswith("@"):
+                        h = next(it)
+                    sq = next(it)
+                    if sq.startswith("+"):
+                        next(it)
+                        continue
+                    plus = next(it)
+                    if not plus.startswith("+"):
+                        continue
+                    q = next(it)
+                    sq_s = sq.rstrip("\n")
+                    q_s = q.rstrip("\n")
+                    if not sq_s or len(sq_s) != len(q_s):
+                        continue
+                    self.network_bytes += len(h) + len(sq_s) + len(q_s) + 4
+                    return h[1:].rstrip("\n"), sq_s, q_s
+                except StopIteration:
                     self._done = True
                     return None
-                rc = self._reap_proc()
-                self._lines = None
-                premature = (rc not in (0, None)) or (self._last_raw_spot == 0 and self.plan.n_spots > 0)
-                if premature and self.retries < self.max_retries:
-                    self.retries += 1
-                    if self.retry_backoff_s > 0:
-                        time.sleep(min(2.0, self.retry_backoff_s * (2 ** (self.retries - 1))))
-                    continue
-                if premature and self._activate_fallback_if_available():
+
+        while True:
+            batch = getattr(self, "_bin_batch", None)
+            idx = getattr(self, "_bin_idx", 0)
+            if not batch or idx + 3 >= len(batch):
+                rem_lines = batch[idx:] if batch and idx < len(batch) else []
+                nxt = self._read_pipe_chunk()
+                if nxt == b"__TIMEOUT__":
+                    self._bin_batch = []
+                    self._bin_idx = 0
+                    if self.retries < self.max_retries:
+                        self.retries += 1
+                        if self.retry_backoff_s > 0:
+                            time.sleep(min(2.0, self.retry_backoff_s * (2 ** (self.retries - 1))))
+                        continue
+                    if self._activate_fallback_if_available():
+                        return None
+                    self._done = True
                     return None
-                self._done = True
-                return None
+                if nxt is None:
+                    rc = self._reap_proc()
+                    self._bin_batch = []
+                    self._bin_idx = 0
+                    premature = (rc not in (0, None)) or (self._last_raw_spot == 0 and self.plan.n_spots > 0)
+                    if premature and self.retries < self.max_retries:
+                        self.retries += 1
+                        if self.retry_backoff_s > 0:
+                            time.sleep(min(2.0, self.retry_backoff_s * (2 ** (self.retries - 1))))
+                        continue
+                    if premature and self._activate_fallback_if_available():
+                        return None
+                    self._done = True
+                    return None
+                batch = (rem_lines + nxt) if rem_lines else nxt
+                self._bin_batch = batch
+                idx = 0
+                self._bin_idx = 0
+                if len(batch) < 4:
+                    continue
+
+            h_b = batch[idx]
+            if not h_b or h_b[0] != 64:
+                self._bin_idx = idx + 1
+                continue
+            sq_b = batch[idx + 1]
+            if sq_b and sq_b[0] == 43:
+                # xsra 3-line zero-length segment quirk (@hdr / + / qual)
+                self._bin_idx = idx + 3
+                continue
+            plus_b = batch[idx + 2]
+            if not plus_b or plus_b[0] != 43:
+                self._bin_idx = idx + 1
+                continue
+            q_b = batch[idx + 3]
+            self._bin_idx = idx + 4
+            if not sq_b or len(sq_b) != len(q_b):
+                continue
+            self.network_bytes += len(h_b) + len(sq_b) + len(q_b) + 4
+            return h_b[1:].decode("latin-1"), sq_b.decode("latin-1"), q_b.decode("latin-1")
 
     def advance_bytes(self, n_bytes: int):
         if self._fallback_stream is not None:
@@ -407,6 +500,8 @@ class XsraRunStream:
         got = 0
         pending: list = self._carry       # first records of a spot read at the end of the previous call
         self._carry = []
+        block_spots = self.plan.block_spots
+        holdout = self._holdout
         while got < want and not self._done:
             rec = self._next_record()
             if rec is None:
@@ -416,23 +511,24 @@ class XsraRunStream:
             spot, seg = _spot_and_segment(rec[0])
             if self._is_spot_done(spot):
                 continue                                    # already processed prior to an xsra pipe retry
-            block = (spot - 1) // self.plan.block_spots
-            if block in self._holdout:
+            block = (spot - 1) // block_spots
+            if block in holdout:
                 if spot != self._last_dropped:
                     self.dropped_holdout_spots += 1
                     self._last_dropped = spot
-                self._last_raw_spot = max(self._last_raw_spot, spot)
+                if spot > self._last_raw_spot:
+                    self._last_raw_spot = spot
                 self._mark_spot_done(spot)
                 continue                                    # holdout: never leaves this class
             if pending:
-                p_spot = _spot_and_segment(pending[0][0])[0]
+                p_spot = pending[0][0]
                 if p_spot != spot:
                     self._emit(pending, r1, r2, paired)
                     got += 1
                     pending = []
-                elif any(_spot_and_segment(x[0])[1] == seg for x in pending):
+                elif (len(pending) == 1 and pending[0][1] == seg) or (len(pending) > 1 and any(x[1] == seg for x in pending)):
                     continue                                # duplicate mate after mid-spot pipe retry
-            pending.append(rec)
+            pending.append((spot, seg, rec[1], rec[2]))
         if pending:
             if self._done and got < want:
                 self._emit(pending, r1, r2, paired)       # last spot of the run
@@ -456,15 +552,17 @@ class XsraRunStream:
             self._seen_overflow.add(spot)
 
     def _emit(self, recs, r1, r2, paired):
-        spot = _spot_and_segment(recs[0][0])[0]
-        self.served_spot_ids.append(spot)
-        self._last_raw_spot = max(self._last_raw_spot, spot)
+        spot = recs[0][0]
+        if len(self.served_spot_ids) < 200_000:
+            self.served_spot_ids.append(spot)
+        if spot > self._last_raw_spot:
+            self._last_raw_spot = spot
         self._mark_spot_done(spot)
         if paired:
             if len(recs) >= 2:
-                r1.append((recs[0][1], recs[0][2])); r2.append((recs[1][1], recs[1][2]))
+                r1.append((recs[0][2], recs[0][3])); r2.append((recs[1][2], recs[1][3]))
         else:
-            for _n, sq, q in recs:
+            for _sp, _sg, sq, q in recs:
                 r1.append((sq, q))
 
     def advance_fraction(self, frac: float, min_bytes: int = 262_144):
@@ -480,5 +578,4 @@ class XsraRunStream:
             if self in XsraRunStream._ACTIVE_STREAMS:
                 XsraRunStream._ACTIVE_STREAMS.remove(self)
                 XsraRunStream._PROC_COND.notify_all()
-        if self._proc is not None and self._proc.poll() is None:
-            self._proc.kill()
+        self._terminate_proc_only()

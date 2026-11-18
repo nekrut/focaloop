@@ -89,6 +89,21 @@ DOTHASH_SKETCH_SCHEMA = pa.schema([
     ("sketch_int16", pa.binary(4096)),
 ])
 
+TRANSCRIPT_ABUNDANCE_SCHEMA = pa.schema([
+    ("sample", pa.string()),
+    ("condition", pa.string()),
+    ("target_id", pa.string()),
+    ("gene_id", pa.string()),
+    ("group_id", pa.string()),
+    ("symbol", pa.string()),
+    ("biotype", pa.string()),
+    ("length_bp", pa.int32()),
+    ("effective_length", pa.float64()),
+    ("transcript_counts", pa.float64()),
+    ("transcript_tpm", pa.float64()),
+    ("isoform_fraction_psi", pa.float64()),
+])
+
 
 class StateStore:
     def __init__(self, state_dir: str | Path) -> None:

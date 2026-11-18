@@ -1,1 +1,1 @@
-"""Compiled native C acceleration modules for MalariaVar."""
+"""Compiled native C acceleration modules for VarLoop / MalariaVar."""

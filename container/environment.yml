@@ -1,4 +1,4 @@
-# Pinned conda environment for ghcr.io/galaxyproject/focaloop:0.2.0
+# Pinned conda environment for ghcr.io/galaxyproject/focaloop:0.3.0
 name: focaloop
 channels:
   - conda-forge
@@ -14,9 +14,12 @@ dependencies:
   - requests>=2.31
   - pydeseq2>=0.4.12
   - statsmodels>=0.14
+  - scikit-learn>=1.5
   - numba>=0.60
   - mappy>=2.28
   - pysam>=0.22
+  - biopython>=1.83
+  - zstandard
   - bwa=0.7.19
   - bwa-mem2=2.2.1
   - strobealign=0.14.0
@@ -25,10 +28,22 @@ dependencies:
   - hisat2=2.2.1
   - salmon=1.10.3
   - piscem>=0.10.3
+  - kallisto
   - samtools=1.21
   - bcftools=1.21
   - htslib=1.21
+  - miniprot
+  - diamond
+  - tantan
+  - stringtie
+  - compleasm
+  - gffcompare
+  - seqkit
+  - hmmer
+  - infernal
+  - trnascan-se
+  - barrnap
   - curl
   - zstd
   - pip
-# xsra (Tier-2 SRA decoder, `xsra dump -Q -P https`) can be added from release binary or `cargo install xsra`.
+# xsra (Tier-2 SRA decoder, `xsra dump -Q -P https`) and themisto can be added from release binaries.

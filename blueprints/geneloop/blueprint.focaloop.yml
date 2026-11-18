@@ -1,0 +1,59 @@
+# Adaptive eukaryotic genome annotation focal loop (GeneLoop / FocalAnnot).
+id: geneloop
+name: GeneLoop adaptive eukaryotic genome annotation
+version: "0.3.0"
+modality: annotation
+description: >-
+  Seeds high-confidence gene models from homology (miniprot) and optional ab initio
+  LSTM/HMM predictions (Tiberius), screens saturated exon loci via an open-syncmer
+  depletion filter, adaptively streams RNA-seq evidence under a Good-Turing UCB
+  intron judge, and synthesizes coding genes, micro-exons, lncRNAs, structural ncRNAs,
+  and pseudogene annotations into GFF3, protein FASTA, HTML report, and warm state.
+container: ghcr.io/galaxyproject/focaloop:0.3.0
+regime_rules:
+  - name: fast_evidence_no_gpu
+    when: gpu_available == false and weights_absent == true
+    set: {mode: fast_evidence}
+  - name: tiberius_gpu_available
+    when: gpu_available == true
+    set: {mode: gpu_tiberius}
+  - name: long_read_isoform_mode
+    when: has_long_reads == true
+    set: {aligner: minimap2}
+kernel_pool:
+  kernels: [kmer_eq, minimap2]
+  tournament:
+    real_reads: 25000
+    synthetic_per_regime: 600
+    n_regimes: 5
+    tie_symmetry_min: 0.80
+    k: 31
+    seed: 42
+conditioner:
+  method: none
+  max_iter: 1
+  tol: 1.0e-6
+  dirichlet_alpha: 0.5
+  external_priors: false
+stop_gate:
+  block_bytes: 65536
+  max_bytes: 1073741824
+  holdout_fraction: 0.25
+  min_posterior_precision: 25.0
+  max_tech_var_fraction: 0.35
+  delta_tol: 0.005
+  min_iterations: 1
+traps:
+  LOW_MAP_RATE: {action: warn, threshold: 0.15}
+  TIE_SYMMETRY_FAIL: {action: warn, threshold: 0.80}
+  BYTE_CAP_UNCONVERGED: {action: warn}
+  CONFOUNDED_DESIGN: {action: warn}
+outputs:
+  - {name: annotation_gff3, kind: bed, format: gff3}
+  - {name: proteins_faa, kind: table, format: fasta}
+  - {name: summary_tsv, kind: table, format: tabular}
+  - {name: report_html, kind: telemetry, format: html}
+  - {name: state, kind: state, format: tar.zst}
+citations:
+  - 10.1093/bioinformatics/btae685
+  - 10.1093/bioinformatics/btad014

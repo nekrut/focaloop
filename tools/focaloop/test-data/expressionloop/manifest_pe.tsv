@@ -1,0 +1,7 @@
+sample_id	condition	batch
+pe_ctrl1	control	b1
+pe_ctrl2	control	b2
+pe_ctrl3	control	b1
+pe_trt1	treated	b2
+pe_trt2	treated	b1
+pe_trt3	treated	b2

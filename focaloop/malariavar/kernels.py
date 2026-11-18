@@ -625,13 +625,13 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
             prev[3] = g0 + rspan
             i = e + 1
             continue
-        # streaming coordinate + template-span PCR/optical duplicate filter (50-bit exact key, zero false collisions)
+        # streaming coordinate + template-span PCR/optical duplicate filter (62-bit exact key, up to 4096 contigs & 4.29 Gb/contig)
         if len(dedup_tab) > 0 and paired and same_chr and tlen != 0:
             left_p = pos if tlen > 0 else pn
-            span_u = min(abs(tlen), 0xFFFFF)
+            span_u = min(abs(tlen), 0x1FFFF)
             side_u = 0 if tlen > 0 else 1
-            dk = ((np.uint64(c & 0x1F) << np.uint64(45)) |
-                  (np.uint64(left_p & 0xFFFFFF) << np.uint64(21)) |
+            dk = ((np.uint64(c & 0xFFF) << np.uint64(50)) |
+                  (np.uint64(left_p & 0xFFFFFFFF) << np.uint64(18)) |
                   (np.uint64(span_u) << np.uint64(1)) |
                   np.uint64(side_u)) + np.uint64(1)
             ds = mix64(dk) & dmask

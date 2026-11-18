@@ -76,6 +76,48 @@ def zoom_mask(g):
     return m
 
 
+def detect_order_mode(ccount, lengths, binbases=None, min_primary_bp=100_000):
+    """Classify stream order as 'sorted' or 'flowcell' for any reference karyotype (1 to 10,000+ contigs).
+
+    Replaces the hardcoded `ccount[:14]` P. falciparum assumption:
+      - Filters to primary nuclear contigs (`lengths >= min_primary_bp`, or all contigs if none qualify).
+      - On multi-contig references, compares observed contig read share `p_obs` against length-proportional
+        random/flowcell expectation `p_exp` via total variation distance `tvd` and max 2-adjacent-contig share
+        (handling slices that straddle a chromosome boundary such as chr19 -> chr20).
+      - On single-contig references (e.g. standalone chr20), checks spatial concentration of covered 1-kb bins.
+    """
+    cc = np.asarray(ccount, dtype=np.float64)
+    ln = np.asarray(lengths, dtype=np.float64)
+    pri = ln >= min_primary_bp
+    if not pri.any():
+        pri = np.ones(len(ln), dtype=bool)
+    cc_p = cc[pri]
+    ln_p = ln[pri]
+    tot = float(cc_p.sum())
+    if tot <= 0:
+        return "flowcell"
+    if len(cc_p) == 1 or float(ln_p.max() / max(ln_p.sum(), 1.0)) > 0.90:
+        if binbases is not None and len(binbases) >= 200:
+            bb = np.asarray(binbases, dtype=np.float64)
+            b_tot = float(bb.sum())
+            if b_tot > 0:
+                win = max(1, len(bb) // 4)
+                csum = np.concatenate([[0.0], np.cumsum(bb)])
+                max_q = float((csum[win:] - csum[:-win]).max() / b_tot)
+                cov_frac = float((bb > 0).mean())
+                if max_q > 0.80 and cov_frac < 0.50:
+                    return "sorted"
+        return "flowcell"
+    p_obs = cc_p / tot
+    p_exp = ln_p / float(ln_p.sum())
+    tvd = 0.5 * float(np.abs(p_obs - p_exp).sum())
+    adj2_obs = float(max(p_obs.max(), (p_obs[:-1] + p_obs[1:]).max()))
+    adj2_exp = float(max(p_exp.max(), (p_exp[:-1] + p_exp[1:]).max()))
+    if tvd > 0.35 and adj2_obs > max(0.50, min(0.95, 2.0 * adj2_exp)):
+        return "sorted"
+    return "flowcell"
+
+
 def run_sample(row, cohort, cfg):
     """stream + call one isolate; writes its FocaloopState tables and returns telemetry."""
     sample = row["Sample"]
@@ -101,7 +143,7 @@ def run_sample(row, cohort, cfg):
         # staged ODP objects are already on the wire; CRAM / ENA FASTQ are coordinate-sorted and need the whole file
         gate.p.max_wire_bytes = float("inf")
     srf = bool(row.get("order_hint") == "flowcell")
-    sieve = ST.Sieve(kset, paired=src.paired, use_pla_sieve=use_pla_sieve)
+    sieve = ST.Sieve(kset, paired=src.paired, need=int(cfg.get("depletion_need", 2)), use_pla_sieve=use_pla_sieve)
     sieve.p = 1.0 if srf else prior_p(row, gp.target_depth)
     if cfg.get("p_fixed"):
         sieve.p = float(cfg["p_fixed"])
@@ -246,9 +288,7 @@ def run_sample(row, cohort, cfg):
                 newly = (acc.binbases > 0) & np.isnan(bin_p)
                 bin_p[newly] = slice_p
                 if order_mode is None:
-                    cc = acc.ccount[:14]
-                    frac = cc.max() / max(cc.sum(), 1)
-                    order_mode = "sorted" if frac > 0.5 else "flowcell"
+                    order_mode = detect_order_mode(acc.ccount, g.lengths, acc.binbases)
                     if (order_mode == "flowcell" and src.kind == "aws_odp_xsra" and sieve.p < 1.0
                             and not cfg.get("p_fixed")):
                         with lock:

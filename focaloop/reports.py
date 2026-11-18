@@ -415,7 +415,7 @@ def render_malariavar_report(
   <div class="kpis">
     <div class="kpi"><div class="label">Isolates Genotyped</div><div class="val">{n_iso}</div><div class="sub">{n_mono} monoclonal · {n_poly} polyclonal (F_WS &lt; 0.95)</div></div>
     <div class="kpi"><div class="label">Bytes Transferred</div><div class="val">{wire_mb:.1f} MB</div><div class="sub">{pct_arch:.2f}% of {arch_mb / 1000.0:.2f} GB full archives</div></div>
-    <div class="kpi"><div class="label">Host Read Sieve</div><div class="val">{med_sieve:.1f}%</div><div class="sub">Median non-Plasmodium spots stripped on stream</div></div>
+    <div class="kpi"><div class="label">Host Read Depletion</div><div class="val">{med_sieve:.1f}%</div><div class="sub">Median non-Plasmodium spots stripped on stream</div></div>
     <div class="kpi"><div class="label">Artemisinin Resistant</div><div class="val">{int((drm_df.get('who_artemisinin') == 'Resistant').sum())}/{n_iso}</div><div class="sub">WHO validated/candidate kelch13 349–726</div></div>
     <div class="kpi"><div class="label">hrp2 / hrp3 Deletions</div><div class="val">{int((drm_df.get('hrp2_deletion') == 'deleted').sum())} / {int((drm_df.get('hrp3_deletion') == 'deleted').sum())}</div><div class="sub">RDT diagnostic-escape surveillance</div></div>
   </div>
@@ -431,7 +431,7 @@ def render_malariavar_report(
   <div class="section">
     <h2>Per-Isolate Streaming Telemetry, Clonality &amp; Drug-Resistance Genotypes</h2>
     <table>
-      <thead><tr><th>Isolate</th><th>Group</th><th>Mode</th><th class="num">Wire / Archive</th><th class="num">Host Sieve</th><th class="num">Depth</th><th class="num">F_WS</th><th>kelch13 (WHO Art)</th><th>crt 76</th><th>dhfr / dhps</th><th>CNVs</th><th>Deletions</th></tr></thead>
+      <thead><tr><th>Isolate</th><th>Group</th><th>Mode</th><th class="num">Wire / Archive</th><th class="num">Host Depletion</th><th class="num">Depth</th><th class="num">F_WS</th><th>kelch13 (WHO Art)</th><th>crt 76</th><th>dhfr / dhps</th><th>CNVs</th><th>Deletions</th></tr></thead>
       <tbody>{''.join(iso_rows)}</tbody>
     </table>
   </div>

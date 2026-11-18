@@ -1,0 +1,447 @@
+<tool id="focaloop_expressionloop" name="ExpressionLoop" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>adaptive streaming RNA-seq differential expression with aligner tournament, multi-reference EM, and 31-mer zoom</description>
+    <macros>
+        <import>macros.xml</import>
+    </macros>
+    <expand macro="edam_topics"/>
+    <edam_operations>
+        <edam_operation>operation_3223</edam_operation>
+    </edam_operations>
+    <expand macro="requirements"/>
+    <version_command>focaloop --version</version_command>
+    <command detect_errors="aggressive"><![CDATA[
+focaloop expressionloop
+    --ref-fasta '$ref_fasta'
+    --ref-gtf '$ref_gtf'
+    --primary-label '$primary_label'
+    #if $multi_assembly.secondary_fasta and $multi_assembly.secondary_gtf
+        --secondary-fasta '$multi_assembly.secondary_fasta'
+        --secondary-gtf '$multi_assembly.secondary_gtf'
+        --secondary-label '$multi_assembly.secondary_label'
+    #end if
+    --manifest '$input_source.manifest'
+    #if str($input_source.source_type) == "history_paired"
+        --reads-r1
+        #for $pair in $input_source.paired_reads
+            '$pair.forward'
+        #end for
+        --reads-r2
+        #for $pair in $input_source.paired_reads
+            '$pair.reverse'
+        #end for
+        --read-ids
+        #for $pair in $input_source.paired_reads
+            '$pair.element_identifier'
+        #end for
+    #elif str($input_source.source_type) == "history_single"
+        --reads
+        #for $r in $input_source.reads
+            '$r'
+        #end for
+        --read-ids
+        #for $r in $input_source.reads
+            '$r.element_identifier'
+        #end for
+    #end if
+    --contrast '$contrast'
+    --design '$design'
+    #if str($followup_contrasts).strip()
+        --followup-contrasts '$followup_contrasts'
+    #end if
+    --max-byte-fraction $stopping_options.max_byte_fraction
+    --v-tech-target $stopping_options.v_tech_target
+    --delta-lfc-stop $stopping_options.delta_lfc_stop
+    #if str($stopping_options.min_mapped_per_sample).strip() not in ("", "0")
+        --min-mapped-per-sample $stopping_options.min_mapped_per_sample
+    #end if
+    $filter_options.enable_zoom
+    $filter_options.enable_abundant_filter
+    --filter-mode '$filter_options.filter_mode'
+    --source-mode '$streaming_options.source_mode'
+    --organism-mode '$streaming_options.organism_mode'
+    --tournament-reads $streaming_options.tournament_reads
+    #if str($streaming_options.kernel_selection.mode) == "custom"
+        --kernels
+        #for $k in $streaming_options.kernel_selection.kernels
+            '$k'
+        #end for
+    #end if
+    @THREADS@
+    --state-dir expressionloop_state_dir
+    --state-archive '$expression_state'
+    --out-de '$de_results'
+    --out-report '$focaloop_report'
+    #if str($output_options.include_transcript_table) == "true"
+        --out-transcripts '$transcript_abundances'
+    #end if
+    ]]></command>
+    <inputs>
+        <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" label="Primary reference genome or transcriptome FASTA" help="Reference sequences in FASTA format (uncompressed or gzip-compressed)."/>
+        <param argument="--ref-gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Primary reference annotation (GTF or GFF3)" help="Gene and exon annotation matching the primary FASTA. Used to build spliced transcripts and intronic or intergenic decoys."/>
+        <param argument="--primary-label" type="text" value="primary" label="Primary assembly label" help="Short identifier for the primary reference recorded in output tables and the warm-state archive.">
+            <validator type="regex" message="Use only letters, digits, underscores, dots, or hyphens">[A-Za-z0-9_.-]+</validator>
+        </param>
+
+        <section name="multi_assembly" title="Secondary Assembly / Strain / Host-Virus Conditioning (Optional)" expanded="false">
+            <param argument="--secondary-fasta" type="data" format="fasta,fasta.gz" optional="true" label="Secondary assembly, strain, or virus FASTA" help="Optional second reference (for example, a legacy genome release, co-infecting strain, or viral genome) for multi-reference EM conditioning and ortholog bridging."/>
+            <param argument="--secondary-gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" optional="true" label="Secondary annotation (GTF or GFF3)" help="Annotation corresponding to the secondary FASTA. Both secondary FASTA and GTF/GFF3 must be provided to enable dual-assembly bridging."/>
+            <param argument="--secondary-label" type="text" value="secondary" label="Secondary assembly label" help="Short identifier prefixed onto bridged genes in the ortholog_bridge output column (e.g. v2:LEGACY_001458).">
+                <validator type="regex" message="Use only letters, digits, underscores, dots, or hyphens">[A-Za-z0-9_.-]+</validator>
+            </param>
+        </section>
+
+        <conditional name="input_source">
+            <param name="source_type" type="select" label="RNA-seq read input mode" help="Choose whether to stream public INSDC runs directly by accession/URL without uploading FASTQs, or to analyze FASTQ datasets already in your Galaxy History.">
+                <option value="manifest_insdc" selected="true">INSDC accessions or remote FASTQ URLs (TSV manifest)</option>
+                <option value="history_paired">Galaxy History paired-end collection (list:paired) + sample sheet</option>
+                <option value="history_single">Galaxy History single-end FASTQ datasets + sample sheet</option>
+            </param>
+            <when value="manifest_insdc">
+                <param argument="--manifest" type="data" format="tabular" label="Sample manifest (TSV)" help="Tab-separated manifest with required columns: sample_id, condition, run_or_url (SRR/ERR/DRR accession or HTTPS FASTQ URL). Optional columns: mate2_url, layout (PE/SE), read_count, and covariates such as batch."/>
+            </when>
+            <when value="history_paired">
+                <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz" label="Paired-end FASTQ collection (list:paired)" help="Galaxy list-of-pairs collection where each pair's element identifier matches sample_id in the sample sheet."/>
+                <param argument="--manifest" type="data" format="tabular" label="Sample sheet (TSV)" help="Tab-separated sample sheet with required columns: sample_id and condition (plus optional covariates such as batch). Each sample_id must match a collection element identifier."/>
+            </when>
+            <when value="history_single">
+                <param argument="--reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" label="History FASTQ datasets" help="FASTQ or FASTQ.GZ datasets from your Galaxy History whose names or element identifiers match sample_id or run_or_url in the sample sheet."/>
+                <param argument="--manifest" type="data" format="tabular" label="Sample sheet (TSV)" help="Tab-separated sample sheet with columns: sample_id, condition (and optional run_or_url or covariates such as batch)."/>
+            </when>
+        </conditional>
+
+        <param argument="--contrast" type="text" value="condition:treated:control" label="Primary differential expression contrast" help="Comparison to test in the form factor:numerator:denominator (e.g. condition:treated:control) or numerator:denominator.">
+            <validator type="regex" message="Use factor:levelA:levelB or levelA:levelB">([A-Za-z0-9_]+[:=])?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+</validator>
+        </param>
+        <param argument="--design" type="text" value="~condition" label="Statistical design formula" help="Wilkinson model formula referencing factor columns in the sample manifest (e.g. ~condition or ~batch + condition).">
+            <sanitizer>
+                <valid initial="default">
+                    <add value="~"/>
+                </valid>
+            </sanitizer>
+            <validator type="regex" message="Formula must start with ~ followed by valid column names">~\s*[A-Za-z0-9_]+(\s*[+*:]\s*[A-Za-z0-9_]+)*</validator>
+        </param>
+        <param argument="--followup-contrasts" type="text" value="" label="Additional warm follow-up contrasts (optional)" help="Optional comma-separated list of extra contrasts (e.g. condition:KO2:WT,condition:KO1:KO2) evaluated at zero extra read bytes and stored in the warm state bundle.">
+            <validator type="regex" message="Provide comma-separated contrasts such as condition:A:B,condition:C:B">^$|(([A-Za-z0-9_]+[:=])?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+)(\s*,\s*([A-Za-z0-9_]+[:=])?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+)*</validator>
+        </param>
+
+        <section name="stopping_options" title="Adaptive Stopping &amp; Byte-Budget Options" expanded="false">
+            <param argument="--max-byte-fraction" type="float" min="0.005" max="1.0" value="0.12" label="Maximum archive byte fraction to stream" help="Hard ceiling on the fraction of each library's archive streamed (0.12 = 12%). Set to 1.0 when analyzing small local test datasets or when exhaustive streaming is desired."/>
+            <param argument="--v-tech-target" type="float" min="0.02" max="0.90" value="0.25" label="Technical variance ratio threshold: V_tech / (V_tech + V_bio)" help="Streaming halts once the median ratio of technical variance (Poisson sampling + read-placement ambiguity) to total variance drops at or below this target."/>
+            <param argument="--delta-lfc-stop" type="float" min="0.005" max="0.50" value="0.05" label="Fold-change stability threshold (median |Δlog2FC|)" help="Streaming halts only after the median change in log2 fold-change across expressed genes between consecutive waves falls below this threshold."/>
+            <param argument="--min-mapped-per-sample" type="integer" min="0" value="0" label="Minimum mapped reads per biological sample (0 = automatic)" help="Per-sample mapped read depth floor required before early stopping is allowed. Set to 0 for automatic scaling based on transcriptome complexity."/>
+        </section>
+
+        <section name="filter_options" title="Borderline &amp; Abundant-Transcript Filter Options" expanded="false">
+            <param name="enable_zoom" type="boolean" truevalue="" falsevalue="--no-zoom" checked="true" label="Enable Stage-5 targeted 31-mer borderline gene zoom" help="Scans an extra slice of each run through a compiled C 31-mer filter to recover additional evidence for borderline and low-count genes without re-mapping abundant transcripts."/>
+            <param name="enable_abundant_filter" type="boolean" truevalue="" falsevalue="--no-abundant-filter" checked="true" label="Enable abundant-transcript depletion filter during Stage-5 zoom" help="Filters out reads matching saturated, highly abundant transcripts before mapping so borderline and rare genes receive balanced statistical power."/>
+            <param argument="--filter-mode" type="select" label="Stage-5 31-mer filter strategy" help="Inclusion retains reads matching target genes; Depletion drops saturated housekeeping/abundant reads while protecting target k-mers; Auto selects the faster exact strategy.">
+                <option value="auto" selected="true">Auto (select fastest exact 31-mer filter)</option>
+                <option value="include">Target inclusion (keep reads matching borderline or rare genes)</option>
+                <option value="deplete">Abundant depletion (remove saturated abundant transcripts)</option>
+            </param>
+        </section>
+
+        <section name="streaming_options" title="Streaming, Regime &amp; Tournament Options" expanded="false">
+            <param argument="--source-mode" type="select" label="Archive streaming transport" help="Auto uses History FASTQ datasets when provided, or AWS SRA Open Data (xsra) / ENA HTTPS 206 byte-range streaming for public accessions.">
+                <option value="auto" selected="true">Auto (History FASTQ, AWS SRA ODP via xsra, or ENA HTTPS 206)</option>
+                <option value="http_range">ENA HTTPS 206 byte-range streaming</option>
+                <option value="sra_odp">AWS SRA Open Data spot-block streaming (xsra)</option>
+                <option value="local_bytes">Local History FASTQ bytes</option>
+            </param>
+            <param argument="--organism-mode" type="select" label="Organism splicing regime" help="Auto inspects the GTF/GFF3 annotation to choose spliced eukaryotic cDNA + intron decoys or compact prokaryotic CDS.">
+                <option value="auto" selected="true">Auto-detect from GTF/GFF3</option>
+                <option value="eukaryotic">Eukaryotic (spliced cDNA + intron and intergenic decoys)</option>
+                <option value="prokaryotic">Prokaryotic / compact CDS</option>
+            </param>
+            <param argument="--tournament-reads" type="integer" min="100" max="200000" value="25000" label="Reads sampled for Stage-1 aligner tournament" help="Number of reads sampled from the first run to benchmark candidate aligners on empirical mapping rate, paralog tie symmetry, and synthetic truth accuracy."/>
+            <conditional name="kernel_selection">
+                <param name="mode" type="select" label="Aligner / pseudoaligner kernel selection" help="Automatic benchmarks all regime-eligible kernels installed in the environment; Custom restricts the tournament to your selected kernels.">
+                    <option value="auto" selected="true">Automatic (benchmark all regime-eligible kernels)</option>
+                    <option value="custom">Custom kernel subset</option>
+                </param>
+                <when value="auto"/>
+                <when value="custom">
+                    <param argument="--kernels" type="select" multiple="true" label="Candidate mapping kernels" help="Select one or more mapping kernels to evaluate in the Stage-1 tournament.">
+                        <option value="mappy" selected="true">minimap2 / mappy (in-process)</option>
+                        <option value="salmon">Salmon (--validateMappings)</option>
+                        <option value="piscem">Piscem (cDBG equivalence classes)</option>
+                        <option value="strobealign_N16">strobealign (-N 16)</option>
+                        <option value="bwa_mem2_spa">BWA-MEM2 (-S -P -a)</option>
+                        <option value="bwa_spa">BWA (-S -P -a)</option>
+                        <option value="bowtie2_local_k16">Bowtie 2 (local -k 16)</option>
+                        <option value="bowtie2_global_k16">Bowtie 2 (global -k 16)</option>
+                        <validator type="no_options" message="Select at least one mapping kernel."/>
+                    </param>
+                </when>
+            </conditional>
+        </section>
+
+        <section name="output_options" title="Output Options" expanded="false">
+            <param name="include_transcript_table" type="boolean" checked="false" label="Output transcript-level abundance and isoform PSI table" help="Also writes transcript_abundances.tsv with per-sample transcript effective counts, TPM, and within-gene isoform fraction (PSI)."/>
+        </section>
+    </inputs>
+    <outputs>
+        <data name="de_results" format="tabular" label="${tool.name} on ${on_string}: de_results.tsv"/>
+        <data name="focaloop_report" format="html" label="${tool.name} on ${on_string}: HTML Report"/>
+        <data name="expression_state" format="data" label="${tool.name} on ${on_string}: expression_state.focaloop.tar.zst"/>
+        <data name="transcript_abundances" format="tabular" label="${tool.name} on ${on_string}: transcript_abundances.tsv">
+            <filter>output_options['include_transcript_table']</filter>
+        </data>
+    </outputs>
+    <tests>
+        <!-- Test 1: Single-end History FASTQs with dual-assembly orthology bridging -->
+        <test expect_num_outputs="3">
+            <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
+            <param name="ref_gtf" value="expressionloop/ref_primary.gtf" ftype="gtf"/>
+            <param name="primary_label" value="v3"/>
+            <section name="multi_assembly">
+                <param name="secondary_fasta" value="expressionloop/ref_secondary.fa" ftype="fasta"/>
+                <param name="secondary_gtf" value="expressionloop/ref_secondary.gtf" ftype="gtf"/>
+                <param name="secondary_label" value="v2"/>
+            </section>
+            <conditional name="input_source">
+                <param name="source_type" value="history_single"/>
+                <param name="reads" value="expressionloop/ctrl1.fastq.gz,expressionloop/ctrl2.fastq.gz,expressionloop/ctrl3.fastq.gz,expressionloop/trt1.fastq.gz,expressionloop/trt2.fastq.gz,expressionloop/trt3.fastq.gz" ftype="fastqsanger.gz"/>
+                <param name="manifest" value="expressionloop/manifest_se.tsv" ftype="tabular"/>
+            </conditional>
+            <param name="contrast" value="condition:treated:control"/>
+            <section name="stopping_options">
+                <param name="max_byte_fraction" value="1.0"/>
+            </section>
+            <section name="streaming_options">
+                <param name="tournament_reads" value="600"/>
+                <conditional name="kernel_selection">
+                    <param name="mode" value="custom"/>
+                    <param name="kernels" value="mappy"/>
+                </conditional>
+            </section>
+            <output name="de_results">
+                <assert_contents>
+                    <has_text text="log2FoldChange"/>
+                    <has_text text="ortholog_bridge"/>
+                    <has_text text="GENE_00"/>
+                    <has_text text="v2:LEGACY_001458"/>
+                </assert_contents>
+            </output>
+            <output name="focaloop_report">
+                <assert_contents>
+                    <has_text text="Focaloop PanExpr"/>
+                    <has_text text="mappy"/>
+                </assert_contents>
+            </output>
+            <output name="expression_state">
+                <assert_contents>
+                    <has_size min="500"/>
+                </assert_contents>
+            </output>
+        </test>
+
+        <!-- Test 2: Paired-end list:paired collection + batch design + transcript abundances output -->
+        <test expect_num_outputs="4">
+            <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
+            <param name="ref_gtf" value="expressionloop/ref_primary.gtf" ftype="gtf"/>
+            <conditional name="input_source">
+                <param name="source_type" value="history_paired"/>
+                <param name="paired_reads">
+                    <collection type="list:paired">
+                        <element name="pe_ctrl1">
+                            <collection type="paired">
+                                <element name="forward" value="expressionloop/pe_ctrl1_R1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="expressionloop/pe_ctrl1_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
+                        <element name="pe_ctrl2">
+                            <collection type="paired">
+                                <element name="forward" value="expressionloop/pe_ctrl2_R1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="expressionloop/pe_ctrl2_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
+                        <element name="pe_ctrl3">
+                            <collection type="paired">
+                                <element name="forward" value="expressionloop/pe_ctrl3_R1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="expressionloop/pe_ctrl3_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
+                        <element name="pe_trt1">
+                            <collection type="paired">
+                                <element name="forward" value="expressionloop/pe_trt1_R1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="expressionloop/pe_trt1_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
+                        <element name="pe_trt2">
+                            <collection type="paired">
+                                <element name="forward" value="expressionloop/pe_trt2_R1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="expressionloop/pe_trt2_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
+                        <element name="pe_trt3">
+                            <collection type="paired">
+                                <element name="forward" value="expressionloop/pe_trt3_R1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="expressionloop/pe_trt3_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
+                    </collection>
+                </param>
+                <param name="manifest" value="expressionloop/manifest_pe.tsv" ftype="tabular"/>
+            </conditional>
+            <param name="contrast" value="condition:treated:control"/>
+            <param name="design" value="~batch + condition"/>
+            <section name="stopping_options">
+                <param name="max_byte_fraction" value="1.0"/>
+            </section>
+            <section name="streaming_options">
+                <param name="tournament_reads" value="500"/>
+                <conditional name="kernel_selection">
+                    <param name="mode" value="custom"/>
+                    <param name="kernels" value="mappy"/>
+                </conditional>
+            </section>
+            <section name="output_options">
+                <param name="include_transcript_table" value="true"/>
+            </section>
+            <output name="de_results">
+                <assert_contents>
+                    <has_text text="log2FoldChange"/>
+                    <has_text text="GENE_00"/>
+                </assert_contents>
+            </output>
+            <output name="focaloop_report">
+                <assert_contents>
+                    <has_text text="Focaloop PanExpr"/>
+                </assert_contents>
+            </output>
+            <output name="expression_state">
+                <assert_contents>
+                    <has_size min="500"/>
+                </assert_contents>
+            </output>
+            <output name="transcript_abundances">
+                <assert_contents>
+                    <has_text text="transcript_tpm"/>
+                    <has_text text="isoform_fraction_psi"/>
+                    <has_text text="GENE_00.t1"/>
+                </assert_contents>
+            </output>
+        </test>
+
+        <!-- Test 3: Prokaryotic CDS mode with Stage-5 31-mer borderline zoom and filter -->
+        <test expect_num_outputs="3">
+            <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
+            <param name="ref_gtf" value="expressionloop/ref_prok.gtf" ftype="gtf"/>
+            <conditional name="input_source">
+                <param name="source_type" value="history_single"/>
+                <param name="reads" value="expressionloop/ctrl1.fastq.gz,expressionloop/ctrl2.fastq.gz,expressionloop/ctrl3.fastq.gz,expressionloop/trt1.fastq.gz,expressionloop/trt2.fastq.gz,expressionloop/trt3.fastq.gz" ftype="fastqsanger.gz"/>
+                <param name="manifest" value="expressionloop/manifest_se.tsv" ftype="tabular"/>
+            </conditional>
+            <param name="contrast" value="condition:treated:control"/>
+            <section name="stopping_options">
+                <param name="max_byte_fraction" value="0.90"/>
+                <param name="v_tech_target" value="0.35"/>
+            </section>
+            <section name="filter_options">
+                <param name="enable_zoom" value="true"/>
+                <param name="enable_abundant_filter" value="true"/>
+                <param name="filter_mode" value="include"/>
+            </section>
+            <section name="streaming_options">
+                <param name="organism_mode" value="prokaryotic"/>
+                <param name="source_mode" value="local_bytes"/>
+                <param name="tournament_reads" value="600"/>
+                <conditional name="kernel_selection">
+                    <param name="mode" value="custom"/>
+                    <param name="kernels" value="mappy"/>
+                </conditional>
+            </section>
+            <output name="de_results">
+                <assert_contents>
+                    <has_text text="log2FoldChange"/>
+                    <has_text text="GENE_00"/>
+                </assert_contents>
+            </output>
+            <output name="focaloop_report">
+                <assert_contents>
+                    <has_text text="Focaloop PanExpr"/>
+                </assert_contents>
+            </output>
+            <output name="expression_state">
+                <assert_contents>
+                    <has_size min="500"/>
+                </assert_contents>
+            </output>
+        </test>
+    </tests>
+    <help format="markdown"><![CDATA[
+**What It Does**
+
+**ExpressionLoop** (powered by the PanExpr v2.4 adaptive RNA-seq engine) performs differential gene and isoform expression analysis from either **public INSDC accessions (SRA/ENA)** streamed on demand or **Galaxy History FASTQ datasets/collections**. Rather than downloading and aligning 100% of every sequencing archive, ExpressionLoop:
+
+1. **Stage 1 — Regime Classification & Aligner Tournament:** Samples a small pilot slice (default 25,000 reads) and benchmarks available aligners/pseudoaligners (`mappy`, `Salmon`, `Piscem`, `strobealign`, `BWA-MEM2`, `Bowtie 2`) on real-read mapping rate, paralog/strain tie symmetry, and synthetic ground-truth accuracy to pick the best mapper for your transcriptome.
+2. **Stage 2 — Inverse-Depth Byte-Range Streaming:** Streams compressed byte prefixes over ENA HTTPS 206 byte ranges, AWS SRA Open Data spot blocks (`xsra`), or local History FASTQs, allocating more bytes to shallower libraries so replicate depths stay balanced.
+3. **Stage 3 — Isoform-Aware EM Conditioning & Orthology Bridging:** Resolves transcript, paralog, and multi-assembly equivalence classes with a compiled C99 sparse CSR Expectation-Maximization solver using effective-length offsets, linking gene IDs across dual assemblies (e.g. legacy vs. current genome annotations or host vs. virus) via reciprocal best hits.
+4. **Stage 4 — Variance-Aware Differential Expression & Adaptive Stopping:** Fits negative binomial GLMs via PyDESeq2, propagates read-placement ambiguity variance into total standard errors (`lfcSE_total`), and halts streaming automatically once technical variance and fold-change estimates stabilize.
+5. **Stage 5 — Targeted 31-mer Borderline Zoom & Warm State Export:** Scans an extra slice of reads through a compiled C99 31-mer inclusion/depletion filter for borderline or low-count genes, emits the final DE table and interactive HTML report, and saves a compact `expression_state.focaloop.tar.zst` bundle for zero-new-byte follow-up contrasts in **Focaloop Query**.
+
+-----
+
+**Adaptive Stopping & Filter Overview**
+
+- **Adaptive Stopping Gate:** Streaming stops early when every biological sample meets the minimum mapped-read depth floor, median `|Δlog2FC|` between consecutive waves drops below `--delta-lfc-stop` (default `0.05`), and the median technical-to-total variance ratio `V_tech / (V_tech + V_bio)` drops at or below `--v-tech-target` (default `0.25`).
+- **Stage-5 31-mer Filter:** Before mapping the final zoom slice, ExpressionLoop uses a fast multi-threaded C99 blocked-Bloom + hash filter (`include` mode retains reads sharing canonical 31-mers with borderline/low-count genes; `deplete` mode strips reads from saturated abundant/housekeeping transcripts while protecting all target gene k-mers). Per-sample exposure offsets preserve exact library normalization.
+
+-----
+
+**Step-by-Step Inputs**
+
+1. **Primary Reference FASTA & GTF/GFF3:** Supply the target genome (or transcriptome) FASTA and matching GTF/GFF3 annotation (`.gz` supported).
+2. **Secondary Assembly (Optional):** Expand *Secondary Assembly / Strain / Host-Virus Conditioning* to provide a second FASTA + GTF/GFF3 when reconciling renumbered gene IDs across releases or co-quantifying host + pathogen/viral transcripts.
+3. **RNA-seq Read Input Mode:**
+   - **INSDC / Remote URLs (`manifest_insdc`):** Upload a tab-separated manifest with columns `sample_id`, `condition`, and `run_or_url`:
+
+     ```tsv
+     sample_id	condition	batch	run_or_url
+     ctrl_1	control	b1	SRR12345678
+     ctrl_2	control	b2	ERR9876543
+     trt_1	treated	b1	https://example.org/trt_1.fastq.gz
+     trt_2	treated	b2	https://example.org/trt_2_R1.fastq.gz
+     ```
+
+     Optional manifest columns: `mate2_url` (or `fastq_2`) for paired remote FASTQ URLs, `layout` (`PE`/`SE`), `read_count`, `strategy` (`RNA-Seq` or `WGS` for DNA presence priors), and any design covariates (e.g. `batch`, `donor`).
+
+   - **Galaxy History Paired Collection (`history_paired`):** Select a `list:paired` collection and a sample sheet TSV whose `sample_id` column matches each pair's element identifier (`run_or_url` is optional).
+   - **Galaxy History Single-End Datasets (`history_single`):** Select one or more FASTQ(.gz) datasets and a sample sheet TSV whose `sample_id` or `run_or_url` column matches the dataset names.
+4. **Contrast & Design Formula:** Set `--contrast` (e.g. `condition:treated:control`) and `--design` (e.g. `~condition` or `~batch + condition`). Optionally supply comma-separated follow-up contrasts evaluated immediately at zero additional read cost.
+
+-----
+
+**Parameter Guide**
+
+- **Maximum archive byte fraction (`--max-byte-fraction`):** Default `0.12` (12%) for streaming large public archives. Increase toward `1.0` for small local test datasets or deep isoform profiling.
+- **Technical variance ratio (`--v-tech-target`):** Default `0.25`. Lower values (e.g. `0.15`) demand tighter precision and stream more reads before stopping.
+- **Fold-change stability (`--delta-lfc-stop`):** Default `0.05`. Ensures log2 fold changes across expressed genes have stabilized across waves.
+- **Minimum mapped reads per sample (`--min-mapped-per-sample`):** `0` enables automatic scaling by gene count; set a positive integer to enforce an explicit per-sample depth floor.
+- **Stage-5 31-mer filter strategy (`--filter-mode`):** `Auto` selects target inclusion for focused candidate lists or abundant-transcript depletion when most housekeeping reads can be bypassed cleanly.
+
+-----
+
+**Outputs**
+
+1. **`de_results.tsv` (tabular):** Gene-level differential expression summary sorted by adjusted p-value (`padj`), including `gene_id`, `gene_name`, `ortholog_bridge`, `baseMean`, `log2FoldChange`, `lfcSE_deseq2`, `lfcSE_total`, `ci95_low`, `ci95_high`, `pvalue`, `padj`, `placement_var_frac`, `tech_var_frac`, `streamed_reads`, `dna_present_prob`, `zoomed`, and `status`.
+2. **`HTML Report` (html):** Self-contained report with tournament scoreboard, per-sample streamed vs. skipped byte bars, convergence and volcano SVG plots, Stage-5 zoom summary, and top differentially expressed genes.
+3. **`expression_state.focaloop.tar.zst` (data):** Compact warm-state bundle containing the catalog, Arrow/Parquet target counts, transcript abundances, holdout slice, and alpha-wealth ledger. Pass this archive directly to **Focaloop Query** for instant zero-new-byte follow-up contrasts.
+4. **`transcript_abundances.tsv` (tabular, optional):** Enabled under *Output Options*; reports per-sample `effective_length`, `transcript_counts`, `transcript_tpm`, and within-gene `isoform_fraction_psi`.
+
+-----
+
+**Troubleshooting**
+
+- *Contrast level not present in manifest:* Verify that the factor name and both level names in `--contrast` (e.g. `condition:treated:control`) exactly match values in your sample sheet column.
+- *AWS SRA ODP streaming unavailable:* If `xsra` is not available or blocked by network policy, set **Archive streaming transport** to **ENA HTTPS 206 byte-range streaming** (`http_range`) or **Auto**.
+- *Few genes quantified / early stop on tiny datasets:* For small FASTQ inputs (< 5 MB), set **Maximum archive byte fraction** to `1.0` so all available reads are processed.
+    ]]></help>
+    <expand macro="citations">
+        <citation type="doi">10.1186/s13059-014-0550-8</citation>
+        <citation type="doi">10.1038/nmeth.4197</citation>
+        <citation type="doi">10.12688/f1000research.7563.2</citation>
+        <citation type="doi">10.1093/bioinformatics/bty191</citation>
+    </expand>
+</tool>

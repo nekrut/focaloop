@@ -1,4 +1,4 @@
-# P. falciparum / eukaryotic cohort variant focal loop with host-decoy k-mer sieve.
+# P. falciparum / eukaryotic cohort variant focal loop with host-decoy k-mer depletion filter.
 id: malariavar
 name: MalariaVar cohort SNP, indel, CNV and deletion calling
 version: "0.1.0"
@@ -6,7 +6,7 @@ modality: variants
 description: >-
   Calls SNPs and indels at declared sites with allele-specific 31-mer probes,
   within-host F_WS polyclonality, crt/mdr1/gch1/plasmepsin2-3 copy number relative to
-  single-copy controls, and hrp2/hrp3 deletions, after sieving host reads with
+  single-copy controls, and hrp2/hrp3 deletions, after filtering host reads with
   a human decoy k-mer catalog.
 container: ghcr.io/galaxyproject/focaloop:0.1.0
 regime_rules:

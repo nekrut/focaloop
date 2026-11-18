@@ -16,7 +16,7 @@ from typing import Any
 
 import yaml
 
-MODALITIES = ("expression", "variants", "metagenomics", "chromatin", "proteomics", "query", "bait")
+MODALITIES = ("expression", "variants", "annotation", "metagenomics", "chromatin", "proteomics", "query", "bait")
 TRAP_CODES = ("LOW_MAP_RATE", "TIE_SYMMETRY_FAIL", "BYTE_CAP_UNCONVERGED", "CONFOUNDED_DESIGN")
 TRAP_ACTIONS = ("abort", "warn")
 KNOWN_KERNELS = (

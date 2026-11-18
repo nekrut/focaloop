@@ -1,0 +1,7 @@
+sample_id	condition	run_or_url
+ctrl1	control	ctrl1
+ctrl2	control	ctrl2
+ctrl3	control	ctrl3
+trt1	treated	trt1
+trt2	treated	trt2
+trt3	treated	trt3

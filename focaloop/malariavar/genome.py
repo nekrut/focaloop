@@ -59,7 +59,10 @@ def revcomp(s):
 
 def read_fasta(path):
     names, seqs, cur = [], [], []
-    with open(path, "rb") as f:
+    with open(path, "rb") as probe:
+        is_gz = probe.read(2) == b"\x1f\x8b"
+    opener = gzip.open if is_gz else open
+    with opener(path, "rb") as f:
         for line in f:
             if line.startswith(b">"):
                 if cur:
@@ -267,3 +270,78 @@ def verify_against_cram_header(header_text):
             sq[d["SN"]] = int(d["LN"])
     ref = dict(zip(g.names, (int(x) for x in g.lengths)))
     return sq == ref, sq, ref
+
+
+def from_fasta(fasta, bed=None, cache=None, need_core=True):
+    """Build or load a Genome for any FASTA reference (e.g. GRCh38 3.1 Gb human) without Pf GFF/regions."""
+    fasta = Path(fasta)
+    bed_p = Path(bed) if bed is not None else None
+    meta = {"fasta": [int(fasta.stat().st_size), int(fasta.stat().st_mtime_ns)], "bin": BIN}
+    if bed_p is not None and bed_p.exists():
+        meta["bed"] = [int(bed_p.stat().st_size), int(bed_p.stat().st_mtime_ns)]
+    fp = json.dumps(meta, sort_keys=True)
+    if cache is not None:
+        cache = Path(cache)
+        if cache.exists():
+            with np.load(cache) as z:
+                if "fingerprint" in z.files and str(z["fingerprint"]) == fp:
+                    seq_z = z["seq"]
+                    core_z = z["core"] if (need_core or bed_p is not None) else np.empty(0, bool)
+                    if need_core and len(core_z) == 0:
+                        core_z = seq_z < 4
+                    return Genome(names=[str(x) for x in z["names"]], lengths=z["lengths"], offsets=z["offsets"],
+                                  seq=seq_z, core=core_z, bin_offsets=z["bin_offsets"],
+                                  bin_gc=z["bin_gc"], bin_core=z["bin_core"], genes={})
+    names, seqs = read_fasta(fasta)
+    lengths = np.array([len(s) for s in seqs], dtype=np.int64)
+    offsets = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
+    seq = CODE[np.frombuffer(b"".join(seqs), dtype=np.uint8)]
+    has_bed = bed_p is not None and bed_p.exists()
+    if has_bed:
+        core = np.zeros(int(offsets[-1]), bool)
+        cidx = {n: i for i, n in enumerate(names)}
+        with open(bed_p) as f:
+            for line in f:
+                if not line or line.startswith(("#", "track", "browser")):
+                    continue
+                t = line.split()
+                if len(t) >= 3 and t[0] in cidx:
+                    ci = cidx[t[0]]
+                    s0 = max(0, int(t[1]))
+                    e0 = min(int(lengths[ci]), int(t[2]))
+                    if e0 > s0:
+                        core[offsets[ci] + s0: offsets[ci] + e0] = True
+    elif need_core:
+        core = seq < 4
+    else:
+        core = np.empty(0, bool)
+    nb = (lengths + BIN - 1) // BIN
+    bin_offsets = np.concatenate([[0], np.cumsum(nb)]).astype(np.int64)
+    gc = np.zeros(int(bin_offsets[-1]), np.float32)
+    bcore = np.zeros_like(gc)
+    for i in range(len(names)):
+        s = seq[offsets[i]:offsets[i + 1]]
+        cm = core[offsets[i]:offsets[i + 1]] if len(core) else None
+        n_full = int(lengths[i] // BIN)
+        if n_full > 0:
+            sw = s[:n_full * BIN].reshape(n_full, BIN)
+            valid = sw < 4
+            n_val = valid.sum(axis=1)
+            is_gc = ((sw == 1) | (sw == 2)).sum(axis=1)
+            b0 = int(bin_offsets[i])
+            gc[b0:b0 + n_full] = np.where(n_val > 0, is_gc / np.maximum(n_val, 1), 0.0)
+            bcore[b0:b0 + n_full] = (cm[:n_full * BIN].reshape(n_full, BIN).mean(axis=1)
+                                     if cm is not None else valid.mean(axis=1))
+        if int(nb[i]) > n_full:
+            b = n_full
+            w = s[b * BIN:]
+            acgt = w[w < 4]
+            gc[int(bin_offsets[i]) + b] = np.isin(acgt, (1, 2)).mean() if len(acgt) else 0.0
+            bcore[int(bin_offsets[i]) + b] = (cm[b * BIN:].mean() if cm is not None and len(cm[b * BIN:])
+                                              else ((w < 4).mean() if len(w) else 0.0))
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(cache, names=np.array(names), lengths=lengths, offsets=offsets, seq=seq, core=core,
+                 bin_offsets=bin_offsets, bin_gc=gc, bin_core=bcore, fingerprint=np.array(fp))
+    return Genome(names=names, lengths=lengths, offsets=offsets, seq=seq, core=core,
+                  bin_offsets=bin_offsets, bin_gc=gc, bin_core=bcore, genes={})

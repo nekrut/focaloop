@@ -1,0 +1,12 @@
+LEGACY_001458_chr	v2	exon	1	500	.	+	.	gene_id "LEGACY_001458"; transcript_id "LEGACY_001458.t1"; gene_name "LEGACY_001458";
+LEGACY_001458_chr	v2	exon	701	1400	.	+	.	gene_id "LEGACY_001458"; transcript_id "LEGACY_001458.t1"; gene_name "LEGACY_001458";
+V2_GENE_01_chr	v2	exon	1	500	.	+	.	gene_id "V2_GENE_01"; transcript_id "V2_GENE_01.t1"; gene_name "V2_GENE_01";
+V2_GENE_01_chr	v2	exon	701	1400	.	+	.	gene_id "V2_GENE_01"; transcript_id "V2_GENE_01.t1"; gene_name "V2_GENE_01";
+V2_GENE_02_chr	v2	exon	1	500	.	+	.	gene_id "V2_GENE_02"; transcript_id "V2_GENE_02.t1"; gene_name "V2_GENE_02";
+V2_GENE_02_chr	v2	exon	701	1400	.	+	.	gene_id "V2_GENE_02"; transcript_id "V2_GENE_02.t1"; gene_name "V2_GENE_02";
+V2_GENE_03_chr	v2	exon	1	500	.	+	.	gene_id "V2_GENE_03"; transcript_id "V2_GENE_03.t1"; gene_name "V2_GENE_03";
+V2_GENE_03_chr	v2	exon	701	1400	.	+	.	gene_id "V2_GENE_03"; transcript_id "V2_GENE_03.t1"; gene_name "V2_GENE_03";
+V2_GENE_04_chr	v2	exon	1	500	.	+	.	gene_id "V2_GENE_04"; transcript_id "V2_GENE_04.t1"; gene_name "V2_GENE_04";
+V2_GENE_04_chr	v2	exon	701	1400	.	+	.	gene_id "V2_GENE_04"; transcript_id "V2_GENE_04.t1"; gene_name "V2_GENE_04";
+V2_GENE_05_chr	v2	exon	1	500	.	+	.	gene_id "V2_GENE_05"; transcript_id "V2_GENE_05.t1"; gene_name "V2_GENE_05";
+V2_GENE_05_chr	v2	exon	701	1400	.	+	.	gene_id "V2_GENE_05"; transcript_id "V2_GENE_05.t1"; gene_name "V2_GENE_05";

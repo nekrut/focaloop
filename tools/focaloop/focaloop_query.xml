@@ -1,0 +1,136 @@
+<tool id="focaloop_query" name="Focaloop Query warm-state instant contrast and sub-cohort comparison" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>zero-network-byte follow-up contrast or sub-cohort F_ST guarded by HypothesisLedger</description>
+    <macros>
+        <import>macros.xml</import>
+    </macros>
+    <expand macro="edam_topics"/>
+    <expand macro="requirements"/>
+    <version_command>focaloop --version</version_command>
+    <command detect_errors="aggressive"><![CDATA[
+focaloop query
+    --state-dir '$state'
+    --contrast '$contrast'
+    --actor '$actor'
+    #if str($hypothesis).strip()
+        --hypothesis '$hypothesis'
+    #end if
+    #if str($design).strip()
+        --design '$design'
+    #end if
+    --mode '$mode'
+    --out-table '$query_table'
+    --out-verdict '$verdict'
+    --out-report '$query_report'
+    --out-state-archive '$state_out'
+    ]]></command>
+    <inputs>
+        <param argument="--state-dir" name="state" type="data" format="data" label="Saved Focaloop state (.focaloop.tar.zst)" help="Warm state bundle produced by ExpressionLoop or VariationLoop."/>
+        <param argument="--contrast" type="text" value="condition:treated:control" label="Contrast or sub-cohort comparison" help="Contrast specification, e.g. condition:AR0387:AR0382 or Population:AS-SE-E:AF-W.">
+            <validator type="regex" message="Use A:B, factor:A:B, or factor=A:B">([A-Za-z0-9_]+[:=])?[A-Za-z0-9_,.-]+:[A-Za-z0-9_,.-]+</validator>
+        </param>
+        <param argument="--actor" type="text" value="human" label="Actor recorded in HypothesisLedger" help="Identifier for alpha-wealth accounting, e.g. 'human' or 'agent:name'.">
+            <validator type="regex" message="Use 'human' or 'agent:name'">(human|agent:[A-Za-z0-9_.-]+)</validator>
+        </param>
+        <param argument="--hypothesis" type="text" value="" label="Specific gene or group to test (optional)" help="Leave blank to test the top discovery hit automatically.">
+            <validator type="regex" message="Letters, digits, '_', ':', '.', '-', '=' only">[A-Za-z0-9_:.=-]*</validator>
+        </param>
+        <param argument="--design" type="text" value="" label="Optional Wilkinson formula override (ExpressionLoop)" help="Optional formula such as '~ batch + condition' when querying an expression state.">
+            <sanitizer>
+                <valid initial="default">
+                    <add value="~"/>
+                </valid>
+            </sanitizer>
+            <validator type="regex" message="Formula characters only">[A-Za-z0-9_ +~:*()-]*</validator>
+        </param>
+        <param argument="--mode" type="select" label="Query mode" help="Choose auto-detection or force expression contrast vs. variant F_ST mode.">
+            <option value="auto" selected="true">Auto-detect from saved state</option>
+            <option value="contrast">Differential expression contrast</option>
+            <option value="fst">Sub-cohort F_ST and prevalence</option>
+        </param>
+    </inputs>
+    <outputs>
+        <data name="query_table" format="tabular" label="${tool.name} on ${on_string}: query_table.tsv"/>
+        <data name="verdict" format="json" label="${tool.name} on ${on_string}: verdict.json"/>
+        <data name="query_report" format="html" label="${tool.name} on ${on_string}: query_report.html"/>
+        <data name="state_out" format="data" label="${tool.name} on ${on_string}: updated state (.focaloop.tar.zst)"/>
+    </outputs>
+    <tests>
+        <test expect_num_outputs="4">
+            <param name="state" value="panexpr_state.tar.zst" ftype="data"/>
+            <param name="contrast" value="treated:control"/>
+            <param name="actor" value="agent:planemo"/>
+            <output name="query_table">
+                <assert_contents>
+                    <has_text text="g2"/>
+                </assert_contents>
+            </output>
+            <output name="verdict">
+                <assert_contents>
+                    <has_text text="&quot;new_bytes&quot;: 0"/>
+                </assert_contents>
+            </output>
+            <output name="query_report">
+                <assert_contents>
+                    <has_text text="0 B"/>
+                </assert_contents>
+            </output>
+            <output name="state_out">
+                <assert_contents>
+                    <has_size min="1000"/>
+                </assert_contents>
+            </output>
+        </test>
+        <test expect_num_outputs="4">
+            <param name="state" value="malariavar_state.tar.zst" ftype="data"/>
+            <param name="contrast" value="site=Ghana:Mali"/>
+            <param name="actor" value="human"/>
+            <param name="mode" value="fst"/>
+            <output name="query_table">
+                <assert_contents>
+                    <has_text text="hudson_fst"/>
+                </assert_contents>
+            </output>
+            <output name="verdict">
+                <assert_contents>
+                    <has_text text="&quot;mode&quot;: &quot;fst&quot;"/>
+                </assert_contents>
+            </output>
+            <output name="query_report">
+                <assert_contents>
+                    <has_text text="0 B"/>
+                </assert_contents>
+            </output>
+            <output name="state_out">
+                <assert_contents>
+                    <has_size min="1000"/>
+                </assert_contents>
+            </output>
+        </test>
+    </tests>
+    <help format="markdown"><![CDATA[
+**What it does**
+
+Executes a zero-network-byte follow-up contrast (`ExpressionLoop`) or sub-cohort resistance and Hudson *F_ST*
+comparison (`VariationLoop`) against a saved `.focaloop.tar.zst` warm state bundle, charging alpha-wealth in
+the persisted `HypothesisLedger`.
+
+-----
+
+**Inputs**
+
+- **Saved Focaloop state:** The `.focaloop.tar.zst` archive emitted by a prior ExpressionLoop or VariationLoop run.
+- **Contrast:** Either `treated:control` / `factor:treated:control` (expression) or `group_field=PopA:PopB` (variation).
+
+-----
+
+**Outputs**
+
+- `query_table.tsv`: Per-feature test statistics or per-locus allele frequency and *F_ST* table.
+- `verdict.json`: Machine-readable hypothesis test summary and remaining alpha-wealth (`new_bytes = 0`).
+- `query_report.html`: Interactive HTML report summarizing the query.
+- `updated state (.focaloop.tar.zst)`: State archive with the new `HypothesisLedger` entry appended.
+    ]]></help>
+    <expand macro="citations">
+        <citation type="doi">10.1126/science.aaa9375</citation>
+    </expand>
+</tool>

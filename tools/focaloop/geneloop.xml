@@ -1,0 +1,406 @@
+<tool id="focaloop_geneloop" name="GeneLoop" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>adaptive eukaryotic structural genome annotation with open-syncmer depletion filtering and Good-Turing RNA-seq streaming</description>
+    <macros>
+        <import>macros.xml</import>
+    </macros>
+    <expand macro="edam_topics"/>
+    <edam_operations>
+        <edam_operation>operation_0362</edam_operation>
+        <edam_operation>operation_0436</edam_operation>
+    </edam_operations>
+    <expand macro="requirements"/>
+    <version_command>focaloop --version</version_command>
+    <command detect_errors="aggressive"><![CDATA[
+focaloop geneloop
+    --genome '$genome'
+    --clade '$clade'
+    --mode '$mode'
+    #if str($protein_source.source_type) == "history"
+        --proteins '$protein_source.proteins'
+        #if str($protein_source.exclude_genus).strip()
+            --exclude-genus '$protein_source.exclude_genus'
+        #end if
+    #end if
+    #if str($rna_source.source_type) == "manifest_insdc"
+        --rna-manifest '$rna_source.rna_manifest'
+    #elif str($rna_source.source_type) == "history_paired"
+        --short-reads-1
+        #for $pair in $rna_source.paired_reads
+            '$pair.forward'
+        #end for
+        --short-reads-2
+        #for $pair in $rna_source.paired_reads
+            '$pair.reverse'
+        #end for
+        --short-read-ids
+        #for $pair in $rna_source.paired_reads
+            '$pair.element_identifier'
+        #end for
+    #elif str($rna_source.source_type) == "history_single"
+        --short-reads-1
+        #for $r in $rna_source.single_reads
+            '$r'
+        #end for
+        --short-read-ids
+        #for $r in $rna_source.single_reads
+            '$r.element_identifier'
+        #end for
+    #elif str($rna_source.source_type) == "history_long"
+        --long-reads
+        #for $lr in $rna_source.long_reads
+            '$lr'
+        #end for
+        --long-read-ids
+        #for $lr in $rna_source.long_reads
+            '$lr.element_identifier'
+        #end for
+    #elif str($rna_source.source_type) == "history_bams"
+        #if $rna_source.short_bams
+            --short-bams
+            #for $sb in $rna_source.short_bams
+                '$sb'
+            #end for
+        #end if
+        #if $rna_source.long_bams
+            --long-bams
+            #for $lb in $rna_source.long_bams
+                '$lb'
+            #end for
+        #end if
+    #elif str($rna_source.source_type) == "combined"
+        #if $rna_source.rna_manifest
+            --rna-manifest '$rna_source.rna_manifest'
+        #end if
+        #if $rna_source.paired_reads
+            --short-reads-1
+            #for $pair in $rna_source.paired_reads
+                '$pair.forward'
+            #end for
+            --short-reads-2
+            #for $pair in $rna_source.paired_reads
+                '$pair.reverse'
+            #end for
+            --short-read-ids
+            #for $pair in $rna_source.paired_reads
+                '$pair.element_identifier'
+            #end for
+        #end if
+        #if $rna_source.long_reads
+            --long-reads
+            #for $lr in $rna_source.long_reads
+                '$lr'
+            #end for
+            --long-read-ids
+            #for $lr in $rna_source.long_reads
+                '$lr.element_identifier'
+            #end for
+        #end if
+        #if $rna_source.short_bams
+            --short-bams
+            #for $sb in $rna_source.short_bams
+                '$sb'
+            #end for
+        #end if
+        #if $rna_source.long_bams
+            --long-bams
+            #for $lb in $rna_source.long_bams
+                '$lb'
+            #end for
+        #end if
+    #end if
+    --logan-mode '$streaming_options.logan_mode'
+    --max-frac-spots $streaming_options.max_frac_spots
+    --p0-stop $streaming_options.p0_stop
+    --wave-spots $streaming_options.wave_spots
+    --structural-ncrna '$refinement_options.structural_ncrna'
+    $refinement_options.enable_zoom
+    #if $refinement_options.tiberius_weights
+        --tiberius-weights '$refinement_options.tiberius_weights'
+    #end if
+    @THREADS@
+    --state-dir geneloop_state_dir
+    --state-archive '$geneloop_state'
+    --out-gff3 '$annotation_gff3'
+    --out-proteins '$proteins_faa'
+    --out-gtf '$transcripts_gtf'
+    --out-summary '$summary_tsv'
+    --out-report '$geneloop_report'
+    ]]></command>
+    <inputs>
+        <param argument="--genome" type="data" format="fasta,fasta.gz" label="Target genome assembly (FASTA)" help="Unmasked or soft-masked eukaryotic genome assembly in FASTA format (uncompressed or gzip-compressed). Organellar contigs (mitochondrial/plastid) are auto-detected for background depletion filtering."/>
+        <param argument="--clade" type="select" label="Taxonomic clade and Tiberius model preset" help="Selects the deep-learning gene-finding weights (including soft-masking expectation), structural ncRNA taxon filter, and intron priors matching your organism.">
+            <option value="vertebrates" selected="true">Vertebrata (non-mammalian vertebrates, unmasked weights)</option>
+            <option value="mammalia_softmasking_v2">Mammalia (soft-masked assembly, v2 weights)</option>
+            <option value="mammalia_nosofttmasking_v2">Mammalia (unmasked assembly, v2 weights)</option>
+            <option value="insecta">Insecta / Arthropoda (unmasked weights)</option>
+            <option value="angiosperms">Angiosperms / flowering plants</option>
+            <option value="fungi">Fungi</option>
+            <option value="chlorophyta">Chlorophyta / green algae</option>
+            <option value="diatoms">Diatoms / stramenopiles</option>
+        </param>
+        <param argument="--mode" type="select" label="Execution and compute mode" help="Auto uses GPU Tiberius when a 24 GB NVIDIA GPU and weights are present, falls back to windowed CPU Tiberius if weights are cached, or runs Fast Evidence + Miniprot when GPU/weights are absent.">
+            <option value="auto" selected="true">Auto-detect (GPU Tiberius &gt; CPU Tiberius &gt; Fast Evidence + Miniprot)</option>
+            <option value="fast_evidence">Fast Evidence + Miniprot (no deep-learning step; fast CPU / CI mode)</option>
+            <option value="cpu_tiberius">CPU Tiberius (windowed ab initio seed over unsettled loci + evidence loop)</option>
+            <option value="gpu_tiberius">GPU Tiberius (full-genome deep-learning seed on 24 GB GPU + evidence loop)</option>
+        </param>
+
+        <conditional name="protein_source">
+            <param name="source_type" type="select" label="Homology protein evidence" help="Providing curated proteins from related clade species (e.g. NCBI RefSeq or OrthoDB) dramatically improves exon boundaries and protects conserved single-exon and multi-exon genes.">
+                <option value="history" selected="true">Clade protein FASTA from Galaxy History (recommended)</option>
+                <option value="none">No homology proteins (ab initio and/or RNA-seq only)</option>
+            </param>
+            <when value="history">
+                <param argument="--proteins" type="data" format="fasta,fasta.gz" label="Clade homology proteins (FASTA)" help="Protein sequences from related species in the same taxonomic clade (e.g. NCBI RefSeq or OrthoDB clade proteins, uncompressed or gzipped)."/>
+                <param argument="--exclude-genus" type="text" value="" label="Target genus to exclude from protein set (optional)" help="Optional genus name (e.g. Gallus or Drosophila) to strip from protein headers to prevent self-annotation leakage during benchmarking.">
+                    <validator type="regex" message="Letters, digits, spaces, underscores, or hyphens only">[A-Za-z0-9_ -]*</validator>
+                </param>
+            </when>
+            <when value="none"/>
+        </conditional>
+
+        <conditional name="rna_source">
+            <param name="source_type" type="select" label="RNA-seq transcriptomic evidence" help="Choose how to supply RNA-seq evidence: stream public INSDC accessions adaptively with Good-Turing stopping, use FASTQ/BAM datasets from your Galaxy History, combine both, or run seed-only annotation.">
+                <option value="history_paired" selected="true">Galaxy History paired-end FASTQ collection (list:paired)</option>
+                <option value="manifest_insdc">INSDC SRA/ENA run accession manifest (adaptive streaming)</option>
+                <option value="history_single">Galaxy History single-end FASTQ datasets</option>
+                <option value="history_long">Galaxy History long-read FASTQ datasets (PacBio Iso-Seq / ONT)</option>
+                <option value="history_bams">Galaxy History pre-aligned RNA-seq BAMs</option>
+                <option value="combined">Combined (INSDC manifest + History FASTQs and/or BAMs)</option>
+                <option value="none">None (ab initio + protein homology seed only)</option>
+            </param>
+            <when value="history_paired">
+                <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz" label="Paired-end RNA-seq FASTQ collection (list:paired)" help="Galaxy list-of-pairs collection of short-read RNA-seq libraries. Reads pass through the open-syncmer depletion filter before HISAT2 spliced alignment."/>
+            </when>
+            <when value="manifest_insdc">
+                <param argument="--rna-manifest" type="data" format="tabular,txt" label="INSDC RNA-seq run manifest (TSV or accession list)" help="Tab-separated file with column run_accession (SRR/ERR/DRR) and optional read_type (short or long) and organism, or a plain one-accession-per-line list."/>
+            </when>
+            <when value="history_single">
+                <param name="single_reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" label="Single-end RNA-seq FASTQ datasets" help="One or more single-end RNA-seq FASTQ(.gz) datasets from your Galaxy History."/>
+            </when>
+            <when value="history_long">
+                <param argument="--long-reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" label="Long-read RNA-seq FASTQ datasets (Iso-Seq / ONT)" help="Full-length cDNA or direct-RNA long-read FASTQ(.gz) datasets aligned with minimap2 (-x splice:hq) and assembled with StringTie -L."/>
+            </when>
+            <when value="history_bams">
+                <param argument="--short-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned short-read RNA-seq BAMs" help="Coordinate-sorted short-read RNA-seq BAM files; splice junctions and read-coverage bins are extracted directly without re-alignment."/>
+                <param argument="--long-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned long-read RNA-seq BAMs" help="Coordinate-sorted Iso-Seq or ONT RNA-seq BAM files."/>
+            </when>
+            <when value="combined">
+                <param argument="--rna-manifest" type="data" format="tabular,txt" optional="true" label="INSDC RNA-seq run manifest (optional)" help="Optional TSV/CSV or one-per-line list of SRR/ERR/DRR accessions."/>
+                <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz" optional="true" label="Paired-end FASTQ collection (optional)"/>
+                <param argument="--long-reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" optional="true" label="Long-read FASTQ datasets (optional)"/>
+                <param argument="--short-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned short-read BAMs (optional)"/>
+                <param argument="--long-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned long-read BAMs (optional)"/>
+            </when>
+            <when value="none"/>
+        </conditional>
+
+        <section name="streaming_options" title="Good-Turing Adaptive Streaming &amp; Convergence Options" expanded="false">
+            <param argument="--p0-stop" type="float" min="0.0005" max="0.10" value="0.005" label="Good-Turing unsettled-intron stopping threshold (p0)" help="Streaming halts once the Good-Turing probability of encountering an unseen canonical intron in unsettled loci (f1 / N) drops below this threshold across consecutive waves."/>
+            <param argument="--max-frac-spots" type="float" min="0.01" max="1.0" value="0.35" label="Maximum short-read spot fraction to stream" help="Hard upper ceiling on the fraction of available short-read spots consumed (0.35 = 35%). Set to 1.0 for exhaustive alignment on small datasets."/>
+            <param argument="--wave-spots" type="integer" min="1000" max="10000000" value="1000000" label="Short-read spots per adaptive bandit wave" help="Number of read pairs processed per wave before updating locus saturation and Good-Turing UCB library priorities."/>
+            <param argument="--logan-mode" type="select" label="Pre-assembled Logan contig acceleration (INSDC short runs)" help="When enabled, checks if public short-read SRA runs have pre-assembled Logan contigs available via HTTP-200 before falling back to raw read streaming.">
+                <option value="auto" selected="true">Auto (use Logan contigs when available)</option>
+                <option value="off">Off (always stream raw reads)</option>
+            </param>
+        </section>
+
+        <section name="refinement_options" title="Micro-Exon Rescue, Structural ncRNA &amp; Weights Options" expanded="false">
+            <param name="enable_zoom" type="boolean" truevalue="" falsevalue="--no-zoom" checked="true" label="Enable Stage-5 micro-exon rescue and retrocopy discriminator" help="Enables targeted 3-27 nt neural/regulated micro-exon gap scanning and the 3-feature classifier that separates processed retrocopies from intact single-exon genes (ORs, histones)."/>
+            <param argument="--structural-ncrna" type="select" label="Structural ncRNA annotation (tRNA, rRNA, snRNA, snoRNA)" help="Auto runs tRNAscan-SE, barrnap, and Rfam cmsearch when pinned assets and binaries are present in the environment, and skips cleanly if absent.">
+                <option value="auto" selected="true">Auto (run when assets and binaries are available)</option>
+                <option value="on">Require structural ncRNA annotation</option>
+                <option value="off">Off (protein-coding and lncRNA only)</option>
+            </param>
+            <param argument="--tiberius-weights" type="data" format="data" optional="true" label="Custom Tiberius model weights archive (.tar.gz, optional)" help="Optional unpacked-compatible .tar.gz archive of Tiberius model weights for your clade. Leave empty to use cluster-cached or container weights."/>
+        </section>
+    </inputs>
+    <outputs>
+        <data name="annotation_gff3" format="gff3" label="${tool.name} on ${on_string}: annotation.gff3"/>
+        <data name="proteins_faa" format="fasta" label="${tool.name} on ${on_string}: proteins.faa"/>
+        <data name="transcripts_gtf" format="gtf" label="${tool.name} on ${on_string}: transcripts.gtf"/>
+        <data name="summary_tsv" format="tabular" label="${tool.name} on ${on_string}: summary.tsv"/>
+        <data name="geneloop_report" format="html" label="${tool.name} on ${on_string}: geneloop_report.html"/>
+        <data name="geneloop_state" format="data" label="${tool.name} on ${on_string}: geneloop_state.focaloop.tar.zst"/>
+    </outputs>
+    <tests>
+        <test expect_num_outputs="6">
+            <param name="genome" value="geneloop/genome.fa" ftype="fasta"/>
+            <param name="clade" value="vertebrates"/>
+            <param name="mode" value="fast_evidence"/>
+            <conditional name="protein_source">
+                <param name="source_type" value="history"/>
+                <param name="proteins" value="geneloop/proteins.faa" ftype="fasta"/>
+            </conditional>
+            <conditional name="rna_source">
+                <param name="source_type" value="history_paired"/>
+                <param name="paired_reads">
+                    <collection type="list:paired">
+                        <element name="sample1">
+                            <collection type="paired">
+                                <element name="forward" value="geneloop/reads_1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="geneloop/reads_2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
+                    </collection>
+                </param>
+            </conditional>
+            <section name="streaming_options">
+                <param name="max_frac_spots" value="1.0"/>
+                <param name="logan_mode" value="off"/>
+            </section>
+            <section name="refinement_options">
+                <param name="structural_ncrna" value="off"/>
+            </section>
+            <output name="annotation_gff3">
+                <assert_contents>
+                    <has_text text="##gff-version 3"/>
+                    <has_text text="protein_coding"/>
+                    <has_text text="CDS"/>
+                </assert_contents>
+            </output>
+            <output name="proteins_faa">
+                <assert_contents>
+                    <has_text text="&gt;GLC"/>
+                </assert_contents>
+            </output>
+            <output name="transcripts_gtf">
+                <assert_contents>
+                    <has_text text="transcript_id"/>
+                    <has_text text="exon"/>
+                </assert_contents>
+            </output>
+            <output name="summary_tsv">
+                <assert_contents>
+                    <has_text text="coding_genes"/>
+                    <has_text text="depletion_filter"/>
+                    <not_has_text text="sieve"/>
+                </assert_contents>
+            </output>
+            <output name="geneloop_report">
+                <assert_contents>
+                    <has_text text="Focaloop GeneLoop"/>
+                    <has_text text="Syncmer Depletion Filter"/>
+                    <not_has_text text="sieve"/>
+                </assert_contents>
+            </output>
+            <output name="geneloop_state">
+                <assert_contents>
+                    <has_size min="500"/>
+                </assert_contents>
+            </output>
+        </test>
+        <test expect_num_outputs="6">
+            <param name="genome" value="geneloop/genome.fa" ftype="fasta"/>
+            <param name="clade" value="vertebrates"/>
+            <param name="mode" value="fast_evidence"/>
+            <conditional name="protein_source">
+                <param name="source_type" value="history"/>
+                <param name="proteins" value="geneloop/proteins.faa" ftype="fasta"/>
+            </conditional>
+            <conditional name="rna_source">
+                <param name="source_type" value="none"/>
+            </conditional>
+            <section name="refinement_options">
+                <param name="structural_ncrna" value="off"/>
+            </section>
+            <output name="annotation_gff3">
+                <assert_contents>
+                    <has_text text="##gff-version 3"/>
+                    <has_text text="CDS"/>
+                </assert_contents>
+            </output>
+            <output name="proteins_faa">
+                <assert_contents>
+                    <has_text text="&gt;GLA"/>
+                </assert_contents>
+            </output>
+            <output name="transcripts_gtf">
+                <assert_contents>
+                    <has_text text="transcript_id"/>
+                </assert_contents>
+            </output>
+            <output name="summary_tsv">
+                <assert_contents>
+                    <has_text text="SEED_ONLY_NO_RNA"/>
+                </assert_contents>
+            </output>
+            <output name="geneloop_report">
+                <assert_contents>
+                    <has_text text="Focaloop GeneLoop"/>
+                </assert_contents>
+            </output>
+            <output name="geneloop_state">
+                <assert_contents>
+                    <has_size min="500"/>
+                </assert_contents>
+            </output>
+        </test>
+    </tests>
+    <help format="markdown"><![CDATA[
+**What it does**
+
+**Focaloop GeneLoop (FocalAnnot)** is a 5-stage adaptive eukaryotic structural genome annotation pipeline. Rather than downloading and aligning 100% of every RNA-seq archive up front, GeneLoop establishes an *ab initio* and clade-protein seed, filters out already-saturated housekeeping and organellar reads in flight using a unique-multiplicity open-syncmer depletion filter, streams only the RNA-seq read slices needed to resolve uncertain loci under a Good-Turing statistical stopping rule, and applies targeted micro-exon and retrocopy refinement.
+
+-----
+
+**5-Stage Adaptive Annotation Overview**
+
+1. **Stage 0 — Global Structural & Homology Seed:** Combines **Tiberius** (CNN-BiLSTM-HMM deep-learning gene finder, when enabled) with clade protein spliced alignments (**DIAMOND** routing + **miniprot**). Conserved multi-exon genes with intact ORFs and corroborated intron chains are partitioned into ``LOCKED_HIGH_CONF``, while ambiguous, single-exon, or ab-initio-only regions are flagged as ``UNSETTLED_LOCI``.
+2. **Stage 1 — Open-Syncmer Depletion Filter (``glcore``):** Indexes canonical open syncmers (``k=31, s=15``) across locked coding exons and organelle/rRNA bait sequences. Only syncmers with **assembly-wide multiplicity == 1** (plus organellar/rDNA bait) enter the active depletion mask, protecting paralogs, gene families, and tandem arrays from premature suppression.
+3. **Stages 2–4 — Good-Turing UCB RNA-seq Streaming:** Streams read slices (from public INSDC SRA/ENA runs via ``xsra`` / pre-assembled Logan contigs or Galaxy History FASTQ datasets) through the depletion filter into **HISAT2** (short reads) or **minimap2** (long reads). A Good-Turing multi-library UCB bandit tracks unseen canonical intron probability (``p0 = f1 / N``) in unsettled loci, halting redundant biological replicates early while prioritizing tissues and long-read libraries that continue discovering new splice junctions.
+4. **Stage 5 — Synthesis, Micro-Exon Rescue & Guardrails:** Assembles transcript models with **StringTie** and reconciles all candidate chains (Tiberius, repaired miniprot, StringTie ORFs, and ORF-scout rescues) via additive evidence scoring and weighted interval scheduling. Includes a targeted **3–27 nt micro-exon** splice-gap scanner, a 3-feature **retrocopy vs. functional single-exon gene** discriminator, and optional **structural ncRNA** (``tRNAscan-SE``, ``barrnap``, Rfam ``cmsearch``) plus gated ``lncRNA`` emission.
+
+-----
+
+**Inputs & Format Guide**
+
+- **Target genome assembly (FASTA):** Unmasked or soft-masked nuclear + organellar assembly (``.fasta`` or ``.fasta.gz``). Make sure your chosen **Taxonomic clade** matches the masking state of your assembly when running Tiberius (e.g., use ``Mammalia (unmasked)`` for unmasked assemblies or ``Vertebrata`` for non-mammalian vertebrates).
+- **Clade homology proteins (FASTA):** Upload or select protein sequences from related species in the same clade (for example, NCBI RefSeq proteins or OrthoDB clade sets for Vertebrata, Insecta, or Embryophyta). Using clade proteins rather than self-species proteins provides strong evolutionary evidence for conserved exons while avoiding circular annotation. You may optionally enter a **Target genus to exclude** to strip that genus from protein headers automatically.
+- **RNA-seq evidence options:**
+  - *Galaxy History paired-end collection (``list:paired``):* Standard paired-end short-read RNA-seq datasets.
+  - *INSDC SRA/ENA run accession manifest:* A tab-separated table (or plain list of one accession per line) specifying public ``SRR``/``ERR``/``DRR`` accessions. Example TSV:
+
+```
+run_accession	read_type	organism
+SRR1234567	short	Gallus gallus
+SRR7654321	long	Gallus gallus
+```
+
+  - *Single-end FASTQs, Long-read FASTQs (Iso-Seq / ONT), Pre-aligned BAMs, or Combined:* Supply any combination of Galaxy History datasets or run seed-only annotation when no RNA-seq is available.
+
+-----
+
+**Compute Mode & Resource Guide**
+
+- **Auto-detect (default):** Automatically selects **GPU Tiberius** if a compatible NVIDIA GPU and clade weights are detected, **CPU Tiberius** (windowed inverted mode over unsettled loci) if Tiberius runtime and cached weights are present without a GPU, or **Fast Evidence + Miniprot** when deep-learning weights or GPU are unavailable (for example, in lightweight CI or CPU-only environments).
+- **Fast Evidence + Miniprot:** Skips Tiberius and builds models directly from ``miniprot`` protein homology, ``HISAT2``/``minimap2`` spliced RNA evidence, ``StringTie``, and Stage-5 refinement. Ideal for rapid validation, protein+RNA annotation, or CPU-only nodes without Tiberius weights.
+- **CPU Tiberius:** Runs ``miniprot`` and RNA-seq scouting first to lock conserved loci, then runs Tiberius on CPU strictly over unsettled windows.
+- **GPU Tiberius:** Runs full-genome Tiberius on a 24 GB GPU (e.g., NVIDIA RTX A5000) followed by DIAMOND-routed targeted ``miniprot`` and the adaptive RNA loop.
+
+-----
+
+**Outputs**
+
+- **annotation.gff3:** Multi-biotype GFF3 annotation containing ``protein_coding`` genes, ``lnc_RNA``, structural ncRNAs (``tRNA``, ``rRNA``, ``snRNA``, ``snoRNA``), and ``pseudogene`` records.
+- **proteins.faa:** Translated amino-acid FASTA of all predicted coding transcripts.
+- **transcripts.gtf:** GTF representation of predicted transcript models for downstream RNA-seq tools.
+- **summary.tsv:** Tabular summary of gene/biotype counts, locus partition metrics, RNA streaming fractions, depletion filter bypass rates, and Good-Turing convergence.
+- **geneloop_report.html:** Self-contained interactive HTML report with KPI cards, inline SVG biotype/evidence charts, and per-library streaming telemetry.
+- **geneloop_state.focaloop.tar.zst:** Compact Zstd-compressed Parquet state bundle (``loci.parquet``, ``junctions.parquet``, ``telemetry.parquet``, ``bins.npz``) for rapid inspection.
+
+-----
+
+**Known Biological Considerations**
+
+- **Paralog protection:** The open-syncmer depletion filter only removes read pairs matching *unique* (genomic multiplicity == 1) syncmers of fully converged loci. Multi-copy gene families, tandem arrays, and duplicated domains are never depleted.
+- **Olfactory receptors (ORs) & canonical histones:** Single-exon genes with intact ORFs (such as 0-TPM olfactory receptors or stem-loop replication-dependent histones) are explicitly protected against processed-pseudogene filtering, while intronless retrocopies carrying poly-A tracts or multi-exon parent intron-loss signatures are classified as pseudogenes.
+- **Micro-exons & ncRNAs:** Internal ``3–27 nt`` coding exons skipped by standard seed-and-extend aligners are recovered via canonical splice-gap scanning. Structural ncRNAs require ``tRNAscan-SE``, ``barrnap``, and Rfam 15.1 ``cmsearch`` assets when enabled.
+    ]]></help>
+    <expand macro="citations">
+        <citation type="doi">10.1093/bioinformatics/btaf036</citation>
+        <citation type="doi">10.1093/bioinformatics/btad014</citation>
+        <citation type="doi">10.1038/nmeth.3317</citation>
+        <citation type="doi">10.1038/nbt.3122</citation>
+    </expand>
+</tool>

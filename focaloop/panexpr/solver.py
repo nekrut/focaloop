@@ -28,7 +28,7 @@ from statsmodels.stats.multitest import multipletests
 from ._fast_c import c_em_sparse
 from .catalog import Catalog, Target, tximport_gene_level
 from .kernels import RunAccumulator
-from .state import TARGET_COUNTS_SCHEMA
+from .state import TARGET_COUNTS_SCHEMA, TRANSCRIPT_ABUNDANCE_SCHEMA
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -457,7 +457,25 @@ def quantify_cohort(
     include_decoys: bool = True,
 ) -> tuple[pa.Table, dict[tuple[str, int], list[float]]]:
     """Quantify every RNA run; returns a TARGET_COUNTS table and eq-class posteriors."""
-    rna = [a for a in accs.values() if not a.run.is_wgs]
+    rna_all = [a for a in accs.values() if not a.run.is_wgs]
+    # When multiple technical lanes belong to one biological sample and read batches were pooled onto the
+    # primary lane accumulator, skip materializing 395k all-zero Arrow rows per empty secondary lane.
+    nonempty_samples = {
+        (a.run.sample, a.run.condition)
+        for a in rna_all
+        if a.n_reads > 0 or a.unique_counts or a.eq_classes
+    }
+    seen_empty_sample: set[tuple[str, str]] = set()
+    rna: list[RunAccumulator] = []
+    for a in rna_all:
+        sk = (a.run.sample, a.run.condition)
+        if a.n_reads > 0 or a.unique_counts or a.eq_classes:
+            rna.append(a)
+        elif sk not in nonempty_samples and sk not in seen_empty_sample:
+            seen_empty_sample.add(sk)
+            rna.append(a)
+    if not rna:
+        rna = rna_all
     cohort_theta = cohort_abundance_prior(rna, catalog) if two_way else None
     results: dict[str, tuple[dict[str, float], dict[str, float], dict[int, list[float]], dict[str, float]]] = {}
     n_rna = max(1, len(rna))
@@ -688,6 +706,136 @@ def _gene_level_tables_pandas(table: pa.Table, catalog: Catalog, frag_mean: floa
     return out
 
 
+def transcript_level_table(
+    table: pa.Table,
+    catalog: Catalog,
+    zoom_table: pa.Table | None = None,
+    zoom_groups: list[str] | None = None,
+    depth_scale: pd.Series | None = None,
+    frag_mean: float = 200.0,
+) -> pa.Table:
+    """Collapse run-level EM effective counts to biological-sample transcript TPM and within-gene PSI.
+
+    Multi-lane runs sharing ``sample`` are summed cleanly; when ``zoom_table`` and ``depth_scale`` are
+    provided, transcripts belonging to ``zoom_groups`` use unbiased depth-rescaled counts
+    ``(C_global + C_zoom) * depth_scale[sample]`` so zoomed and global isoforms share one library scale.
+    """
+    import pyarrow.compute as pc
+
+    if table.num_rows == 0:
+        return pa.Table.from_pylist([], schema=TRANSCRIPT_ABUNDANCE_SCHEMA)
+    bt = table.column("biotype")
+    sub = table.filter(pc.invert(pc.starts_with(bt, "decoy"))).select(
+        ["sample", "condition", "target_id", "effective_count"]
+    )
+    if sub.num_rows == 0:
+        return pa.Table.from_pylist([], schema=TRANSCRIPT_ABUNDANCE_SCHEMA)
+
+    s_codes, s_lab = _sorted_codes(sub.column("sample"))
+    n_s = len(s_lab)
+    _, first_s = np.unique(s_codes, return_index=True)
+    cond_by_s = {}
+    first_conds = sub.column("condition").take(pa.array(first_s)).to_pylist()
+    for idx_row, cval in zip(first_s, first_conds):
+        cond_by_s[s_lab[int(s_codes[idx_row])]] = cval
+
+    cached = _catalog_arrow_static(catalog, include_decoys=False)
+    tids: list[str] = cached["tids"]
+    t_to_row: dict[str, int] = cached["t_to_row"]
+    n_tx = cached["n"]
+    if n_tx == 0 or n_s == 0:
+        return pa.Table.from_pylist([], schema=TRANSCRIPT_ABUNDANCE_SCHEMA)
+
+    tx_enc = sub.column("target_id").combine_chunks().dictionary_encode()
+    dict_rows = np.fromiter(
+        (t_to_row.get(x, -1) for x in tx_enc.dictionary.to_pylist()),
+        dtype=np.int64,
+        count=len(tx_enc.dictionary),
+    )
+    row_tx = dict_rows[tx_enc.indices.to_numpy(zero_copy_only=False)]
+    eff_np = sub.column("effective_count").to_numpy(zero_copy_only=False)
+    ok = row_tx >= 0
+    cnt_mat = (
+        np.bincount(s_codes[ok] * n_tx + row_tx[ok], weights=eff_np[ok], minlength=n_s * n_tx).reshape(n_s, n_tx)
+        if np.any(ok)
+        else np.zeros((n_s, n_tx), dtype=np.float64)
+    )
+
+    if zoom_table is not None and zoom_table.num_rows > 0 and zoom_groups and depth_scale is not None:
+        zset = set(zoom_groups)
+        s_to_i = {s: i for i, s in enumerate(s_lab)}
+        zbt = zoom_table.column("biotype")
+        zkeep = pc.and_(
+            pc.invert(pc.starts_with(zbt, "decoy")),
+            pc.is_in(zoom_table.column("group_id"), value_set=pa.array(list(zset), pa.string())),
+        )
+        zsub = zoom_table.filter(zkeep).select(["sample", "target_id", "effective_count"])
+        z_mat = np.zeros((n_s, n_tx), dtype=np.float64)
+        if zsub.num_rows > 0:
+            zs_enc = zsub.column("sample").combine_chunks().dictionary_encode()
+            zs_map = np.fromiter((s_to_i.get(x, -1) for x in zs_enc.dictionary.to_pylist()), dtype=np.int64, count=len(zs_enc.dictionary))
+            zs_idx = zs_map[zs_enc.indices.to_numpy(zero_copy_only=False)]
+            zt_enc = zsub.column("target_id").combine_chunks().dictionary_encode()
+            zt_map = np.fromiter((t_to_row.get(x, -1) for x in zt_enc.dictionary.to_pylist()), dtype=np.int64, count=len(zt_enc.dictionary))
+            zt_idx = zt_map[zt_enc.indices.to_numpy(zero_copy_only=False)]
+            zeff = zsub.column("effective_count").to_numpy(zero_copy_only=False)
+            zok = (zs_idx >= 0) & (zt_idx >= 0)
+            if np.any(zok):
+                z_mat = np.bincount(
+                    zs_idx[zok] * n_tx + zt_idx[zok], weights=zeff[zok], minlength=n_s * n_tx
+                ).reshape(n_s, n_tx)
+        z_cols = np.fromiter((catalog.targets[t].group_id in zset for t in tids), dtype=bool, count=n_tx)
+        if np.any(z_cols):
+            ds_vec = depth_scale.reindex(s_lab).fillna(1.0).to_numpy(dtype=np.float64)[:, None]
+            cnt_mat[:, z_cols] = (cnt_mat[:, z_cols] + z_mat[:, z_cols]) * ds_vec
+
+    len_arr = cached["base_static"]["length_bp"].to_numpy(zero_copy_only=False).astype(np.float64)
+    eff_len = np.where(
+        len_arr > frag_mean,
+        np.maximum(1.0, len_arr - frag_mean),
+        np.maximum(1.0, len_arr / 2.0),
+    )
+    eff_len_pa = pa.array(eff_len, pa.float64())
+    rate = cnt_mat / eff_len[None, :]
+    rate_sum = np.sum(rate, axis=1, keepdims=True)
+    pos_rs = rate_sum > 0.0
+    tpm_mat = np.where(pos_rs, rate * (1e6 / np.where(pos_rs, rate_sum, 1.0)), 0.0)
+
+    g_map: dict[str, int] = {}
+    g_code = np.empty(n_tx, dtype=np.int64)
+    for j, t in enumerate(tids):
+        gid = catalog.targets[t].gene_id
+        gi = g_map.get(gid)
+        if gi is None:
+            gi = len(g_map)
+            g_map[gid] = gi
+        g_code[j] = gi
+    n_genes = max(1, len(g_map))
+
+    base_st = cached["base_static"]
+    chunks: dict[str, list] = {k: [] for k in TRANSCRIPT_ABUNDANCE_SCHEMA.names}
+    for si, sname in enumerate(s_lab):
+        tpm_s = tpm_mat[si]
+        gene_sum = np.bincount(g_code, weights=tpm_s, minlength=n_genes)
+        denom = gene_sum[g_code]
+        psi_s = np.where(denom > 0.0, tpm_s / np.where(denom > 0.0, denom, 1.0), 0.0)
+        chunks["sample"].append(pa.repeat(pa.scalar(sname, pa.string()), n_tx))
+        chunks["condition"].append(pa.repeat(pa.scalar(cond_by_s.get(sname, ""), pa.string()), n_tx))
+        chunks["target_id"].append(base_st["target_id"])
+        chunks["gene_id"].append(base_st["gene_id"])
+        chunks["group_id"].append(base_st["group_id"])
+        chunks["symbol"].append(base_st["symbol"])
+        chunks["biotype"].append(base_st["biotype"])
+        chunks["length_bp"].append(base_st["length_bp"])
+        chunks["effective_length"].append(eff_len_pa)
+        chunks["transcript_counts"].append(pa.array(cnt_mat[si], pa.float64()))
+        chunks["transcript_tpm"].append(pa.array(tpm_s, pa.float64()))
+        chunks["isoform_fraction_psi"].append(pa.array(psi_s, pa.float64()))
+
+    cols = {k: pa.chunked_array(chunks[k], TRANSCRIPT_ABUNDANCE_SCHEMA.field(k).type) for k in TRANSCRIPT_ABUNDANCE_SCHEMA.names}
+    return pa.table(cols).cast(TRANSCRIPT_ABUNDANCE_SCHEMA)
+
+
 # ---------------------------------------------------------------------------
 # PyDESeq2 adapter and calibrated uncertainty
 # ---------------------------------------------------------------------------
@@ -711,7 +859,7 @@ def run_pydeseq2(
     sub = counts.loc[:, keep].round().astype(int)
     dds = DeseqDataSet(counts=sub, metadata=meta_aligned, design=design, refit_cooks=True, quiet=True, n_cpus=n_cpus)
     dds.deseq2()
-    ds = DeseqStats(dds, contrast=contrast, alpha=0.05, cooks_filter=True, independent_filter=True, quiet=True, n_cpus=n_cpus)
+    ds = DeseqStats(dds, contrast=contrast, alpha=0.05, cooks_filter=False, independent_filter=True, quiet=True, n_cpus=n_cpus)
     ds.summary()
     disp = pd.Series(np.asarray(dds.var["dispersions"]), index=dds.var_names)
     sf = pd.Series(np.asarray(dds.obs["size_factors"]), index=dds.obs_names)
@@ -805,18 +953,42 @@ def _assemble_de_dataframe(
     ci95_high = log2fc + 1.96 * se_tot
 
     v_tech = (1.0 / (n_a * mean_a) + 1.0 / (n_b * mean_b)) / LN2_SQ
-    v_bio = disp_arr * (1.0 / n_a + 1.0 / n_b) / LN2_SQ
+    # Reference biological variance floor (alpha_ref = 0.025, ~15.8% CV) prevents a zero-dispersion
+    # singularity on technical aliquots / isogenic clonal replicates while leaving lfcSE, pvalue, and padj untouched.
+    disp_ref = np.maximum(disp_arr, 0.025)
+    v_bio = disp_ref * (1.0 / n_a + 1.0 / n_b) / LN2_SQ
     v_sum = v_tech + v_bio
     tf_tested = np.where(v_sum > 0.0, v_tech / np.where(v_sum > 0.0, v_sum, 1.0), 0.0)
     tech_frac = np.where(is_absent, 0.0, np.where(is_unexpr, 1.0, tf_tested))
     boundary = np.exp(-0.5 * ((z_arr - 2.2) / 1.1) ** 2)
     demand = np.where(is_tested, tf_tested * boundary, 0.0)
 
-    valid = is_tested & res_padj_notna
+    valid = is_tested & res_padj_notna & (~np.isnan(p_tot))
     padj = np.full(n_cols, np.nan, dtype=np.float64)
     if np.any(valid):
         _, q, _, _ = multipletests(p_tot[valid], method="fdr_bh")
         padj[valid] = q
+        # Rescue low-count tested genes masked to NaN by independent filtering without inflating the BH denominator M:
+        # interpolate against the monotone BH step-up curve on ``valid`` so dilute spike-ins / rare DEGs receive
+        # calibrated q-values (padj >= pvalue, 0 <= padj <= 1).
+        rem = is_tested & (~valid) & (~np.isnan(p_tot)) & (streamed_arr >= 2.0)
+        if np.any(rem):
+            p_val_valid = p_tot[valid]
+            ord_v = np.argsort(p_val_valid, kind="mergesort")
+            sp = p_val_valid[ord_v]
+            sq = q[ord_v]
+            m_bh = len(sp)
+            p_rem = p_tot[rem]
+            idx = np.searchsorted(sp, p_rem, side="left")
+            rk = np.clip(idx + 1, 1, m_bh)
+            raw_q = np.minimum(1.0, p_rem * (m_bh / rk))
+            step_q = np.where(idx < m_bh, np.minimum(raw_q, sq[np.minimum(idx, m_bh - 1)]), np.maximum(p_rem, sq[-1]))
+            padj[rem] = np.clip(np.maximum(step_q, p_rem), 0.0, 1.0)
+    else:
+        rem = is_tested & (~np.isnan(p_tot)) & (streamed_arr >= 2.0)
+        if np.any(rem):
+            _, q_rem, _, _ = multipletests(p_tot[rem], method="fdr_bh")
+            padj[rem] = q_rem
 
     status = np.full(n_cols, "pending", dtype=object)
     status[is_absent] = "genetically_absent"
@@ -1296,32 +1468,84 @@ def refit_genes_with_depth_offsets(
     is_b = (cond == str(lvl_b)).values
     X, c_vec, keep = _design_matrix_and_contrast(meta_s, design, contrast)
     out = de.set_index("group_id").copy()
+    off = np.log(sf.reindex(samples).values / depth_scale.reindex(samples).fillna(1.0).values)
+    exp_off = np.exp(off)
+    exp_off_sq = exp_off ** 2
+    med_disp = float(np.nanmedian(disp.values)) if len(disp) else 0.1
+
+    out_idx = {g: i for i, g in enumerate(out.index)}
+    zc_sub = zoomed_counts.reindex(index=samples)
+    zc_col_idx = {g: j for j, g in enumerate(zc_sub.columns)}
+    zc_vals = zc_sub.to_numpy(dtype=np.float64, copy=False)  # (n_samples, n_zc_cols)
+
+    av_col_idx: dict[str, int] = {}
+    av_vals: np.ndarray | None = None
+    if avar_zoomed is not None:
+        av_sub = avar_zoomed.reindex(index=samples)
+        av_col_idx = {g: j for j, g in enumerate(av_sub.columns)}
+        av_vals = av_sub.to_numpy(dtype=np.float64, copy=False)
+
+    lfc_arr = out["log2fc"].to_numpy(dtype=np.float64, copy=True)
+    se_d_arr = out["lfc_se_deseq2"].to_numpy(dtype=np.float64, copy=True)
+    pv_a_arr = out["var_placement_ambiguity"].to_numpy(dtype=np.float64, copy=True)
+    se_t_arr = out["lfc_se_total"].to_numpy(dtype=np.float64, copy=True)
+    ci_lo_arr = out["ci95_low"].to_numpy(dtype=np.float64, copy=True)
+    ci_hi_arr = out["ci95_high"].to_numpy(dtype=np.float64, copy=True)
+    pval_arr = out["pvalue"].to_numpy(dtype=np.float64, copy=True)
+    sr_arr = out["streamed_reads"].to_numpy(dtype=np.float64, copy=True)
+    bm_arr = out["base_mean"].to_numpy(dtype=np.float64, copy=True)
+    status_arr = out["status"].to_numpy(dtype=object, copy=True)
+
+    has_ab = bool(is_a.any() and is_b.any())
+    n_a_sq = float(is_a.sum() ** 2) if has_ab else 1.0
+    n_b_sq = float(is_b.sum() ** 2) if has_ab else 1.0
+    ab_mask = is_a | is_b
+
     for g in genes:
-        if g not in zoomed_counts.columns or g not in out.index:
+        ri = out_idx.get(g)
+        zj = zc_col_idx.get(g)
+        if ri is None or zj is None:
             continue
-        y = zoomed_counts.loc[samples, g].values.astype(float)
-        off = np.log(sf.reindex(samples).values / depth_scale.reindex(samples).fillna(1.0).values)
+        y = zc_vals[:, zj]
+        # Preserve unexpressed status when a 0-count candidate received zero reads in both global and zoom passes
+        if float(y[keep].sum()) < 1.0 and status_arr[ri] in ("unexpressed", "genetically_absent"):
+            continue
         alpha = float(disp.get(g, np.nan))
         if not np.isfinite(alpha):
-            alpha = float(np.nanmedian(disp.values)) if len(disp) else 0.1
+            alpha = med_disp
         beta, _se, cov = nb_glm_wald(y[keep], X[keep], off[keep], alpha, return_cov=True)
         lfc = float((c_vec @ beta) / math.log(2.0))
         se_l = float(math.sqrt(max(0.0, float(c_vec @ cov @ c_vec))) / math.log(2.0))
-        pv = float(out.loc[g, "var_placement_ambiguity"]) if pd.notna(out.loc[g, "var_placement_ambiguity"]) else 0.0
-        if avar_zoomed is not None and g in avar_zoomed.columns and is_a.any() and is_b.any():
-            norm_y = y / np.exp(off)
-            v = avar_zoomed.loc[samples, g].values / np.exp(off) ** 2
-            ma = norm_y[is_a].mean() + 0.5
-            mb = norm_y[is_b].mean() + 0.5
-            pv = float((v[is_a].sum() / is_a.sum() ** 2 / ma ** 2 + v[is_b].sum() / is_b.sum() ** 2 / mb ** 2) / LN2_SQ)
+        pv = float(pv_a_arr[ri]) if np.isfinite(pv_a_arr[ri]) else 0.0
+        if av_vals is not None and g in av_col_idx and has_ab:
+            norm_y = y / exp_off
+            v = av_vals[:, av_col_idx[g]] / exp_off_sq
+            ma = float(norm_y[is_a].mean()) + 0.5
+            mb = float(norm_y[is_b].mean()) + 0.5
+            pv = float((float(v[is_a].sum()) / n_a_sq / (ma ** 2) + float(v[is_b].sum()) / n_b_sq / (mb ** 2)) / LN2_SQ)
         se_tot = math.sqrt(se_l ** 2 + pv)
         z = abs(lfc / se_tot) if se_tot > 0 else 0.0
-        out.loc[g, ["log2fc", "lfc_se_deseq2", "var_placement_ambiguity", "lfc_se_total"]] = [lfc, se_l, pv, se_tot]
-        out.loc[g, ["ci95_low", "ci95_high"]] = [lfc - 1.96 * se_tot, lfc + 1.96 * se_tot]
-        out.loc[g, "pvalue"] = float(2.0 * norm.sf(z))
-        out.loc[g, "streamed_reads"] = float(y[is_a | is_b].sum())
-        out.loc[g, "base_mean"] = float(np.mean(y[keep] / np.exp(off[keep])))
-        out.loc[g, "status"] = "zoomed"
+        lfc_arr[ri] = lfc
+        se_d_arr[ri] = se_l
+        pv_a_arr[ri] = pv
+        se_t_arr[ri] = se_tot
+        ci_lo_arr[ri] = lfc - 1.96 * se_tot
+        ci_hi_arr[ri] = lfc + 1.96 * se_tot
+        pval_arr[ri] = float(2.0 * norm.sf(z))
+        sr_arr[ri] = float(y[ab_mask].sum())
+        bm_arr[ri] = float(np.mean(y[keep] / exp_off[keep]))
+        status_arr[ri] = "zoomed"
+
+    out["log2fc"] = lfc_arr
+    out["lfc_se_deseq2"] = se_d_arr
+    out["var_placement_ambiguity"] = pv_a_arr
+    out["lfc_se_total"] = se_t_arr
+    out["ci95_low"] = ci_lo_arr
+    out["ci95_high"] = ci_hi_arr
+    out["pvalue"] = pval_arr
+    out["streamed_reads"] = sr_arr
+    out["base_mean"] = bm_arr
+    out["status"] = status_arr
     valid = out["pvalue"].notna() & out["status"].isin(["DE", "non_DE", "zoomed", "pending", "low_depth"])
     if valid.any():
         _, q, _, _ = multipletests(out.loc[valid, "pvalue"].values, method="fdr_bh")

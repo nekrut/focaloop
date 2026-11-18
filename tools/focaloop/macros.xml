@@ -1,0 +1,34 @@
+<macros>
+    <token name="@TOOL_VERSION@">0.3.0</token>
+    <token name="@VERSION_SUFFIX@">0</token>
+    <token name="@PROFILE@">25.0</token>
+    <token name="@THREADS@">--threads \${GALAXY_SLOTS:-8}</token>
+
+    <xml name="requirements">
+        <requirements>
+            <requirement type="package" version="@TOOL_VERSION@">focaloop</requirement>
+            <yield/>
+            <container type="docker">ghcr.io/galaxyproject/focaloop:@TOOL_VERSION@</container>
+        </requirements>
+    </xml>
+
+    <xml name="edam_topics">
+        <edam_topics>
+            <edam_topic>topic_0091</edam_topic>
+            <edam_topic>topic_0622</edam_topic>
+            <yield/>
+        </edam_topics>
+    </xml>
+
+    <xml name="citations">
+        <citations>
+            <citation type="bibtex">@misc{focaloop2026,
+  author = {Nekrutenko, Anton and Galaxy Project},
+  title = {Focaloop: Adaptive Byte-Budgeted Streaming Loops for Genomics},
+  year = {2026},
+  url = {https://github.com/galaxyproject/focaloop}
+}</citation>
+            <yield/>
+        </citations>
+    </xml>
+</macros>

@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
-<toolbox monitor="true" tool_path="__FOCALOOP_REPO__/blueprints">
+<toolbox monitor="true" tool_path="__FOCALOOP_REPO__/tools">
     <section id="focaloop" name="Focaloop">
-        <tool file="panexpr/galaxy_tool.xml"/>
-        <tool file="malariavar/galaxy_tool.xml"/>
-        <tool file="focaloop_query/galaxy_tool.xml"/>
-        <tool file="focaloop_bait/galaxy_tool.xml"/>
+        <tool file="focaloop/expressionloop.xml"/>
+        <tool file="focaloop/variationloop.xml"/>
+        <tool file="focaloop/geneloop.xml"/>
+        <tool file="focaloop/focaloop_query.xml"/>
     </section>
 </toolbox>

@@ -1563,31 +1563,21 @@ def run_warm_engine_query(
 
 
 def prebuild_all_native_libs() -> dict[str, str]:
-    """Compile and load all C99 shared libraries for PanExpr and MalariaVar."""
+    """Compile and load all C99/OpenMP binaries and shared libraries across all Focaloop engines."""
     from .malariavar.native._loader import ensure_shared_lib
-    from .panexpr import _fast_c
-    from .panexpr._medvedev_compile import compile_c_lib
+    from .runners_expression import prebuild_expressionloop_native_libs
+    from .runners_geneloop import prebuild_geneloop_native_libs
 
-    pan_dir = Path(_fast_c.__file__).resolve().parent
     built: dict[str, str] = {}
-    em_lib = _fast_c.get_fast_lib()
-    if em_lib is None:
-        raise RuntimeError("Failed to compile panexpr _fast_c shared library")
-    built["panexpr_fast_c"] = str(getattr(em_lib, "_name", "loaded"))
-    for name, src in (
-        ("island_pc", "island_pc_core.c"),
-        ("ust", "ust_kernel.c"),
-        ("sam_unordered", "sam_unordered_core.c"),
-        ("dothash", "dothash_sketch.c"),
-    ):
-        lib = compile_c_lib(name, pan_dir / src)
-        built[f"panexpr_{name}"] = str(getattr(lib, "_name", "loaded"))
+    built.update(prebuild_expressionloop_native_libs())
     for stem, srcs, hdrs, omp in (
         ("libpla_sieve", ["pla_sieve.c"], ["pla_sieve.h"], True),
         ("libdothash", ["dothash_sketch.c"], None, True),
         ("libisland_pc", ["island_pc_core.c"], None, False),
         ("libust", ["ust_kernel.c"], None, False),
+        ("varloop_core", ["varloop_core.c"], None, False),
     ):
         p = ensure_shared_lib(stem, srcs, headers=hdrs, use_openmp=omp)
         built[f"malariavar_{stem}"] = str(p)
+    built.update(prebuild_geneloop_native_libs())
     return built

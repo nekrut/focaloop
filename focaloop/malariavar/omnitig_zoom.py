@@ -25,6 +25,13 @@ import math
 from typing import Iterable, Sequence
 
 import numpy as np
+try:
+    from numba import njit
+except ImportError:  # pragma: no cover
+    def njit(*args, **kwargs):
+        def _wrap(fn):
+            return fn
+        return _wrap
 
 K_DEFAULT = 31
 
@@ -146,22 +153,17 @@ def _parse_qual_array(q: str | Sequence[int] | np.ndarray) -> np.ndarray:
     return np.clip(np.asarray(q, dtype=np.int32), 0, 93)
 
 
+_SURV_PROB_LIST = _SURV_PROB.tolist()
+
+
 def vargeno_edge_weights(
     reads: Sequence[str],
-    quals: Sequence[str | Sequence[int] | np.ndarray] | None = None,
+    quals: Sequence[str | bytes | np.ndarray] | None = None,
     k: int = K_DEFAULT,
+    min_bq: int = 8,
     weight_mode: str = "prod",
 ) -> dict[str, float]:
-    """Compute VarGeno Phred survival weights over directed (k+1)-mer edges e = (u -> v).
-
-    Args:
-        reads: Genomic-strand read sequences covering the locus window.
-        quals: Optional Phred+33 ASCII strings or numeric Phred arrays matching `reads`.
-        k: Node k-mer size (edges are (k+1)-mers).
-        weight_mode:
-          - "prod": prod_{b in e} (1 - 10^(-Q_b / 10))  [exact k+1 survival probability]
-          - "min":  (1 - 10^(-min_{b in e} Q_b / 10))   [worst-base survival bound]
-    """
+    """Accumulate (k+1)-mer edge weights across reads, breaking on 'N' or bases with Phred < min_bq."""
     kp1 = k + 1
     weights: dict[str, float] = {}
     if quals is None:
@@ -178,38 +180,62 @@ def vargeno_edge_weights(
     if weight_mode not in ("prod", "min"):
         raise ValueError(f"weight_mode must be 'prod' or 'min', got {weight_mode!r}")
 
-    csum = np.empty(4096, dtype=np.float64)
+    surv_tbl = _SURV_PROB_LIST
+    get_w = weights.get
     for r, q_raw in zip(reads, quals):
         nr = len(r)
         if nr < kp1:
             continue
-        q = _parse_qual_array(q_raw)
-        if len(q) != nr:
-            raise ValueError(f"Read length {nr} != qual length {len(q)}")
+        if isinstance(q_raw, (bytes, bytearray, memoryview)):
+            qb = bytes(q_raw)
+            q_list = [b - 33 for b in qb]
+        elif isinstance(q_raw, str):
+            q_list = [ord(c) - 33 for c in q_raw]
+        else:
+            arr_q = np.asarray(q_raw)
+            if arr_q.dtype == np.uint8:
+                q_list = [int(b) - 33 for b in arr_q.tolist()]
+            else:
+                q_list = arr_q.tolist()
+        if len(q_list) != nr:
+            raise ValueError(f"Read length {nr} != qual length {len(q_list)}")
+
+        bad_ps = [0] * (nr + 1)
+        low_ps = [0] * (nr + 1)
+        b_acc = 0
+        l_acc = 0
+        for idx_c, (ch, qv) in enumerate(zip(r, q_list)):
+            if qv < min_bq or ch == "N":
+                b_acc += 1
+            elif qv < 30:
+                l_acc += 1
+            bad_ps[idx_c + 1] = b_acc
+            low_ps[idx_c + 1] = l_acc
 
         if weight_mode == "prod":
-            if nr + 1 > len(csum):
-                csum = np.empty(nr + 1, dtype=np.float64)
-            csum[0] = 0.0
-            # Track zero-quality bases explicitly so Q=0 gives exact 0 survival
-            zero_csum = np.zeros(nr + 1, dtype=np.int32)
-            zero_csum[1:] = np.cumsum(q <= 0)
-            csum[1:nr + 1] = np.cumsum(_LOG_SURV_PROB[q])
+            csum = [0.0] * (nr + 1)
+            c_acc = 0.0
+            for idx_c, qv in enumerate(q_list):
+                qc = 0 if qv < 0 else (93 if qv > 93 else qv)
+                c_acc += float(_LOG_SURV_PROB[qc])
+                csum[idx_c + 1] = c_acc
             for i in range(nr - k):
-                if zero_csum[i + kp1] > zero_csum[i]:
+                if bad_ps[i + kp1] > bad_ps[i]:
                     continue
                 edge = r[i:i + kp1]
-                if "N" not in edge:
-                    w = math.exp(float(csum[i + kp1] - csum[i]))
-                    weights[edge] = weights.get(edge, 0.0) + w
+                weights[edge] = get_w(edge, 0.0) + math.exp(csum[i + kp1] - csum[i])
         else:
-            probs = _SURV_PROB[q]
             for i in range(nr - k):
-                edge = r[i:i + kp1]
-                if "N" not in edge:
-                    w = float(np.min(probs[i:i + kp1]))
-                    if w > 0.0:
-                        weights[edge] = weights.get(edge, 0.0) + w
+                if bad_ps[i + kp1] > bad_ps[i]:
+                    continue
+                if low_ps[i + kp1] == low_ps[i]:
+                    w = 0.9995
+                else:
+                    mq = min(q_list[i:i + kp1])
+                    w = surv_tbl[93 if mq > 93 else (0 if mq < 0 else mq)]
+                if w > 0.0:
+                    edge = r[i:i + kp1]
+                    weights[edge] = get_w(edge, 0.0) + w
     return weights
 
 
@@ -320,7 +346,7 @@ def spell_edge_walk(graph: LocusGraph, edge_ids: Sequence[int]) -> str:
     return "".join(parts)
 
 
-def extract_core_unitigs(graph: LocusGraph) -> list[list[int]]:
+def extract_core_unitigs(graph: LocusGraph, stop_vertices: set[int] | None = None) -> list[list[int]]:
     """Partition all edges of `graph` into maximal edge-disjoint non-branching core unitigs.
 
     Internal vertices v of a core unitig strictly satisfy in_deg(v) == 1 and out_deg(v) == 1
@@ -329,10 +355,12 @@ def extract_core_unitigs(graph: LocusGraph) -> list[list[int]]:
     n_edges = len(graph.edge_seq)
     if n_edges == 0:
         return []
+    stops = stop_vertices or set()
 
     def _is_1to1_vertex(vid: int) -> bool:
         return (
-            len(graph.in_edges[vid]) == 1
+            vid not in stops
+            and len(graph.in_edges[vid]) == 1
             and len(graph.out_edges[vid]) == 1
             and not graph.guarded_in_merge[vid]
             and not graph.guarded_out_branch[vid]
@@ -417,7 +445,8 @@ def extract_simple_omnitigs(
     max_walk_edges: int = 2048,
     anchor_left: str | None = None,
     anchor_right: str | None = None,
-) -> tuple[list[list[int]], list[list[int]], list[int]]:
+    return_core_indices: bool = False,
+):
     """Compute maximal deduplicated Simple Omnitigs (Schmidt et al. WABI 2024) in O(|V|+|E|) time.
 
     For each maximal core unitig C = (e_0, ..., e_m):
@@ -429,16 +458,13 @@ def extract_simple_omnitigs(
         (seeded with `set(C)`), plus `max_walk_edges` cap, AND blocks extension into dead-end
         sinkless/sourceless cycles that cannot connect to anchors when anchors exist.
         Guarantees 0 infinite loops and 0 over-unrolling on 81%-AT P. falciparum tandem repeats!
-
-    Returns:
-      (maximal_omnitig_edge_walks, core_unitigs, omnitig_core_indices)
     """
-    cores = extract_core_unitigs(graph)
-    if not cores:
-        return [], [], []
-
     left_id = graph.node_to_id.get(anchor_left, -1) if anchor_left else -1
     right_id = graph.node_to_id.get(anchor_right, -1) if anchor_right else -1
+    stops = {v for v in (left_id, right_id) if v >= 0} if not return_core_indices else set()
+    cores = extract_core_unitigs(graph, stop_vertices=stops)
+    if not cores:
+        return ([], [], []) if return_core_indices else ([], [])
 
     # If both anchors exist and right_id is reachable from left_id, identify vertices that can
     # reach right_id and vertices reachable from left_id so sinkless/sourceless noise cycles
@@ -534,7 +560,9 @@ def extract_simple_omnitigs(
         kept_walks.append(w)
         kept_core_idx.append(c_idx)
 
-    return kept_walks, cores, kept_core_idx
+    if return_core_indices:
+        return kept_walks, cores, kept_core_idx
+    return kept_walks, cores
 
 
 # ============================================================================
@@ -791,6 +819,7 @@ def assemble_omnitig_wsaf(
         max_walk_edges=max_walk_edges,
         anchor_left=left,
         anchor_right=right,
+        return_core_indices=True,
     )
     if not walks:
         return []
@@ -851,3 +880,390 @@ def assemble(
         weight_mode=weight_mode,
     )
     return [(h.seq, round(h.mean_support, 3)) for h in haplotigs]
+
+
+# ============================================================================
+# 5. Multi-k Diploid Haplotype Discovery & Needleman-Wunsch VCF Decomposition
+# ============================================================================
+
+def enumerate_anchor_paths(
+    graph: LocusGraph,
+    cores: list[list[int]],
+    anchor_left: str,
+    anchor_right: str,
+    max_paths: int = 16,
+    max_edges: int = 600,
+) -> tuple[list[tuple[str, float]], bool]:
+    """Enumerate highest-support s->t paths in the compacted core-unitig graph; flag if cycle encountered."""
+    left_id = graph.node_to_id.get(anchor_left, -1)
+    right_id = graph.node_to_id.get(anchor_right, -1)
+    if left_id < 0 or right_id < 0:
+        return [], False
+
+    edge_to_core = {c[0]: idx for idx, c in enumerate(cores) if c}
+    core_mean_w = [float(np.mean([graph.edge_weight[e] for e in c])) for c in cores]
+    start_cores = sorted(
+        (edge_to_core[e] for e in graph.out_edges[left_id] if e in edge_to_core),
+        key=lambda cid: -core_mean_w[cid],
+    )
+    if not start_cores:
+        return [], False
+
+    n_v = len(graph.nodes)
+    can_reach = [False] * n_v
+    st = [right_id]
+    can_reach[right_id] = True
+    while st:
+        v = st.pop()
+        for eid in graph.in_edges[v]:
+            u = graph.edge_u[eid]
+            if not can_reach[u]:
+                can_reach[u] = True
+                st.append(u)
+    if not can_reach[left_id]:
+        return [], False
+
+    results: list[tuple[str, float]] = []
+    saw_cycle = False
+    stack: list[tuple[int, list[int], int, float, set[int]]] = [
+        (cid, [cid], len(cores[cid]), core_mean_w[cid], {cid})
+        for cid in reversed(start_cores)
+        if can_reach[graph.edge_v[cores[cid][-1]]]
+    ]
+
+    while stack and len(results) < max_paths:
+        cid, cpath, n_ed, min_sup, vis = stack.pop()
+        v_end = graph.edge_v[cores[cid][-1]]
+        if v_end == right_id and n_ed >= 1:
+            full_edges = [e for c_i in cpath for e in cores[c_i]]
+            seq = spell_edge_walk(graph, full_edges)
+            results.append((seq, min_sup))
+            continue
+        if n_ed >= max_edges:
+            continue
+        nxt_cids = sorted(
+            (edge_to_core[e] for e in graph.out_edges[v_end] if e in edge_to_core),
+            key=lambda x: core_mean_w[x],
+        )
+        for ncid in nxt_cids:
+            if not can_reach[graph.edge_v[cores[ncid][-1]]]:
+                continue
+            if ncid in vis:
+                saw_cycle = True
+                continue
+            stack.append((
+                ncid,
+                cpath + [ncid],
+                n_ed + len(cores[ncid]),
+                min(min_sup, core_mean_w[ncid]),
+                vis | {ncid},
+            ))
+
+    results.sort(key=lambda x: (-x[1], len(x[0])))
+    return results, saw_cycle
+
+
+def discover_candidate_haplotypes(
+    ref_window: str,
+    reads: Sequence[str],
+    quals: Sequence[str | bytes | np.ndarray] | None = None,
+    uncap_ref_depth: int = 0,
+    k_list: Sequence[int] = (31, 55),
+    min_weight: float = 1.8,
+    slack: int = 120,
+    max_candidates: int = 8,
+) -> list[str]:
+    """Return deduplicated candidate haplotypes `[ref_window, alt_1, ...]` using multi-k Simple Omnitigs."""
+    candidates: list[str] = [ref_window]
+    seen: set[str] = {ref_window}
+
+    for k in k_list:
+        if len(ref_window) < k + 2:
+            continue
+        left, right = ref_window[:k], ref_window[-k:]
+        ew = vargeno_edge_weights(reads, quals=quals, k=k, weight_mode="min")
+        if uncap_ref_depth > 0:
+            w_ref = float(uncap_ref_depth)
+            for i in range(len(ref_window) - k):
+                e = ref_window[i:i + k + 1]
+                if "N" not in e:
+                    ew[e] = ew.get(e, 0.0) + w_ref
+        else:
+            for i in list(range(min(k + 4, len(ref_window) - k))) + list(range(max(0, len(ref_window) - 2 * k - 4), len(ref_window) - k)):
+                e = ref_window[i:i + k + 1]
+                if "N" not in e:
+                    ew[e] = ew.get(e, 0.0) + 0.6
+
+        eff_min = min_weight
+        graph = build_locus_graph(ew, k=k, min_weight=eff_min, branch_guard_weight=eff_min)
+        max_edges = max(len(ref_window) - k + slack, 2 * len(ref_window))
+        omni_walks, cores = extract_simple_omnitigs(graph, max_walk_edges=max_edges, anchor_left=left, anchor_right=right)
+
+        found_nonref_this_k = False
+        for w in omni_walks:
+            seq = spell_edge_walk(graph, w)
+            i_l = seq.find(left)
+            i_r = seq.rfind(right)
+            if i_l >= 0 and i_r >= i_l:
+                sub_seq = seq[i_l: i_r + k]
+                if len(sub_seq) >= k + 1 and sub_seq not in seen:
+                    seen.add(sub_seq)
+                    candidates.append(sub_seq)
+                    found_nonref_this_k = True
+                    if len(candidates) >= max_candidates:
+                        return candidates
+
+        st_paths, saw_cycle = enumerate_anchor_paths(
+            graph, cores, left, right, max_paths=max_candidates, max_edges=max_edges
+        )
+        for seq, _ in st_paths:
+            if seq not in seen:
+                seen.add(seq)
+                candidates.append(seq)
+                found_nonref_this_k = True
+                if len(candidates) >= max_candidates:
+                    return candidates
+
+        if found_nonref_this_k and not saw_cycle:
+            break
+
+    return candidates
+
+
+@njit(cache=True, nogil=True)
+def _nw_align_ops_jit(rs_u8: np.ndarray, as_u8: np.ndarray) -> np.ndarray:
+    lr = len(rs_u8)
+    la = len(as_u8)
+    NEG = -1000000000
+    GO = -6
+    GE = -1
+    MM = -4
+    M = np.full((lr + 1, la + 1), NEG, dtype=np.int32)
+    I = np.full((lr + 1, la + 1), NEG, dtype=np.int32)
+    D = np.full((lr + 1, la + 1), NEG, dtype=np.int32)
+    tbM = np.zeros((lr + 1, la + 1), dtype=np.int8)
+    tbI = np.zeros((lr + 1, la + 1), dtype=np.int8)
+    tbD = np.zeros((lr + 1, la + 1), dtype=np.int8)
+
+    M[0, 0] = 0
+    for i in range(1, lr + 1):
+        D[i, 0] = GO + (i - 1) * GE
+        tbD[i, 0] = 0 if i == 1 else 2
+    for j in range(1, la + 1):
+        I[0, j] = GO + (j - 1) * GE
+        tbI[0, j] = 0 if j == 1 else 1
+
+    for i in range(1, lr + 1):
+        rc = rs_u8[i - 1]
+        for j in range(1, la + 1):
+            sc = 2 if rc == as_u8[j - 1] else MM
+            m0 = M[i - 1, j - 1]
+            i0 = I[i - 1, j - 1]
+            d0 = D[i - 1, j - 1]
+            if m0 >= i0 and m0 >= d0:
+                M[i, j] = m0 + sc
+                tbM[i, j] = 0
+            elif i0 >= d0:
+                M[i, j] = i0 + sc
+                tbM[i, j] = 1
+            else:
+                M[i, j] = d0 + sc
+                tbM[i, j] = 2
+
+            im = M[i, j - 1] + GO
+            ii = I[i, j - 1] + GE
+            if ii >= im:
+                I[i, j] = ii
+                tbI[i, j] = 1
+            else:
+                I[i, j] = im
+                tbI[i, j] = 0
+
+            dm = M[i - 1, j] + GO
+            dd = D[i - 1, j] + GE
+            if dd >= dm:
+                D[i, j] = dd
+                tbD[i, j] = 2
+            else:
+                D[i, j] = dm
+                tbD[i, j] = 0
+
+    buf = np.empty((lr + la + 1, 3), dtype=np.int32)
+    n_ops = 0
+    i = lr
+    j = la
+    mv = M[i, j]
+    iv = I[i, j]
+    dv = D[i, j]
+    if mv >= iv and mv >= dv:
+        st = 0
+    elif iv >= dv:
+        st = 1
+    else:
+        st = 2
+
+    while i > 0 or j > 0:
+        if st == 0:
+            prv = int(tbM[i, j])
+            buf[n_ops, 0] = 0 if rs_u8[i - 1] == as_u8[j - 1] else 1
+            buf[n_ops, 1] = i - 1
+            buf[n_ops, 2] = j - 1
+            n_ops += 1
+            i -= 1
+            j -= 1
+            st = prv
+        elif st == 1:
+            prv = int(tbI[i, j])
+            buf[n_ops, 0] = 2
+            buf[n_ops, 1] = i
+            buf[n_ops, 2] = j - 1
+            n_ops += 1
+            j -= 1
+            st = prv
+        else:
+            prv = int(tbD[i, j])
+            buf[n_ops, 0] = 3
+            buf[n_ops, 1] = i - 1
+            buf[n_ops, 2] = j
+            n_ops += 1
+            i -= 1
+            st = prv
+
+    out = np.empty((n_ops, 3), dtype=np.int32)
+    for k in range(n_ops):
+        out[k, 0] = buf[n_ops - 1 - k, 0]
+        out[k, 1] = buf[n_ops - 1 - k, 1]
+        out[k, 2] = buf[n_ops - 1 - k, 2]
+    return out
+
+
+def decompose_haplotype_diffs(ref_seq: str, alt_seq: str, ref_start0: int, ctg_ref_seq_u8: np.ndarray | None = None) -> list[tuple[int, str, str]]:
+    """Decompose `alt_seq` vs `ref_seq` into minimal left-aligned VCF alleles `(pos0, REF, ALT)`."""
+    if ref_seq == alt_seq:
+        return []
+
+    n_r, n_a = len(ref_seq), len(alt_seq)
+    p = 0
+    while p < n_r and p < n_a and ref_seq[p] == alt_seq[p]:
+        p += 1
+    s = 0
+    while s < (n_r - p) and s < (n_a - p) and ref_seq[n_r - 1 - s] == alt_seq[n_a - 1 - s]:
+        s += 1
+
+    r_core = ref_seq[p:n_r - s]
+    a_core = alt_seq[p:n_a - s]
+    if len(r_core) == 1 and len(a_core) == 1:
+        return [(ref_start0 + p, r_core, a_core)]
+
+    if len(r_core) == 0 or len(a_core) == 0:
+        return [_left_normalize_vcf_allele(ref_seq, p, r_core, a_core, ref_start0, ctg_ref_seq_u8)]
+
+    pad_l = min(p, 6)
+    pad_r = min(s, 6)
+    rs = ref_seq[p - pad_l: n_r - s + pad_r]
+    as_ = alt_seq[p - pad_l: n_a - s + pad_r]
+    base0 = p - pad_l
+
+    lr, la = len(rs), len(as_)
+    if lr * la > 90_000:
+        return [_left_normalize_vcf_allele(ref_seq, p, r_core, a_core, ref_start0, ctg_ref_seq_u8)]
+
+    rs_u8 = np.frombuffer(rs.encode("ascii"), dtype=np.uint8)
+    as_u8 = np.frombuffer(as_.encode("ascii"), dtype=np.uint8)
+    ops_arr = _nw_align_ops_jit(rs_u8, as_u8)
+    _op_ch = ("=", "X", "I", "D")
+    ops = [(_op_ch[int(ops_arr[t, 0])], int(ops_arr[t, 1]), int(ops_arr[t, 2])) for t in range(len(ops_arr))]
+
+    diffs = []
+    k = 0
+    while k < len(ops):
+        if ops[k][0] == "=":
+            k += 1
+            continue
+        g_start = k
+        g_end = k + 1
+        while g_end < len(ops):
+            eq = 0
+            while g_end + eq < len(ops) and ops[g_end + eq][0] == "=":
+                eq += 1
+            if g_end + eq < len(ops) and eq < 3:
+                g_end = g_end + eq + 1
+            else:
+                break
+        r_indices = [op[1] for op in ops[g_start:g_end] if op[0] in ("=", "X", "D")]
+        a_indices = [op[2] for op in ops[g_start:g_end] if op[0] in ("=", "X", "I")]
+        r0 = r_indices[0] if r_indices else ops[g_start][1]
+        r1 = (r_indices[-1] + 1) if r_indices else ops[g_start][1]
+        a0 = a_indices[0] if a_indices else ops[g_start][2]
+        a1 = (a_indices[-1] + 1) if a_indices else ops[g_start][2]
+        sub_r = rs[r0:r1]
+        sub_a = as_[a0:a1]
+        diffs.append(_left_normalize_vcf_allele(ref_seq, base0 + r0, sub_r, sub_a, ref_start0, ctg_ref_seq_u8))
+        k = g_end
+
+    merged: list[tuple[int, str, str]] = []
+    for pos0_v, rv, av in sorted(diffs, key=lambda x: x[0]):
+        if merged and pos0_v < merged[-1][0] + len(merged[-1][1]):
+            return [_left_normalize_vcf_allele(ref_seq, p, r_core, a_core, ref_start0, ctg_ref_seq_u8)]
+        merged.append((pos0_v, rv, av))
+    return merged
+
+
+def _left_normalize_vcf_allele(
+    ref_window: str,
+    win_off: int,
+    r_sub: str,
+    a_sub: str,
+    ref_start0: int,
+    ctg_ref_seq_u8: np.ndarray | None = None,
+) -> tuple[int, str, str]:
+    """Trim outer matches and left-align indels to parsimonious 1-bp-anchored VCF representation."""
+    while len(r_sub) > 0 and len(a_sub) > 0 and r_sub[-1] == a_sub[-1]:
+        r_sub = r_sub[:-1]
+        a_sub = a_sub[:-1]
+    while len(r_sub) > 0 and len(a_sub) > 0 and r_sub[0] == a_sub[0]:
+        r_sub = r_sub[1:]
+        a_sub = a_sub[1:]
+        win_off += 1
+
+    pos0 = ref_start0 + win_off
+    if len(r_sub) == 1 and len(a_sub) == 1:
+        return (pos0, r_sub, a_sub)
+
+    def _ref_char(p0: int) -> str:
+        w_idx = p0 - ref_start0
+        if 0 <= w_idx < len(ref_window):
+            return ref_window[w_idx]
+        if ctg_ref_seq_u8 is not None and 0 <= p0 < len(ctg_ref_seq_u8):
+            return "ACGTN"[int(ctg_ref_seq_u8[p0])]
+        return "N"
+
+    if len(a_sub) == 0 and len(r_sub) > 0:
+        while pos0 > 1:
+            prev_base = _ref_char(pos0 - 1)
+            if prev_base != "N" and prev_base == r_sub[-1]:
+                r_sub = prev_base + r_sub[:-1]
+                pos0 -= 1
+            else:
+                break
+        anchor = _ref_char(pos0 - 1) if pos0 > 0 else "N"
+        if pos0 > 0 and anchor != "N":
+            return (pos0 - 1, anchor + r_sub, anchor)
+        nxt = _ref_char(pos0 + len(r_sub))
+        return (pos0, r_sub + nxt, nxt)
+
+    if len(r_sub) == 0 and len(a_sub) > 0:
+        while pos0 > 1:
+            prev_base = _ref_char(pos0 - 1)
+            if prev_base != "N" and prev_base == a_sub[-1]:
+                a_sub = prev_base + a_sub[:-1]
+                pos0 -= 1
+            else:
+                break
+        anchor = _ref_char(pos0 - 1) if pos0 > 0 else "N"
+        if pos0 > 0 and anchor != "N":
+            return (pos0 - 1, anchor, anchor + a_sub)
+        nxt = _ref_char(pos0)
+        return (pos0, nxt, a_sub + nxt)
+
+    return (pos0, r_sub, a_sub)

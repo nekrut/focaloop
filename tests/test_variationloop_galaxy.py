@@ -1,0 +1,333 @@
+"""Tests for VariationLoop (MalariaVar + Diploid Human VarLoop), C core, Galaxy XML, and runner."""
+
+from __future__ import annotations
+
+import gzip
+import os
+from pathlib import Path
+import re
+import xml.etree.ElementTree as ET
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from focaloop.archive import is_state_archive, unpack_state
+from focaloop.malariavar import caller as C
+from focaloop.malariavar import engine as E
+from focaloop.malariavar import genome as G
+from focaloop.malariavar import omnitig_zoom as OZ
+from focaloop.malariavar import varloop_giab as VG
+from focaloop.malariavar.native._loader import ensure_shared_lib
+from focaloop.runners_variation import run_variationloop_galaxy
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOL_XML = ROOT / "tools" / "focaloop" / "variationloop.xml"
+TEST_DATA_DIR = ROOT / "tools" / "focaloop" / "test-data" / "variationloop"
+
+
+def _sam_rec(
+    qname: str | int,
+    flag: int,
+    rname: str,
+    pos1: int,
+    mapq: int,
+    cigar: str,
+    seq: str,
+    qual: str | None = None,
+    nm: int = 0,
+    pnext: int | None = None,
+    tlen: int = 0,
+) -> str:
+    qual = qual or ("F" * len(seq))
+    pnext = pos1 if pnext is None else pnext
+    return f"{qname}\t{flag}\t{rname}\t{pos1}\t{mapq}\t{cigar}\t=\t{pnext}\t{tlen}\t{seq}\t{qual}\tNM:i:{nm}\n"
+
+
+def _make_synth_genome(tmp_path: Path, n_contigs: int = 40, ctg0_len: int = 21_000_000, other_len: int = 3000) -> tuple[G.Genome, Path]:
+    rng = np.random.default_rng(42)
+    bases = np.frombuffer(b"ACGT", dtype=np.uint8)
+    fa = tmp_path / "synth.fa"
+    with open(fa, "w", encoding="utf-8") as fh:
+        for c in range(n_contigs):
+            ln = ctg0_len if c == 0 else other_len
+            seq = bases[rng.integers(0, 4, size=ln)].tobytes().decode("ascii")
+            fh.write(f">chr_s{c}\n{seq}\n")
+    return G.from_fasta(fa), fa
+
+
+def test_varloop_core_portable_isa_compile_and_load(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("FOCALOOP_PORTABLE_ISA", "1")
+    monkeypatch.setenv("FOCALOOP_BUILD_NATIVE_DIR", str(tmp_path / "native"))
+    monkeypatch.delenv("FOCALOOP_NATIVE_CACHE", raising=False)
+    lib_path = ensure_shared_lib("varloop_core", ["varloop_core.c"], use_openmp=False)
+    assert lib_path.is_file()
+    lib = VG._lib()
+    for sym in ("vl_kset_build", "vl_fastq_sieve_paired", "vl_acc_create", "vl_score_reads_haplotypes"):
+        assert hasattr(lib, sym)
+
+
+def test_62bit_dedup_no_wrap_and_order_mode(tmp_path: Path) -> None:
+    g, _ = _make_synth_genome(tmp_path, n_contigs=40, ctg0_len=21_000_000, other_len=3000)
+    pos_low = 2_000_001
+    pos_high = pos_low + (1 << 24)
+    s_low = g.bases(g.goff("chr_s0", pos_low), g.goff("chr_s0", pos_low) + 120)
+    s_high = g.bases(g.goff("chr_s0", pos_high), g.goff("chr_s0", pos_high) + 120)
+    s_c5 = g.bases(g.goff("chr_s5", 501), g.goff("chr_s5", 501) + 120)
+    s_c37 = g.bases(g.goff("chr_s37", 501), g.goff("chr_s37", 501) + 120)
+
+    sam_lines = "".join(
+        [
+            _sam_rec(101, 99, "chr_s0", pos_low, 60, "120M", s_low, pnext=pos_low + 230, tlen=350),
+            _sam_rec(102, 99, "chr_s0", pos_high, 60, "120M", s_high, pnext=pos_high + 230, tlen=350),
+            _sam_rec(103, 99, "chr_s0", pos_high, 60, "120M", s_high, pnext=pos_high + 230, tlen=350),
+            _sam_rec(201, 99, "chr_s5", 501, 60, "120M", s_c5, pnext=701, tlen=320),
+            _sam_rec(202, 99, "chr_s37", 501, 60, "120M", s_c37, pnext=701, tlen=320),
+        ]
+    ).encode("ascii")
+
+    with VG.PagedContigAccumulator(g, VG.DiploidParams(mask_end_trim=0, mask_clip_flank=0)) as pacc:
+        pacc.feed_bytes(sam_lines)
+        summ = pacc.summary()
+        assert int(summ["stats"][10]) == 1
+        dp_0, _, _ = pacc.query_positions(0, np.array([pos_low + 50, pos_high + 50], dtype=np.int32))
+        dp_5, _, _ = pacc.query_positions(5, np.array([550], dtype=np.int32))
+        dp_37, _, _ = pacc.query_positions(37, np.array([550], dtype=np.int32))
+        assert list(dp_0) == [1, 1]
+        assert int(dp_5[0]) == 1 and int(dp_37[0]) == 1
+
+    acc_py = C.Accumulator(g, C.CallParams(mask_end_trim=0, mask_clip_flank=0, dedup=True), ev_cap=1000)
+    acc_py.feed(np.frombuffer(sam_lines, dtype=np.uint8), len(sam_lines))
+    assert int(acc_py.stats[10]) == 1
+
+    lens = np.array([248_956_422] * 24 + [20_000] * 171, dtype=np.int64)
+    cc_chr20 = np.zeros(195, dtype=np.int64)
+    cc_chr20[19] = 250_000
+    assert E.detect_order_mode(cc_chr20, lens) == "sorted"
+
+
+def test_diploid_snv_multiallelic_and_omnitig_softclip_rescue(tmp_path: Path) -> None:
+    rng = np.random.default_rng(123)
+    bases = np.frombuffer(b"ACGT", dtype=np.uint8)
+    left = bases[rng.integers(0, 4, size=3000)].tobytes().decode("ascii")
+    mid = bases[rng.integers(0, 4, size=3000)].tobytes().decode("ascii")
+    unit19 = "ACGTACGTACGTACGTTGA"
+    ctg_seq = left + (unit19 * 2) + mid
+    fa = tmp_path / "omni.fa"
+    fa.write_text(f">chr_test\n{ctg_seq}\n", encoding="utf-8")
+    g = G.from_fasta(fa)
+
+    # SNV genotyper checks (0/1, 1/1, 1/2, spanning del, paralog bleed)
+    pos0 = np.array([100, 200, 300, 400, 500, 600], dtype=np.int32)
+    ref = np.zeros(len(pos0), dtype=np.uint8)
+    counts = np.array(
+        [
+            [18, 17, 0, 0],
+            [0, 34, 0, 0],
+            [54, 6, 0, 0],
+            [0, 16, 18, 0],
+            [0, 17, 0, 0],
+            [0, 3, 0, 0],
+        ],
+        dtype=np.uint16,
+    )
+    delc = np.array([0, 0, 0, 0, 18, 32], dtype=np.uint16)
+    cand = dict(pos0=pos0, counts=counts, delc=delc, clipc=np.zeros_like(delc), uncap=np.zeros_like(delc), ref=ref)
+    by_pos = {c["pos0"]: c for c in VG.call_diploid_snvs_contig(g, 0, cand, VG.DiploidParams())}
+    assert by_pos[100]["gt"] == "0/1"
+    assert by_pos[200]["gt"] == "1/1"
+    assert 300 not in by_pos
+    assert by_pos[400]["gt"] == "1/2"
+    assert by_pos[500]["gt"] == "0/1"
+    assert 600 not in by_pos
+
+    # Multi-k (k=31, k=55) repeat bridging + soft-clip 24 bp insertion rescue
+    ins_pos0 = 1500
+    ins24 = "TGCATGCATGCAGTACTGCATGCA"
+    alt_chrom = ctg_seq[:ins_pos0] + ins24 + ctg_seq[ins_pos0:]
+    sam_lines = []
+    for k in range(22):
+        st0 = ins_pos0 - 110 + (k * 3)
+        sam_lines.append(_sam_rec(500 + k, 99, "chr_test", st0 + 1, 60, "150M", ctg_seq[st0:st0 + 150], pnext=st0 + 301, tlen=450 + k))
+    for k in range(8):
+        st0 = ins_pos0 - (95 + k * 3)
+        m_len = ins_pos0 - st0
+        s_len = 150 - m_len
+        sam_lines.append(_sam_rec(700 + k, 99, "chr_test", st0 + 1, 60, f"{m_len}M{s_len}S", alt_chrom[st0:st0 + 150], pnext=st0 + 301, tlen=480 + k))
+    for k in range(7):
+        lead_s = 32 + k * 3
+        alt_st = (ins_pos0 + len(ins24)) - lead_s
+        m_len = 150 - lead_s
+        sam_lines.append(_sam_rec(800 + k, 99, "chr_test", ins_pos0 + 1, 60, f"{lead_s}S{m_len}M", alt_chrom[alt_st:alt_st + 150], pnext=ins_pos0 + 301, tlen=510 + k))
+
+    with VG.PagedContigAccumulator(g, VG.DiploidParams(enable_reassembly=True)) as acc:
+        acc.feed_bytes("".join(sam_lines).encode("ascii"))
+        calls = VG.call_contig_diploid(g, acc, 0, VG.DiploidParams(enable_reassembly=True))
+    assert len(calls) == 1
+    assert calls[0]["source"] == "omnitig_asm"
+    assert calls[0]["gt"] == "0/1"
+    assert len(calls[0]["alt"]) - len(calls[0]["ref"]) == 24
+
+    # Also verify MalariaVar WSAF Omnitig assembler remains intact in omnitig_zoom.py
+    assert callable(OZ.assemble_omnitig_wsaf)
+    assert callable(OZ.assemble)
+
+
+def test_c_target_depletion_filter_lockstep(tmp_path: Path) -> None:
+    g, _ = _make_synth_genome(tmp_path, n_contigs=2, ctg0_len=20_000, other_len=20_000)
+    tab, meta = VG.build_target_kset(g, [("chr_s0", 0, 20_000)], bits=16)
+    assert meta["inserted_kmers"] > 15_000
+
+    r1_in = tmp_path / "in_R1.fq.gz"
+    r2_in = tmp_path / "in_R2.fq.gz"
+    s0_a, s0_b = g.bases(1000, 1150), g.bases(1300, 1450)
+    s1_a, s1_b = g.bases(25_000, 25_150), g.bases(25_300, 25_450)
+    r1_in.write_bytes(gzip.compress(f"@READ_A 1\n{s0_a}\n+\n{'F'*150}\n@READ_B 1\n{s1_a}\n+\n{'F'*150}\n".encode()))
+    r2_in.write_bytes(gzip.compress(f"@READ_A 2\n{s0_b}\n+\n{'F'*150}\n@READ_B 2\n{s1_b}\n+\n{'F'*150}\n".encode()))
+
+    out1, out2 = tmp_path / "out_R1.fq.gz", tmp_path / "out_R2.fq.gz"
+    res = VG.extract_sieved_fastq_pair(r1_in, r2_in, out1, out2, kset_tab=tab, stride=5, need=1, decomp_threads=1, comp_threads=1)
+    assert res["spots_seen"] == 2 and res["spots_emitted"] == 1
+    out_txt = gzip.decompress(out1.read_bytes()).decode()
+    assert s0_a in out_txt and s1_a not in out_txt
+
+
+def test_runner_all_three_modes_e2e(tmp_path: Path) -> None:
+    # 1. Mode C: diploid_wgs (paired FASTQ + BED + subsampling)
+    out_vcf_c = tmp_path / "c.vcf"
+    out_var_c = tmp_path / "c.tsv"
+    out_rep_c = tmp_path / "c.html"
+    out_arc_c = tmp_path / "c.tar.zst"
+    meta_c = run_variationloop_galaxy(
+        analysis_mode="diploid_wgs",
+        reads_r1=TEST_DATA_DIR / "sample_R1.fastq.gz",
+        reads_r2=TEST_DATA_DIR / "sample_R2.fastq.gz",
+        sample_name="HG_MINI",
+        ref_fasta=TEST_DATA_DIR / "ref_chr20_mini.fa",
+        targets_bed=TEST_DATA_DIR / "targets.bed",
+        subsample_fraction=0.95,
+        threads=2,
+        state_dir=tmp_path / "state_c",
+        state_archive=out_arc_c,
+        out_variants=out_var_c,
+        out_vcf=out_vcf_c,
+        out_report=out_rep_c,
+    )
+    assert meta_c["summary"]["n_variants"] == 2
+    df_c = pd.read_csv(out_var_c, sep="\t")
+    assert set(df_c["kind"]) == {"SNV", "INDEL"}
+    assert set(df_c["gt"]) == {"0/1", "1/1"}
+    vcf_txt = out_vcf_c.read_text(encoding="utf-8")
+    assert "#CHROM\tPOS\tID" in vcf_txt and "HG_MINI" in vcf_txt
+    rep_c_txt = out_rep_c.read_text(encoding="utf-8")
+    assert "Focaloop VariationLoop" in rep_c_txt
+    assert "sieve" not in rep_c_txt.lower()
+    assert is_state_archive(out_arc_c)
+    un_c = unpack_state(out_arc_c, tmp_path / "un_c")
+    assert (un_c / "focaloop_state.json").is_file()
+
+    # 2. Mode A: focused_cram (History CRAM + CRAI + BED)
+    out_vcf_a = tmp_path / "a.vcf"
+    out_var_a = tmp_path / "a.tsv"
+    out_rep_a = tmp_path / "a.html"
+    meta_a = run_variationloop_galaxy(
+        analysis_mode="focused_cram",
+        bam_path=TEST_DATA_DIR / "sample.cram",
+        crai_path=TEST_DATA_DIR / "sample.cram.crai",
+        sample_name="HG_CRAM",
+        ref_fasta=TEST_DATA_DIR / "ref_chr20_mini.fa",
+        targets_bed=TEST_DATA_DIR / "targets.bed",
+        cram_pad_bp=500,
+        threads=2,
+        state_dir=tmp_path / "state_a",
+        state_archive=tmp_path / "a.tar.zst",
+        out_variants=out_var_a,
+        out_vcf=out_vcf_a,
+        out_report=out_rep_a,
+    )
+    assert meta_a["summary"]["n_variants"] == 2
+    assert "sieve" not in out_rep_a.read_text(encoding="utf-8").lower()
+
+    # 3. Mode B: wgs_stream (manifest + --reads + C 31-mer depletion filter)
+    out_vcf_b = tmp_path / "b.vcf"
+    out_var_b = tmp_path / "b.tsv"
+    out_drm_b = tmp_path / "b_drm.tsv"
+    out_rep_b = tmp_path / "b.html"
+    meta_b = run_variationloop_galaxy(
+        analysis_mode="wgs_stream",
+        manifest_path=TEST_DATA_DIR / "manifest_wgs.tsv",
+        reads=[str(TEST_DATA_DIR / "sample_R1.fastq.gz"), str(TEST_DATA_DIR / "sample_R2.fastq.gz")],
+        read_ids=["sample_R1.fastq.gz", "sample_R2.fastq.gz"],
+        ref_fasta=TEST_DATA_DIR / "ref_chr20_mini.fa",
+        targets_bed=TEST_DATA_DIR / "targets.bed",
+        use_host_depletion=True,
+        threads=2,
+        state_dir=tmp_path / "state_b",
+        state_archive=tmp_path / "b.tar.zst",
+        out_variants=out_var_b,
+        out_vcf=out_vcf_b,
+        out_drm=out_drm_b,
+        out_report=out_rep_b,
+    )
+    assert meta_b["summary"]["n_variants"] == 2
+    assert out_drm_b.is_file()
+    assert "sieve" not in out_rep_b.read_text(encoding="utf-8").lower()
+
+
+def test_variationloop_xml_iuc_standards_and_no_sieve() -> None:
+    xml_text = TOOL_XML.read_text(encoding="utf-8")
+    assert "sieve" not in xml_text.lower()
+
+    for rel_path in (
+        ROOT / "blueprints" / "malariavar" / "galaxy_tool.xml",
+        ROOT / "blueprints" / "malariavar" / "galaxy_udt.yml",
+    ):
+        assert "sieve" not in rel_path.read_text(encoding="utf-8").lower()
+
+    root = ET.parse(TOOL_XML).getroot()
+    assert root.attrib["id"] == "focaloop_variationloop"
+    assert root.attrib["profile"] == "@PROFILE@"
+    assert root.find("command").attrib["detect_errors"] == "aggressive"
+
+    # Element ordering per tools-iuc schema
+    order = [el.tag for el in root]
+    expected_prefix = ["description", "macros", "edam_operations", "version_command", "command", "inputs", "outputs", "tests", "help"]
+    positions = [order.index(t) for t in expected_prefix]
+    assert positions == sorted(positions), f"Out-of-order XML tags: {order}"
+
+    cmd_text = root.find("command").text or ""
+    assert "@THREADS@" in cmd_text
+
+    # Parameter parity: every param in <inputs> appears in <command>
+    for p in root.findall(".//inputs//param"):
+        pname = p.attrib.get("name")
+        if not pname and "argument" in p.attrib:
+            pname = p.attrib["argument"].lstrip("-").replace("-", "_")
+        assert pname, f"Param missing name/argument: {ET.tostring(p)}"
+        assert pname in cmd_text, f"Orphaned param {pname!r} not referenced in <command>"
+
+    # Test-data files exist and < 1 MB; every <test> has expect_num_outputs and no pipe syntax
+    tests_el = root.find("tests")
+    test_els = tests_el.findall("test")
+    assert len(test_els) == 3
+    total_td_bytes = 0
+    for t in test_els:
+        assert "expect_num_outputs" in t.attrib
+        for p in t.findall(".//param"):
+            assert "|" not in p.attrib["name"], f"Pipe syntax in test param: {p.attrib['name']}"
+            val = p.attrib.get("value", "")
+            if val.startswith("variationloop/"):
+                for item in val.split(","):
+                    f = ROOT / "tools" / "focaloop" / "test-data" / item.strip()
+                    assert f.is_file(), f"Missing test-data file: {f}"
+                    assert f.stat().st_size < 1_000_000
+                    total_td_bytes += f.stat().st_size
+    assert total_td_bytes < 1_000_000
+
+    # Help markdown sections present
+    help_el = root.find("help")
+    assert help_el.attrib.get("format") == "markdown"
+    help_txt = help_el.text or ""
+    for heading in ("**What It Does**", "**Mode Selection Guide**", "**Manifest & Input Requirements**", "**Parameter Guide**", "**Outputs**", "**Citations**"):
+        assert heading in help_txt, f"Missing help section {heading}"
+    assert re.search(r"-----\n", help_txt)

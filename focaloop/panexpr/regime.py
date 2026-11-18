@@ -56,6 +56,9 @@ STRICT_TIE_TX_PER_GENE = 1.05
 STRICT_TIE_DUP_KMER_FRAC = 0.01
 ADAPTER_RATE_MAX = 0.02
 LONG_READ_MEDIAN = 400
+EXTREME_GC_LOW = 0.28
+EXTREME_GC_HIGH = 0.72
+EXTREME_HOMOPOLYMER_FRAC = 0.04
 RAM_SAFETY = 0.85                    # use at most this share of the budget for one index build
 ANNOT_EXACT_MAX_BYTES = 24 << 20     # parse the whole annotation below this size
 ANNOT_SAMPLE_CHUNKS = 48
@@ -111,7 +114,7 @@ KERNEL_TRAITS: dict[str, KernelTraits] = {
     "star": KernelTraits("spliced", spliced=True, needs_genome=True, end_to_end=True, ram_b_per_bp=13.0, ram_base_mb=400),
     "hisat2_genome_k16": KernelTraits("spliced", spliced=True, needs_genome=True, end_to_end=True, ram_b_per_bp=2.1, ram_base_mb=250),
     "star_genome_m16": KernelTraits("spliced", spliced=True, needs_genome=True, end_to_end=True, ram_b_per_bp=13.0, ram_base_mb=400),
-    "salmon": KernelTraits("kmer_ec", end_to_end=True, ram_b_per_bp=4.6, ram_base_mb=900),
+    "salmon": KernelTraits("kmer_ec", end_to_end=False, ram_b_per_bp=4.6, ram_base_mb=900),
     "kallisto": KernelTraits("kmer_ec", ram_b_per_bp=24.5, ram_base_mb=100),
     "piscem": KernelTraits("kmer_ec", ram_b_per_bp=4.6, ram_base_mb=900),
     "themisto": KernelTraits("kmer_ec", ram_b_per_bp=6.0, ram_base_mb=1000),
@@ -173,6 +176,8 @@ class RedundancyFeatures:
     sampled_bp: int
     dup_kmer_frac_primary: float
     cross_assembly_shared_frac: dict[str, float]
+    gc_fraction: float = 0.5
+    homopolymer_frac: float = 0.0
 
 
 @dataclass
@@ -443,12 +448,32 @@ def _anchor_kmers(seq: bytes, k: int = KMER) -> list[bytes]:
     return out
 
 
+_HP8 = re.compile(rb"(A{8,}|T{8,}|C{8,}|G{8,})")
+
+
+def _composition_stats(seq: bytes) -> tuple[float, float]:
+    """Return (gc_fraction, homopolymer_frac) on upper-case sequence bytes."""
+    n_a = seq.count(b"A")
+    n_c = seq.count(b"C")
+    n_g = seq.count(b"G")
+    n_t = seq.count(b"T")
+    valid = n_a + n_c + n_g + n_t
+    if valid <= 0:
+        return 0.5, 0.0
+    gc = (n_c + n_g) / valid
+    hp_bp = sum(len(m.group(0)) for m in _HP8.finditer(seq))
+    return round(gc, 5), round(hp_bp / valid, 5)
+
+
 def redundancy_features(genomes: Sequence[str | Path], genome_bp: Sequence[int]) -> RedundancyFeatures:
     full = sum(genome_bp) <= GENOME_FULL_SCAN_MAX_BP
     sketches = []
     sampled_bp = 0
-    for g in genomes:
+    gc0, hp0 = 0.5, 0.0
+    for idx_g, g in enumerate(genomes):
         seq = _read_sequence_sample(Path(g), full or str(g).endswith(".gz"))
+        if idx_g == 0:
+            gc0, hp0 = _composition_stats(seq)
         sampled_bp += len(seq)
         sketches.append(_anchor_kmers(seq))
     counts: dict[bytes, int] = {}
@@ -460,7 +485,10 @@ def redundancy_features(genomes: Sequence[str | Path], genome_bp: Sequence[int])
     for g, sk in zip(genomes[1:], sketches[1:]):
         s = set(sk)
         cross[Path(g).name] = round(len(s & prim) / max(1, len(s)), 4) if full else float("nan")
-    return RedundancyFeatures(len(genomes), "full_scan" if full else "block_sample", sampled_bp, round(dup, 5), cross)
+    return RedundancyFeatures(
+        len(genomes), "full_scan" if full else "block_sample", sampled_bp, round(dup, 5), cross,
+        gc_fraction=gc0, homopolymer_frac=hp0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +906,20 @@ def classify(
             f"large high-isoform eukaryote (n_tx~{prim.n_transcripts}, genome_bp={genome_bp:,}) -> "
             f"pruned to fast cDBG equivalence-class pool {sorted(FAST_EUK_KERNELS)}"
         )
+    extreme_comp = (
+        not long_reads
+        and (
+            red.gc_fraction < EXTREME_GC_LOW
+            or red.gc_fraction > EXTREME_GC_HIGH
+            or red.homopolymer_frac > EXTREME_HOMOPOLYMER_FRAC
+        )
+        and any(traits_of(k).family != "seed_extend" for k in kernels)
+    )
+    if extreme_comp:
+        reasons.append(
+            f"extreme genome composition / homopolymers (gc={red.gc_fraction:.4f}, "
+            f"homopolymer_frac={red.homopolymer_frac:.4f}) -> unspliced seed-extend kernels excluded"
+        )
     pred: dict[str, int] = {}
     excluded: dict[str, str] = {}
     cands: list[str] = []
@@ -895,6 +937,11 @@ def classify(
             excluded[k] = f"spliced aligner, multi_exon_gene_frac={prim.multi_exon_gene_frac:.4f} < {SPLICED_MIN_MULTI_EXON_FRAC}"
         elif strict and tr.pair_collapse:
             excluded[k] = "paired mode collapses equal-score ties by construction; strict mate-tie gate is on"
+        elif extreme_comp and tr.family == "seed_extend":
+            excluded[k] = (
+                f"extreme genome composition / homopolymers (gc={red.gc_fraction:.4f}, "
+                f"homopolymer_frac={red.homopolymer_frac:.4f}) -> unspliced seed-extend excluded"
+            )
         elif reads.adapter_rate > ADAPTER_RATE_MAX and tr.end_to_end:
             excluded[k] = f"end-to-end aligner, adapter rate {reads.adapter_rate:.3f} > {ADAPTER_RATE_MAX}"
         elif long_reads and not tr.long_read_ok:

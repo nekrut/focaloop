@@ -1,0 +1,192 @@
+class: GalaxyUserTool
+id: focaloop-geneloop
+version: "0.3.0"
+name: Focaloop GeneLoop adaptive genome annotation
+description: 5-stage adaptive eukaryotic genome annotation combining miniprot/Tiberius seeding, syncmer depletion filtering, Good-Turing UCB RNA-seq streaming, and micro-exon/ncRNA synthesis
+container: ghcr.io/galaxyproject/focaloop:0.3.0
+shell_command: |
+  focaloop geneloop \
+  --genome '$(inputs.genome_fasta.path)' \
+  $(inputs.proteins_fasta ? "--proteins '" + inputs.proteins_fasta.path + "'" : '') \
+  --clade '$(inputs.clade)' \
+  --exclude-genus '$(inputs.exclude_genus)' \
+  --mode '$(inputs.mode)' \
+  $(inputs.tiberius_weights_dir ? "--tiberius-weights '" + inputs.tiberius_weights_dir + "'" : '') \
+  $(inputs.rna_manifest ? "--rna-manifest '" + inputs.rna_manifest.path + "'" : '') \
+  $(inputs.short_reads_1 ? "--short-reads-1 " + inputs.short_reads_1.map((d) => "'" + d.path + "'").join(' ') : '') \
+  $(inputs.short_reads_2 ? "--short-reads-2 " + inputs.short_reads_2.map((d) => "'" + d.path + "'").join(' ') : '') \
+  $(inputs.short_reads_1 ? "--short-read-ids " + inputs.short_reads_1.map((d) => "'" + (d.basename || d.nameroot || 'short') + "'").join(' ') : '') \
+  $(inputs.long_reads ? "--long-reads " + inputs.long_reads.map((d) => "'" + d.path + "'").join(' ') : '') \
+  $(inputs.long_reads ? "--long-read-ids " + inputs.long_reads.map((d) => "'" + (d.basename || d.nameroot || 'long') + "'").join(' ') : '') \
+  $(inputs.short_bams ? "--short-bams " + inputs.short_bams.map((d) => "'" + d.path + "'").join(' ') : '') \
+  $(inputs.long_bams ? "--long-bams " + inputs.long_bams.map((d) => "'" + d.path + "'").join(' ') : '') \
+  --logan-mode '$(inputs.logan_mode)' \
+  --max-frac-spots $(inputs.max_frac_spots) \
+  --p0-stop $(inputs.p0_stop) \
+  --wave-spots $(inputs.wave_spots) \
+  --structural-ncrna '$(inputs.structural_ncrna)' \
+  $(inputs.enable_zoom ? '' : '--no-zoom') \
+  --threads 8 \
+  --state-dir geneloop_state_dir \
+  --state-archive geneloop_state.focaloop.tar.zst \
+  --out-gff3 annotation.gff3 \
+  --out-proteins proteins.faa \
+  --out-gtf transcripts.gtf \
+  --out-summary locus_summary.tsv \
+  --out-report focaloop_report.html
+inputs:
+  - name: genome_fasta
+    type: data
+    format: [fasta, fasta.gz]
+    label: Target genome assembly (FASTA)
+    help: "Target genome assembly in FASTA format (unmasked or soft-masked; .fa or .fa.gz)."
+  - name: proteins_fasta
+    type: data
+    format: [fasta, fasta.gz]
+    optional: true
+    label: Homology protein sequences (RefSeq / clade protein FASTA, optional)
+    help: "Reference clade proteins (e.g. vertebrate or insect RefSeq/OrthoDB proteins) aligned with miniprot for Stage-1 locus seeding and splice verification."
+  - name: clade
+    type: select
+    label: Target taxonomic clade
+    options:
+      - { label: "Vertebrates (mammals, birds, reptiles, fishes)", value: vertebrates, selected: true }
+      - { label: "Insects / Arthropoda", value: insecta, selected: false }
+      - { label: "Angiosperms / Flowering plants", value: angiosperms, selected: false }
+      - { label: "Fungi / General Eukaryota", value: fungi, selected: false }
+  - name: exclude_genus
+    type: text
+    value: ""
+    optional: true
+    label: Exclude genus / species prefix from homology proteins (optional)
+  - name: mode
+    type: select
+    label: Execution and compute mode
+    options:
+      - { label: "Auto-detect (GPU Tiberius -> CPU Tiberius -> Fast Evidence+Miniprot)", value: auto, selected: true }
+      - { label: "Fast Evidence + Miniprot (no Tiberius, CPU-friendly)", value: fast_evidence, selected: false }
+      - { label: "CPU Tiberius + Evidence", value: cpu_tiberius, selected: false }
+      - { label: "GPU Tiberius + Evidence", value: gpu_tiberius, selected: false }
+  - name: tiberius_weights_dir
+    type: text
+    value: ""
+    optional: true
+    label: Custom Tiberius model weights path (optional)
+  - name: rna_manifest
+    type: data
+    format: tabular
+    optional: true
+    label: RNA-seq accession manifest (TSV, optional)
+  - name: short_reads_1
+    type: data
+    format: [fastqsanger, fastqsanger.gz]
+    multiple: true
+    optional: true
+    label: Short-read FASTQ forward mates (R1) or single-end reads (optional)
+  - name: short_reads_2
+    type: data
+    format: [fastqsanger, fastqsanger.gz]
+    multiple: true
+    optional: true
+    label: Short-read FASTQ reverse mates (R2, optional)
+  - name: long_reads
+    type: data
+    format: [fastqsanger, fastqsanger.gz, fasta, fasta.gz]
+    multiple: true
+    optional: true
+    label: Long-read RNA-seq FASTQ/FASTA (PacBio Iso-Seq / ONT cDNA, optional)
+  - name: short_bams
+    type: data
+    format: bam
+    multiple: true
+    optional: true
+    label: Pre-aligned short-read RNA-seq BAMs (optional)
+  - name: long_bams
+    type: data
+    format: bam
+    multiple: true
+    optional: true
+    label: Pre-aligned long-read RNA-seq BAMs (optional)
+  - name: logan_mode
+    type: select
+    label: Transcriptome contig assembly / long-read seeding
+    options:
+      - { label: "Auto (use bundled or RNA-derived contigs when beneficial)", value: auto, selected: true }
+      - { label: "Off", value: "off", selected: false }
+      - { label: "Force", value: force, selected: false }
+  - name: max_frac_spots
+    type: float
+    value: 0.35
+    min: 0.01
+    max: 1.0
+    label: Maximum fraction of spots streamed per RNA-seq run (0.35 = 35%)
+  - name: p0_stop
+    type: float
+    value: 0.005
+    min: 0.0001
+    max: 0.25
+    label: Good-Turing missing-intron probability stopping threshold (p0)
+  - name: wave_spots
+    type: integer
+    value: 1000000
+    min: 1000
+    max: 50000000
+    label: Spots processed per adaptive streaming wave
+  - name: structural_ncrna
+    type: select
+    label: Structural ncRNA detection (rRNA / tRNA / snRNA / snoRNA)
+    options:
+      - { label: "Auto (use installed tools + bundled eukaryotic rRNA panel)", value: auto, selected: true }
+      - { label: "Required (error if external structural ncRNA tools missing)", value: "on", selected: false }
+      - { label: "Off (skip external structural ncRNA tools)", value: "off", selected: false }
+  - name: enable_zoom
+    type: boolean
+    value: true
+    label: Enable Stage-4 targeted micro-exon, orphan ORF, and lncRNA locus zoom
+outputs:
+  - name: annotation_gff3
+    type: data
+    format: gff3
+    from_work_dir: annotation.gff3
+    label: "Focaloop GeneLoop: annotation.gff3"
+  - name: proteins_faa
+    type: data
+    format: fasta
+    from_work_dir: proteins.faa
+    label: "Focaloop GeneLoop: proteins.faa"
+  - name: transcripts_gtf
+    type: data
+    format: gtf
+    from_work_dir: transcripts.gtf
+    label: "Focaloop GeneLoop: transcripts.gtf"
+  - name: locus_summary
+    type: data
+    format: tabular
+    from_work_dir: locus_summary.tsv
+    label: "Focaloop GeneLoop: locus_summary.tsv"
+  - name: focaloop_report
+    type: data
+    format: html
+    from_work_dir: focaloop_report.html
+    label: "Focaloop GeneLoop: focaloop_report.html"
+  - name: geneloop_state
+    type: data
+    format: data
+    from_work_dir: geneloop_state.focaloop.tar.zst
+    label: "Focaloop GeneLoop: geneloop_state.focaloop.tar.zst"
+help:
+  format: markdown
+  content: |
+    Runs the 5-stage **Focaloop GeneLoop** adaptive eukaryotic genome annotation engine:
+
+    1. **Stage 1 — Homology & Ab Initio Seeding:** Aligns clade homology proteins with `miniprot` and optionally runs `Tiberius` (GPU or CPU) to establish candidate gene models and protect verified single-exon and multi-exon loci.
+    2. **Stage 2 — Open-Syncmer Depletion Filter:** Indexes already-saturated exon k-mers (`glcore`) so incoming RNA-seq reads matching saturated loci are bypassed before spliced alignment while preserving paralog and divergent exon discrimination.
+    3. **Stage 3 — Good-Turing UCB Adaptive RNA-seq Streaming:** Streams History FASTQs, pre-aligned BAMs, or INSDC SRA/ENA runs (`xsra` / HTTPS) in waves ranked by an Upper Confidence Bound over novel splice-junction discovery until Good-Turing missing-intron mass drops below `p0_stop`.
+    4. **Stage 4 — Locus Synthesis, Micro-Exon Zoom & Orphan ORF Rescue:** Combines all spliced, protein, and prediction evidence per locus with splice-site consensus scoring, junction-gap micro-exon recovery, and C-accelerated orphan ORF detection.
+    5. **Stage 5 — Structural ncRNA, lncRNA & Report Output:** Annotates rRNA/tRNA/snRNA/snoRNA, noncoding transcripts, and pseudogene flags, emitting `annotation.gff3`, `proteins.faa`, `transcripts.gtf`, `locus_summary.tsv`, an interactive HTML report, and a `.focaloop.tar.zst` state archive.
+citations:
+  - type: doi
+    content: 10.1093/bioinformatics/btae685
+  - type: doi
+    content: 10.1093/bioinformatics/btad014
+license: MIT

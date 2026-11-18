@@ -881,16 +881,19 @@ class SalmonKernel(Kernel):
     kind = "salmon"
     symmetric_by_construction = True
 
-    def __init__(self, threads: int = 4, extra_args: list[str] | None = None, tmp_dir: str | Path | None = None) -> None:
+    def __init__(self, threads: int = 4, extra_args: list[str] | None = None, tmp_dir: str | Path | None = None,
+                 clip_adapters: bool = True) -> None:
         super().__init__(threads)
         self.extra_args = extra_args if extra_args is not None else ["--validateMappings"]
         self.tmp_dir = Path(tmp_dir) if tmp_dir else None
+        self.clip_adapters = clip_adapters
 
     def available(self) -> bool:
         return tool_path("salmon") is not None
 
     def clone_with_threads(self, threads: int) -> "SalmonKernel":
-        c = SalmonKernel(threads=threads, extra_args=list(self.extra_args), tmp_dir=self.tmp_dir)
+        c = SalmonKernel(threads=threads, extra_args=list(self.extra_args), tmp_dir=self.tmp_dir,
+                         clip_adapters=self.clip_adapters)
         c.index_paths = dict(self.index_paths)
         return c
 
@@ -915,17 +918,22 @@ class SalmonKernel(Kernel):
         res = MapResult()
         if n == 0:
             return res
+        r1_in = r1[:n]
+        r2_in = r2[:n] if r2 is not None else None
+        if self.clip_adapters:
+            from ._fast_c import clip_adapters_batch
+            r1_in, r2_in, _ = clip_adapters_batch(r1_in, r2_in, min_len=31, threads=self.threads)
         with tempfile.TemporaryDirectory(dir=self.tmp_dir) as td:
             td = Path(td)
             f1 = td / "r1.fq"
-            write_fastq(f1, r1[:n], "/1" if r2 is not None else "")
+            write_fastq(f1, r1_in, "/1" if r2_in is not None else "")
             cmd = [tool_path("salmon"), "quant", "-i", str(self.index_paths["idx"]), "-l", "A", "-p", str(self.threads),
                    "-o", str(td / "q"), "--dumpEqWeights", "-q"] + self.extra_args
             if trace:
                 cmd += ["--writeMappings", str(td / "map.sam")]
-            if r2 is not None:
+            if r2_in is not None:
                 f2 = td / "r2.fq"
-                write_fastq(f2, r2[:n], "/2")
+                write_fastq(f2, r2_in, "/2")
                 cmd += ["-1", str(f1), "-2", str(f2)]
             else:
                 cmd += ["-r", str(f1)]
@@ -1882,10 +1890,12 @@ class PiscemKernel(Kernel):
     symmetric_by_construction = True
     trace_costs_extra_pass = True       # trace mode adds a single-thread sentinel pass; wall_seconds excludes it
 
-    def __init__(self, threads: int = 4, tmp_dir: str | Path | None = None, k: int = 31, m: int = 19) -> None:
+    def __init__(self, threads: int = 4, tmp_dir: str | Path | None = None, k: int = 31, m: int = 19,
+                 clip_adapters: bool = True) -> None:
         super().__init__(threads)
         self.tmp_dir = Path(tmp_dir) if tmp_dir else None
         self.k, self.m = k, m
+        self.clip_adapters = clip_adapters
         self._rad_meta: dict = {}
 
     def available(self) -> bool:
@@ -1895,7 +1905,8 @@ class PiscemKernel(Kernel):
         return tool_version("piscem")
 
     def clone_with_threads(self, threads: int) -> "PiscemKernel":
-        c = PiscemKernel(threads=threads, tmp_dir=self.tmp_dir, k=self.k, m=self.m)
+        c = PiscemKernel(threads=threads, tmp_dir=self.tmp_dir, k=self.k, m=self.m,
+                         clip_adapters=self.clip_adapters)
         c.index_paths = dict(self.index_paths)
         c._rad_meta = self._rad_meta
         return c
@@ -1938,15 +1949,21 @@ class PiscemKernel(Kernel):
 
     def map_batch(self, r1: list[Read], r2: list[Read] | None, calibrator: OnlineErrorCalibrator | None = None,
                   trace: bool = False) -> MapResult:
-        from ._fast_c import c_rad_aggregate
+        from ._fast_c import c_rad_aggregate, clip_adapters_batch
         n = len(r1) if r2 is None else min(len(r1), len(r2))
         res = MapResult()
         if n == 0:
             return res
+        r1_in = r1[:n]
+        r2_in = r2[:n] if r2 is not None else None
+        if self.tmp_dir is not None:
+            self.tmp_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=self.tmp_dir) as td:
             td = Path(td)
             t0 = time.time()
-            rad_path = self._run_cmd(td, r1[:n], r2[:n] if r2 is not None else None, self.threads, "main")
+            if self.clip_adapters:
+                r1_in, r2_in, _ = clip_adapters_batch(r1_in, r2_in, min_len=max(25, self.k), threads=self.threads)
+            rad_path = self._run_cmd(td, r1_in, r2_in, self.threads, "main")
             c_agg = c_rad_aggregate(rad_path, SENTINEL_ID, self._rad_meta)
             if c_agg is not None:
                 res.n_mapped, res.unique_counts, res.eq_classes = c_agg
@@ -1964,11 +1981,11 @@ class PiscemKernel(Kernel):
                 s = _sentinel_seq()
                 sr1 = (revcomp_str(s[400:400 + min(100, len(r1[0][0]))]), "I" * min(100, len(r1[0][0])))
                 sr2 = (s[100:100 + min(100, len(r1[0][0]))], "I" * min(100, len(r1[0][0])))
-                t1, t2 = [], ([] if r2 is not None else None)
+                t1, t2 = [], ([] if r2_in is not None else None)
                 for i in range(n):
-                    t1 += [r1[i], sr1]
+                    t1 += [r1_in[i], sr1]
                     if t2 is not None:
-                        t2 += [r2[i], sr2]
+                        t2 += [r2_in[i], sr2]
                 tnames, trecs = self._run(td, t1, t2, 1, "trace")
                 sid = tnames.index(SENTINEL_ID)
                 per: dict[int, tuple[tuple[str, ...], tuple[bool, ...]]] = {}

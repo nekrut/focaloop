@@ -1,4 +1,4 @@
-"""`focaloop` command-line entry point: validate | run | panexpr | malariavar | query | bait | steer."""
+"""`focaloop` command-line entry point: validate | run | expressionloop | variationloop | geneloop | panexpr | malariavar | query | bait | steer."""
 
 from __future__ import annotations
 
@@ -146,6 +146,152 @@ def cmd_malariavar(a: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_expressionloop(a: argparse.Namespace) -> int:
+    from .runners_expression import run_expressionloop_galaxy
+
+    try:
+        meta = run_expressionloop_galaxy(
+            manifest_path=a.manifest,
+            ref_fasta=a.ref_fasta,
+            ref_gtf=a.ref_gtf,
+            contrast=a.contrast,
+            out_de=a.out_de,
+            out_report=a.out_report,
+            state_dir=a.state_dir,
+            state_archive=a.state_archive,
+            out_transcripts=a.out_transcripts,
+            secondary_fasta=a.secondary_fasta,
+            secondary_gtf=a.secondary_gtf,
+            primary_label=a.primary_label,
+            secondary_label=a.secondary_label,
+            reads=a.reads,
+            reads_r1=a.reads_r1,
+            reads_r2=a.reads_r2,
+            read_ids=a.read_ids,
+            organism_mode=a.organism_mode,
+            source_mode=a.source_mode,
+            design=a.design,
+            followup_contrasts=a.followup_contrasts,
+            max_byte_fraction=a.max_byte_fraction,
+            v_tech_target=a.v_tech_target,
+            delta_lfc_stop=a.delta_lfc_stop,
+            min_mapped_per_sample=a.min_mapped_per_sample,
+            enable_zoom=not a.no_zoom,
+            enable_abundant_filter=not a.no_abundant_filter,
+            filter_mode=a.filter_mode,
+            threads=a.threads,
+            kernel_names=a.kernels,
+            n_tournament_reads=a.tournament_reads,
+        )
+    except Exception as exc:
+        _err(str(exc))
+        return EXIT_ERROR
+    ls = meta["loop_summary"]
+    print(
+        f"focaloop expressionloop: winner={ls['winner']} pct_streamed={ls['pct_archive_streamed']:.2f}% "
+        f"stop={ls['stop_reason']} wall={ls['wall_seconds']:.1f}s",
+        file=sys.stderr,
+    )
+    return EXIT_OK
+
+
+def cmd_variationloop(a: argparse.Namespace) -> int:
+    from .runners_variation import run_variationloop_galaxy
+
+    try:
+        meta = run_variationloop_galaxy(
+            analysis_mode=a.analysis_mode,
+            out_variants=a.out_variants,
+            out_report=a.out_report,
+            state_dir=a.state_dir,
+            state_archive=a.state_archive,
+            out_vcf=a.out_vcf,
+            out_drm=a.out_drm,
+            manifest_path=a.manifest,
+            ref_fasta=a.ref_fasta,
+            targets_bed=a.targets_bed,
+            cram_pad_bp=a.cram_pad_bp,
+            reads=a.reads,
+            read_ids=a.read_ids,
+            reads_r1=a.reads_r1,
+            reads_r2=a.reads_r2,
+            bam_path=a.bam,
+            crai_path=a.crai,
+            sample_name=a.sample_name,
+            target_depth=a.target_depth,
+            subsample_fraction=a.subsample_fraction,
+            mapper=a.mapper,
+            threads=a.threads,
+            streams=a.streams,
+            sample_timeout_s=a.sample_timeout,
+            use_host_depletion=not a.no_host_depletion,
+            enable_reassembly=not a.no_reassembly,
+            min_mapq=a.min_mapq,
+            min_bq=a.min_bq,
+            snv_min_qual=a.snv_min_qual,
+            indel_min_qual=a.indel_min_qual,
+            dedup_bits=a.dedup_bits,
+        )
+    except Exception as exc:
+        _err(str(exc))
+        return EXIT_ERROR
+    sm = meta["summary"]
+    n_cnt = sm.get("n_isolates", sm.get("n_samples", 0))
+    print(
+        f"focaloop variationloop: mode={sm['mode']} samples={n_cnt} wall={sm['wall_s']:.1f}s",
+        file=sys.stderr,
+    )
+    return EXIT_OK
+
+
+def cmd_geneloop(a: argparse.Namespace) -> int:
+    from .runners_geneloop import run_geneloop_galaxy
+
+    try:
+        meta = run_geneloop_galaxy(
+            genome_fasta=a.genome,
+            out_gff3=a.out_gff3,
+            out_proteins=a.out_proteins,
+            out_gtf=a.out_gtf,
+            out_summary=a.out_summary,
+            out_report=a.out_report,
+            state_dir=a.state_dir,
+            state_archive=a.state_archive,
+            proteins_fasta=a.proteins,
+            exclude_genus=a.exclude_genus,
+            clade=a.clade,
+            mode=a.mode,
+            tiberius_weights=a.tiberius_weights,
+            rna_manifest=a.rna_manifest,
+            short_reads_1=a.short_reads_1,
+            short_reads_2=a.short_reads_2,
+            short_read_ids=a.short_read_ids,
+            long_reads=a.long_reads,
+            long_read_ids=a.long_read_ids,
+            short_bams=a.short_bams,
+            long_bams=a.long_bams,
+            logan_mode=a.logan_mode,
+            max_frac_spots=a.max_frac_spots,
+            p0_stop=a.p0_stop,
+            wave_spots=a.wave_spots,
+            structural_ncrna=a.structural_ncrna,
+            rfam_dir=a.rfam_dir,
+            enable_zoom=a.enable_zoom,
+            threads=a.threads,
+        )
+    except Exception as exc:
+        _err(str(exc))
+        return EXIT_ERROR
+    bio = meta.get("biotypes") or {}
+    print(
+        f"focaloop geneloop: mode={meta.get('effective_mode')} clade={meta.get('clade')} "
+        f"coding={bio.get('n_coding_genes', 0)} proteins={meta.get('proteins_emitted', 0)} "
+        f"wall={meta.get('wall_seconds', 0.0):.1f}s",
+        file=sys.stderr,
+    )
+    return EXIT_OK
+
+
 def cmd_query(a: argparse.Namespace) -> int:
     import json
     from .ops import run_query
@@ -278,6 +424,107 @@ def build_parser() -> argparse.ArgumentParser:
     mv.add_argument("--out-variants", required=True, help="output variant calls TSV")
     mv.add_argument("--out-report", required=True, help="output self-contained HTML report")
     mv.set_defaults(func=cmd_malariavar)
+
+    el = sub.add_parser("expressionloop", help="PanExpr v2.4 adaptive RNA-seq differential expression loop")
+    el.add_argument("--manifest", required=True, help="TSV/CSV sample manifest")
+    el.add_argument("--ref-fasta", required=True, help="primary reference genome or transcriptome FASTA(.gz)")
+    el.add_argument("--ref-gtf", required=True, help="primary reference annotation GTF/GFF3(.gz)")
+    el.add_argument("--secondary-fasta", help="optional secondary strain/assembly/virus FASTA(.gz)")
+    el.add_argument("--secondary-gtf", help="optional secondary strain/assembly/virus GTF/GFF3(.gz)")
+    el.add_argument("--primary-label", default="primary")
+    el.add_argument("--secondary-label", default="secondary")
+    el.add_argument("--reads", nargs="+", help="optional single-end Galaxy History FASTQ(.gz) files")
+    el.add_argument("--reads-r1", nargs="+", help="optional paired R1 Galaxy History FASTQ(.gz) files")
+    el.add_argument("--reads-r2", nargs="+", help="optional paired R2 Galaxy History FASTQ(.gz) files")
+    el.add_argument("--read-ids", nargs="+", help="optional element identifiers matching --reads or --reads-r1/--reads-r2")
+    el.add_argument("--contrast", required=True, help="factor:treated:control or treated:control")
+    el.add_argument("--design", default="~condition", help="Wilkinson formula (default: ~condition)")
+    el.add_argument("--followup-contrasts", nargs="*", help="optional comma-separated or space-separated warm contrasts")
+    el.add_argument("--organism-mode", choices=("auto", "eukaryotic", "prokaryotic"), default="auto")
+    el.add_argument("--source-mode", choices=("auto", "http_range", "sra_odp", "local_bytes"), default="auto")
+    el.add_argument("--max-byte-fraction", type=float, default=0.12, help="max archive fraction (0.12 or 12.0)")
+    el.add_argument("--v-tech-target", type=float, default=0.25, help="median V_tech/(V_tech+V_bio) stop gate")
+    el.add_argument("--delta-lfc-stop", type=float, default=0.05)
+    el.add_argument("--min-mapped-per-sample", type=int, default=None)
+    el.add_argument("--no-zoom", action="store_true", help="disable Stage-5 31-mer borderline zoom")
+    el.add_argument("--no-abundant-filter", action="store_true", help="disable abundant-transcript depletion filter")
+    el.add_argument("--filter-mode", choices=("auto", "include", "deplete"), default="auto")
+    el.add_argument("--threads", type=int, default=_default_threads())
+    el.add_argument("--kernels", nargs="*", help="optional subset of mapping kernels")
+    el.add_argument("--tournament-reads", type=int, default=25_000)
+    el.add_argument("--state-dir", required=True)
+    el.add_argument("--state-archive", help="output .focaloop.tar.zst state bundle")
+    el.add_argument("--out-de", required=True, help="output differential expression TSV")
+    el.add_argument("--out-report", required=True, help="output self-contained HTML report")
+    el.add_argument("--out-transcripts", help="optional output transcript abundance TSV")
+    el.set_defaults(func=cmd_expressionloop)
+
+    vl = sub.add_parser("variationloop", help="pathogen surveillance and diploid human variant calling loop")
+    vl.add_argument("--analysis-mode", choices=("focused_cram", "wgs_stream", "diploid_wgs"), default="focused_cram")
+    vl.add_argument("--manifest", help="TSV/CSV isolate or cohort manifest")
+    vl.add_argument("--reads", nargs="+", help="optional History FASTQ(.gz) datasets for manifest matching")
+    vl.add_argument("--read-ids", nargs="+", help="element identifiers matching --reads")
+    vl.add_argument("--reads-r1", help="single-sample forward R1 FASTQ(.gz)")
+    vl.add_argument("--reads-r2", help="single-sample reverse R2 FASTQ(.gz)")
+    vl.add_argument("--bam", help="single-sample aligned BAM or CRAM")
+    vl.add_argument("--crai", help="optional CRAM/BAM index (.crai or .bai)")
+    vl.add_argument("--sample-name", default="SAMPLE")
+    vl.add_argument("--ref-fasta", help="reference genome FASTA(.gz)")
+    vl.add_argument("--targets-bed", help="optional target intervals BED")
+    vl.add_argument("--cram-pad-bp", type=int, default=1000)
+    vl.add_argument("--streams", type=int, default=24)
+    vl.add_argument("--target-depth", type=float, default=24.0, help="target median core depth for streaming stop gate")
+    vl.add_argument("--no-host-depletion", action="store_true", help="disable C host depletion filter")
+    vl.add_argument("--mapper", choices=("auto", "strobealign", "minimap2", "bwa-mem2", "bwa"), default="auto")
+    vl.add_argument("--subsample-fraction", type=float, default=1.0)
+    vl.add_argument("--no-reassembly", action="store_true", help="disable multi-k local active-region reassembly")
+    vl.add_argument("--min-mapq", type=int, default=20)
+    vl.add_argument("--min-bq", type=int, default=13)
+    vl.add_argument("--snv-min-qual", type=float, default=20.0)
+    vl.add_argument("--indel-min-qual", type=float, default=15.0)
+    vl.add_argument("--dedup-bits", type=int, default=20)
+    vl.add_argument("--sample-timeout", type=float, default=420.0)
+    vl.add_argument("--threads", type=int, default=_default_threads())
+    vl.add_argument("--state-dir", required=True)
+    vl.add_argument("--state-archive", help="output .focaloop.tar.zst state bundle")
+    vl.add_argument("--out-variants", required=True, help="output variant calls TSV")
+    vl.add_argument("--out-vcf", help="optional output VCF")
+    vl.add_argument("--out-drm", help="optional output WHO DRM/CNV/deletion/F_WS TSV")
+    vl.add_argument("--out-report", required=True, help="output self-contained HTML report")
+    vl.set_defaults(func=cmd_variationloop)
+
+    gl = sub.add_parser("geneloop", help="5-stage adaptive eukaryotic genome annotation loop")
+    gl.add_argument("--genome", required=True, help="target genome assembly FASTA(.gz)")
+    gl.add_argument("--clade", default="vertebrates", help="taxonomic clade preset")
+    gl.add_argument("--mode", choices=("auto", "fast_evidence", "cpu_tiberius", "gpu_tiberius"), default="auto")
+    gl.add_argument("--proteins", help="optional clade homology protein FASTA(.gz)")
+    gl.add_argument("--exclude-genus", default="", help="optional genus to strip from homology proteins")
+    gl.add_argument("--tiberius-weights", help="optional Tiberius weights directory or .tar.gz archive")
+    gl.add_argument("--rna-manifest", help="optional INSDC RNA-seq run manifest")
+    gl.add_argument("--short-reads-1", nargs="+", help="optional History short-read R1 or single-end FASTQs")
+    gl.add_argument("--short-reads-2", nargs="+", help="optional History short-read R2 FASTQs")
+    gl.add_argument("--short-read-ids", nargs="+", help="element identifiers matching short-read FASTQs")
+    gl.add_argument("--long-reads", nargs="+", help="optional History long-read FASTQs")
+    gl.add_argument("--long-read-ids", nargs="+", help="element identifiers matching long-read FASTQs")
+    gl.add_argument("--short-bams", nargs="+", help="optional pre-aligned short-read RNA-seq BAMs")
+    gl.add_argument("--long-bams", nargs="+", help="optional pre-aligned long-read RNA-seq BAMs")
+    gl.add_argument("--logan-mode", choices=("auto", "off", "force"), default="auto")
+    gl.add_argument("--max-frac-spots", type=float, default=0.35)
+    gl.add_argument("--p0-stop", type=float, default=0.005)
+    gl.add_argument("--wave-spots", type=int, default=1_000_000)
+    gl.add_argument("--structural-ncrna", choices=("auto", "on", "off"), default="auto")
+    gl.add_argument("--rfam-dir", help="optional Rfam CM directory")
+    gl.add_argument("--no-zoom", action="store_false", dest="enable_zoom", default=True,
+                    help="disable Stage-5 micro-exon rescue and retrocopy discriminator")
+    gl.add_argument("--threads", type=int, default=_default_threads())
+    gl.add_argument("--state-dir", required=True)
+    gl.add_argument("--state-archive", help="output .focaloop.tar.zst state bundle")
+    gl.add_argument("--out-gff3", required=True, help="output annotation GFF3")
+    gl.add_argument("--out-proteins", required=True, help="output predicted proteins FASTA")
+    gl.add_argument("--out-gtf", required=True, help="output transcripts GTF")
+    gl.add_argument("--out-summary", required=True, help="output summary metrics TSV")
+    gl.add_argument("--out-report", required=True, help="output self-contained HTML report")
+    gl.set_defaults(func=cmd_geneloop)
 
     q = sub.add_parser("query", help="zero-new-byte warm-state contrast / F_ST query")
     q.add_argument("--state-dir", required=True, help="state directory or .tar.zst archive")

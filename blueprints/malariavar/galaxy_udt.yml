@@ -2,7 +2,7 @@ class: GalaxyUserTool
 id: focaloop-malariavar
 version: "0.2.0"
 name: Focaloop MalariaVar Plasmodium variation and drug-resistance loop
-description: Focused .crai CRAM HTTP range surveillance or raw SRA host-sieved streaming for WHO drug resistance, hrp2/3 deletions, CNVs and F_WS
+description: Focused .crai CRAM HTTP range surveillance or raw SRA host-depleted streaming for WHO drug resistance, hrp2/3 deletions, CNVs and F_WS
 container: ghcr.io/galaxyproject/focaloop:0.2.0
 shell_command: |
   focaloop malariavar \
@@ -33,7 +33,7 @@ inputs:
     options:
       - { label: "Auto-detect per isolate (.cram -> focused_cram, ERR/SRR -> wgs_stream)", value: auto, selected: true }
       - { label: "Mode A: Focused .crai CRAM HTTP Range surveillance (55 curated windows, ~20 MB/isolate)", value: focused_cram, selected: false }
-      - { label: "Mode B: Raw SRA/FASTQ streaming + C 31-mer human host sieve + depth stop gate", value: wgs_stream, selected: false }
+      - { label: "Mode B: Raw SRA/FASTQ streaming + C 31-mer human host depletion filter + depth stop gate", value: wgs_stream, selected: false }
   - name: target_depth
     type: float
     value: 24.0
@@ -79,7 +79,7 @@ help:
       CNV tandem-duplication breakpoints (`mdr1`, `pm2_pm3`, `gch1`, `crt`), *hrp2/hrp3* diagnostic-escape loci, and
       high-MAF core barcode windows (~20 MB transferred vs ~1–2 GB full CRAM).
     - **Mode B (`wgs_stream`):** Streams raw `ERR*`/`SRR*` clinical reads via `xsra`/HTTPS through a C canonical
-      31-mer / PLA human host-depletion sieve on the fly, maps parasite reads, and halts as soon as the stop gate
+      31-mer / PLA human host-depletion filter on the fly, maps parasite reads, and halts as soon as the stop gate
       reaches target core depth.
 
     Emits per-isolate WHO antimalarial resistance genotypes (`drm_calls.tsv`), variant allele-depth posteriors

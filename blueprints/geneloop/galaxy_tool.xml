@@ -1,0 +1,184 @@
+<tool id="focaloop_geneloop" name="Focaloop GeneLoop adaptive genome annotation" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>5-stage adaptive eukaryotic genome annotation with homology seeding, syncmer depletion filtering, and Good-Turing UCB RNA-seq streaming</description>
+    <macros>
+        <token name="@TOOL_VERSION@">0.3.0</token>
+        <token name="@VERSION_SUFFIX@">0</token>
+        <token name="@PROFILE@">25.0</token>
+    </macros>
+    <requirements>
+        <requirement type="package" version="@TOOL_VERSION@">focaloop</requirement>
+        <container type="docker">ghcr.io/galaxyproject/focaloop:@TOOL_VERSION@</container>
+    </requirements>
+    <version_command>focaloop --version</version_command>
+    <command detect_errors="exit_code"><![CDATA[
+focaloop geneloop
+    --genome '$genome_fasta'
+    #if $proteins_fasta
+        --proteins '$proteins_fasta'
+    #end if
+    --clade '$clade'
+    #if $exclude_genus
+        --exclude-genus '$exclude_genus'
+    #end if
+    --mode '$mode'
+    #if $tiberius_weights_dir
+        --tiberius-weights '$tiberius_weights_dir'
+    #end if
+    #if $rna_manifest
+        --rna-manifest '$rna_manifest'
+    #end if
+    #if $short_reads_1
+        --short-reads-1
+        #for $r in $short_reads_1
+            '$r'
+        #end for
+        --short-read-ids
+        #for $r in $short_reads_1
+            '$r.element_identifier'
+        #end for
+    #end if
+    #if $short_reads_2
+        --short-reads-2
+        #for $r in $short_reads_2
+            '$r'
+        #end for
+    #end if
+    #if $long_reads
+        --long-reads
+        #for $r in $long_reads
+            '$r'
+        #end for
+        --long-read-ids
+        #for $r in $long_reads
+            '$r.element_identifier'
+        #end for
+    #end if
+    #if $short_bams
+        --short-bams
+        #for $b in $short_bams
+            '$b'
+        #end for
+    #end if
+    #if $long_bams
+        --long-bams
+        #for $b in $long_bams
+            '$b'
+        #end for
+    #end if
+    --logan-mode '$logan_mode'
+    --max-frac-spots $max_frac_spots
+    --p0-stop $p0_stop
+    --wave-spots $wave_spots
+    --structural-ncrna '$structural_ncrna'
+    #if not $enable_zoom
+        --no-zoom
+    #end if
+    --threads \${GALAXY_SLOTS:-8}
+    --state-dir geneloop_state_dir
+    --state-archive '$geneloop_state'
+    --out-gff3 '$annotation_gff3'
+    --out-proteins '$proteins_faa'
+    --out-gtf '$transcripts_gtf'
+    --out-summary '$locus_summary'
+    --out-report '$focaloop_report'
+    ]]></command>
+    <inputs>
+        <param name="genome_fasta" type="data" format="fasta,fasta.gz" label="Target genome assembly (FASTA)" help="Target eukaryotic genome assembly in FASTA format (unmasked or soft-masked)."/>
+        <param name="proteins_fasta" type="data" format="fasta,fasta.gz" optional="true" label="Homology protein sequences (RefSeq / clade FASTA, optional)" help="Homologous reference protein sequences aligned with miniprot for Stage-1 locus seeding."/>
+        <param name="clade" type="select" label="Target taxonomic clade">
+            <option value="vertebrates" selected="true">Vertebrates</option>
+            <option value="insecta">Insects / Arthropoda</option>
+            <option value="angiosperms">Angiosperms / Flowering plants</option>
+            <option value="fungi">Fungi / General Eukaryota</option>
+        </param>
+        <param name="exclude_genus" type="text" value="" optional="true" label="Exclude genus prefix from homology proteins (optional)"/>
+        <param name="mode" type="select" label="Execution and compute mode">
+            <option value="auto" selected="true">Auto-detect (GPU Tiberius -&gt; CPU Tiberius -&gt; Fast Evidence+Miniprot)</option>
+            <option value="fast_evidence">Fast Evidence + Miniprot (no Tiberius, CPU-friendly)</option>
+            <option value="cpu_tiberius">CPU Tiberius + Evidence</option>
+            <option value="gpu_tiberius">GPU Tiberius + Evidence</option>
+        </param>
+        <param name="tiberius_weights_dir" type="text" value="" optional="true" label="Custom Tiberius model weights path (optional)"/>
+        <param name="rna_manifest" type="data" format="tabular" optional="true" label="RNA-seq accession manifest (TSV, optional)"/>
+        <param name="short_reads_1" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" optional="true" label="Short-read FASTQ forward mates (R1) or single-end reads (optional)"/>
+        <param name="short_reads_2" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" optional="true" label="Short-read FASTQ reverse mates (R2, optional)"/>
+        <param name="long_reads" type="data" format="fastqsanger,fastqsanger.gz,fasta,fasta.gz" multiple="true" optional="true" label="Long-read RNA-seq FASTQ/FASTA (optional)"/>
+        <param name="short_bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned short-read BAMs (optional)"/>
+        <param name="long_bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned long-read BAMs (optional)"/>
+        <param name="logan_mode" type="select" label="Transcriptome contig assembly mode">
+            <option value="auto" selected="true">Auto</option>
+            <option value="off">Off</option>
+            <option value="force">Force</option>
+        </param>
+        <param name="max_frac_spots" type="float" min="0.01" max="1.0" value="0.35" label="Maximum spot fraction streamed per run"/>
+        <param name="p0_stop" type="float" min="0.0001" max="0.25" value="0.005" label="Good-Turing stopping threshold (p0)"/>
+        <param name="wave_spots" type="integer" min="1000" max="50000000" value="1000000" label="Spots per adaptive streaming wave"/>
+        <param name="structural_ncrna" type="select" label="Structural ncRNA detection">
+            <option value="auto" selected="true">Auto</option>
+            <option value="on">On (Require external structural ncRNA tools)</option>
+            <option value="off">Off</option>
+        </param>
+        <param name="enable_zoom" type="boolean" checked="true" label="Enable Stage-4 targeted micro-exon, orphan ORF, and lncRNA zoom"/>
+    </inputs>
+    <outputs>
+        <data name="annotation_gff3" format="gff3" label="${tool.name} on ${on_string}: annotation.gff3"/>
+        <data name="proteins_faa" format="fasta" label="${tool.name} on ${on_string}: proteins.faa"/>
+        <data name="transcripts_gtf" format="gtf" label="${tool.name} on ${on_string}: transcripts.gtf"/>
+        <data name="locus_summary" format="tabular" label="${tool.name} on ${on_string}: locus_summary.tsv"/>
+        <data name="focaloop_report" format="html" label="${tool.name} on ${on_string}: focaloop_report.html"/>
+        <data name="geneloop_state" format="data" label="${tool.name} on ${on_string}: geneloop_state.focaloop.tar.zst"/>
+    </outputs>
+    <tests>
+        <test expect_num_outputs="6">
+            <param name="genome_fasta" value="genome.fa" ftype="fasta"/>
+            <param name="proteins_fasta" value="proteins.faa" ftype="fasta"/>
+            <param name="clade" value="vertebrates"/>
+            <param name="mode" value="fast_evidence"/>
+            <param name="short_reads_1" value="reads_1.fastq.gz" ftype="fastqsanger.gz"/>
+            <param name="short_reads_2" value="reads_2.fastq.gz" ftype="fastqsanger.gz"/>
+            <param name="structural_ncrna" value="off"/>
+            <output name="annotation_gff3">
+                <assert_contents>
+                    <has_text text="##gff-version 3"/>
+                </assert_contents>
+            </output>
+            <output name="proteins_faa">
+                <assert_contents>
+                    <has_line_matching expression="^>.*"/>
+                </assert_contents>
+            </output>
+            <output name="transcripts_gtf">
+                <assert_contents>
+                    <has_text text="exon"/>
+                </assert_contents>
+            </output>
+            <output name="locus_summary">
+                <assert_contents>
+                    <has_text text="coding_genes"/>
+                </assert_contents>
+            </output>
+            <output name="focaloop_report">
+                <assert_contents>
+                    <has_text text="GeneLoop"/>
+                </assert_contents>
+            </output>
+            <output name="geneloop_state">
+                <assert_contents>
+                    <has_size min="200"/>
+                </assert_contents>
+            </output>
+        </test>
+    </tests>
+    <help format="markdown"><![CDATA[
+**What it does**
+
+Runs the 5-stage **Focaloop GeneLoop** adaptive eukaryotic genome annotation loop on a target genome assembly,
+combining `miniprot` homology alignments, optional `Tiberius` ab initio predictions, an open-syncmer depletion
+filter (`glcore`), Good-Turing UCB adaptive RNA-seq streaming, and locus synthesis to emit `annotation.gff3`,
+`proteins.faa`, `transcripts.gtf`, `locus_summary.tsv`, a self-contained HTML report, and a `.focaloop.tar.zst` warm state archive.
+    ]]></help>
+    <citations>
+        <citation type="doi">10.1093/bioinformatics/btae685</citation>
+        <citation type="doi">10.1093/bioinformatics/btad014</citation>
+    </citations>
+</tool>

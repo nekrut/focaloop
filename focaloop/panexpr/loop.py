@@ -29,11 +29,11 @@ from .kernels import Kernel, RunAccumulator, map_pooled
 from .manifest import Run, StudyManifest
 from .solver import (assembly_assignment_summary, combine_zoom_gene_tables, de_with_uncertainty, fast_nb_mom_de,
                      gene_level_tables, infer_dna_presence, infer_strandedness, quantify_cohort,
-                     refit_genes_with_depth_offsets)
+                     refit_genes_with_depth_offsets, transcript_level_table)
 from .state import (DOTHASH_SKETCH_SCHEMA, GENE_DE_SCHEMA, ITERATION_TELEMETRY_SCHEMA,
-                    TARGET_COUNTS_SCHEMA, StateStore)
+                    TARGET_COUNTS_SCHEMA, TRANSCRIPT_ABUNDANCE_SCHEMA, StateStore)
 from .streamer import RunStream, open_run_stream
-from .zoom import ZoomResult, select_borderline, zoom_pass
+from .zoom import ZoomResult, select_borderline, select_zoom_targets, zoom_pass
 
 
 @dataclass
@@ -46,9 +46,9 @@ class LoopConfig:
     initial_fraction: float = 0.0015
     growth: float = 2.2
     bg_scale: float = 0.3
-    max_iterations: int = 8
+    max_iterations: int = 12
     min_iterations: int = 2
-    max_bytes_pct: float = 10.0
+    max_bytes_pct: float = 100.0
     delta_lfc_stop: float = 0.05
     tech_var_stop: float = 0.25
     expressed_reads: float = 20.0
@@ -57,10 +57,10 @@ class LoopConfig:
     length_offsets: bool = False
     zoom: bool = True
     zoom_extra_fraction: float = 0.01
-    zoom_padj: tuple[float, float] = (0.005, 0.25)
+    zoom_padj: tuple[float, float] = (0.002, 0.25)
     zoom_reads: tuple[float, float] = (5.0, 35.0)
     followup_contrasts: list[list[str]] = field(default_factory=list)
-    fetch_workers: int = 4
+    fetch_workers: int = 24
     min_bytes_per_file: int = 262_144
     pool_samples: bool = True          # one kernel invocation (one index load) per layout per iteration
     sample_metadata: pd.DataFrame | dict[str, dict] | None = None
@@ -70,6 +70,12 @@ class LoopConfig:
     use_ust_decoys: bool = False
     use_island_pc_router: bool = False
     use_dothash_dedup: bool = False
+    min_mapped_per_sample: int | None = None
+    abundant_sieve: bool = True
+    abundant_sieve_force: bool = False
+    sieve_mode: str = "auto"
+    sieve_low_reads_hi: float = 50.0
+    sieve_max_rem_fraction: float = 0.30
 
 
 @dataclass
@@ -114,6 +120,7 @@ class Focaloop:
         self.pooled_calls = 0
         self.low_map_rate_runs: set[str] = set()
         self._last_alloc_cap_clipped = False
+        self._lane_cursor: dict[str, int] = {}
         self._dothash_hvs: dict[str, np.ndarray] = {}
         self._dothash_seen: dict[str, set[int]] = {}
         self._dothash_reads: dict[str, int] = {}
@@ -131,57 +138,231 @@ class Focaloop:
                 }
 
     # ---------------- byte allocation ----------------
+    def _active_conditions(self) -> set[str] | None:
+        """All conditions participating in primary or follow-up contrasts (None = all RNA conditions)."""
+        if self.cfg.focal_conditions is None:
+            return None
+        conds = set(self.cfg.focal_conditions)
+        if len(self.cfg.contrast) >= 3:
+            conds.add(str(self.cfg.contrast[1]))
+            conds.add(str(self.cfg.contrast[2]))
+        for fc in self.cfg.followup_contrasts:
+            if len(fc) >= 3:
+                conds.add(str(fc[1]))
+                conds.add(str(fc[2]))
+        return conds
+
     def _focal(self, r: Run) -> bool:
-        return self.cfg.focal_conditions is None or r.condition in self.cfg.focal_conditions
+        ac = self._active_conditions()
+        return ac is None or r.condition in ac
+
+    def _effective_min_mapped_per_sample(self) -> int:
+        if self.cfg.min_mapped_per_sample is not None:
+            return max(0, int(self.cfg.min_mapped_per_sample))
+        n_groups = len(self.catalog.groups)
+        if n_groups < 500:
+            return 0
+        return min(15_000_000, max(1_500_000, 750 * n_groups))
+
+    def _floor_aware_next_fraction(self, cur_frac: float, cum_pct: float) -> float:
+        """Compute next iteration increment fraction using empirical per-sample mapped-reads-per-byte."""
+        floor = self._effective_min_mapped_per_sample()
+        if floor < 1_000_000:
+            return cur_frac * self.cfg.growth
+        focal = [r for r in self.manifest.rna_runs if self._focal(r)]
+        if not focal:
+            return cur_frac * self.cfg.growth
+        by_sample: dict[str, list[Run]] = {}
+        for r in focal:
+            by_sample.setdefault(r.sample, []).append(r)
+        est_full: list[float] = []
+        cur_mapped: list[float] = []
+        need_cum_fracs: list[float] = []
+        for runs_s in by_sample.values():
+            m_s = float(sum(self.accs[r.run_id].n_mapped for r in runs_s))
+            c_s = float(sum(self.accs[r.run_id].bytes_consumed for r in runs_s))
+            t_s = float(sum(max(1, self.streams[r.run_id].total_bytes) for r in runs_s))
+            cur_mapped.append(m_s)
+            if m_s > 0 and c_s > 0:
+                ef = m_s * (t_s / c_s)
+                est_full.append(ef)
+                need_cum_fracs.append(min(1.0, (1.06 * floor) / max(1.0, ef)))
+            else:
+                est_full.append(float(floor))
+                need_cum_fracs.append(1.0)
+        min_est_full = min(est_full) if est_full else float(floor)
+        min_cur = min(cur_mapped) if cur_mapped else 0.0
+        cur_cum = cum_pct / 100.0
+        # Shallow archive (entire archive has <= 1.20x floor mapped reads per sample): finish cleanly in 3 steps (~2.5% -> ~50% -> 100%)
+        if min_est_full <= 1.20 * floor:
+            if cur_cum < 0.35:
+                return max(cur_frac * self.cfg.growth, 0.50 - cur_cum)
+            return max(0.60, 1.02 - cur_cum)
+        # Deep archive (e.g. 175M-350M pairs/sample): jump iter 2 to ~55% of floor, iter 3 to ~106% of floor, then 1.55x if needed
+        f_floor = max(need_cum_fracs) if need_cum_fracs else 1.0
+        if min_cur < 0.45 * floor:
+            return max(0.005, min(0.50, max(cur_frac * 1.5, 0.55 * f_floor - cur_cum)))
+        if min_cur < floor:
+            return max(0.008, min(0.65, 1.06 * f_floor - cur_cum))
+        return max(0.015, min(0.35, 0.55 * max(cur_cum, 0.02)))
+
+    def _sample_depth_floors_met(self) -> tuple[bool, float]:
+        """Check whether every active biological sample has met its mapped-fragment floor (or exhausted its archive)."""
+        floor = self._effective_min_mapped_per_sample()
+        focal = [r for r in self.manifest.rna_runs if self._focal(r)]
+        if not focal:
+            return True, 0.0
+        by_sample: dict[str, list[Run]] = {}
+        for r in focal:
+            by_sample.setdefault(r.sample, []).append(r)
+        mapped_vals: list[float] = []
+        all_met = True
+        for s, runs_s in by_sample.items():
+            m_s = float(sum(self.accs[r.run_id].n_mapped for r in runs_s))
+            mapped_vals.append(m_s)
+            if floor <= 0:
+                continue
+            exh_s = all(self.streams[r.run_id].exhausted for r in runs_s)
+            tot_b = sum(self.streams[r.run_id].total_bytes for r in runs_s)
+            con_b = sum(self.streams[r.run_id].consumed_bytes for r in runs_s)
+            near_end = tot_b > 0 and con_b >= 0.96 * tot_b
+            if m_s < floor and not exh_s and not near_end:
+                all_met = False
+        return all_met, (float(np.mean(mapped_vals)) if mapped_vals else 0.0)
+
+    def _active_contrasts(self, meta: pd.DataFrame) -> list[list[str]]:
+        """Ordered active contrasts (primary + followups + remaining multi-group levels when unfiltered)."""
+        out: list[list[str]] = [list(self.cfg.contrast)]
+        seen = {tuple(self.cfg.contrast)}
+        for fc in self.cfg.followup_contrasts:
+            k = tuple(fc)
+            if len(fc) >= 3 and k not in seen:
+                seen.add(k)
+                out.append(list(fc))
+        if self.cfg.focal_conditions is None and len(self.cfg.contrast) >= 3:
+            factor, _a, ref_lvl = self.cfg.contrast[0], str(self.cfg.contrast[1]), str(self.cfg.contrast[2])
+            if factor in meta.columns:
+                levels = sorted(meta[factor].dropna().astype(str).unique())
+                if ref_lvl in levels and len(levels) > 2:
+                    for lv in levels:
+                        if lv == ref_lvl:
+                            continue
+                        cand = [factor, lv, ref_lvl]
+                        if tuple(cand) not in seen and (ref_lvl, lv) not in {(c[1], c[2]) for c in out}:
+                            seen.add(tuple(cand))
+                            out.append(cand)
+        return out
+
+    def _conv_expr_subset(self, df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+        """CPM-aware expressed gene subset (>= max(expressed_reads, 1.0 CPM)) for ultra-deep convergence checks."""
+        min_r = max(float(self.cfg.expressed_reads), 1.0 * float(df["streamed_reads"].sum()) / 1_000_000.0)
+        sub = df[(df["streamed_reads"] >= min_r) & df["log2fc"].notna()]
+        if sub.empty:
+            sub = df[(df["streamed_reads"] >= self.cfg.expressed_reads) & df["log2fc"].notna()]
+            min_r = float(self.cfg.expressed_reads)
+        return sub, min_r
+
+    def _distribute_sample_budget(self, sample: str, runs_s: list[Run], sample_budget: int, iteration: int) -> dict[str, int]:
+        """Distribute a biological sample's byte budget across its sequencing lanes (round-robin / proportional)."""
+        if len(runs_s) == 1:
+            r = runs_s[0]
+            if iteration == 1:
+                return {r.run_id: max(self.cfg.min_bytes_per_file * len(r.files), int(sample_budget))}
+            return {r.run_id: int(sample_budget)}
+        lane_alloc = {r.run_id: 0 for r in runs_s}
+        avail = [
+            r for r in runs_s
+            if not self.streams[r.run_id].exhausted
+            and (self.streams[r.run_id].total_bytes - self.streams[r.run_id].consumed_bytes) > 0
+        ]
+        if not avail or sample_budget <= 0:
+            return lane_alloc
+        min_lane = max(1, self.cfg.min_bytes_per_file * max(len(r.files) for r in avail))
+        eff_budget = max(min_lane, int(sample_budget)) if iteration == 1 else int(sample_budget)
+        if eff_budget >= min_lane * len(avail):
+            rem_weights = {
+                r.run_id: max(1, self.streams[r.run_id].total_bytes - self.streams[r.run_id].consumed_bytes)
+                for r in avail
+            }
+            tot_rem = sum(rem_weights.values()) or 1
+            for r in avail:
+                lane_alloc[r.run_id] = int(eff_budget * rem_weights[r.run_id] / tot_rem)
+            return lane_alloc
+        # Budget smaller than min_lane * n_lanes: stripe round-robin across k_lanes and advance cursor next wave
+        k_lanes = max(1, min(len(avail), eff_budget // min_lane))
+        cur = self._lane_cursor.get(sample, 0) % len(avail)
+        chosen = [avail[(cur + j) % len(avail)] for j in range(k_lanes)]
+        self._lane_cursor[sample] = (cur + k_lanes) % len(avail)
+        per_chosen = max(min_lane if iteration == 1 else 1, eff_budget // k_lanes)
+        for r in chosen:
+            lane_alloc[r.run_id] = int(per_chosen)
+        return lane_alloc
 
     def allocate(self, iteration: int, budget_fraction: float) -> dict[str, int]:
-        """Bytes per run for this iteration (variance-guided: inverse to effective mapped depth)."""
+        """Bytes per run for this iteration (variance-guided per biological sample, striped across lanes)."""
         alloc: dict[str, int] = {}
         focal = [r for r in self.manifest.rna_runs if self._focal(r)]
         bg = [r for r in self.manifest.rna_runs if not self._focal(r)]
         for r in self.manifest.wgs_runs:
             alloc[r.run_id] = self.cfg.wgs_bytes_per_iter * len(r.files)
-        if iteration == 1 or not focal:
-            for r in focal:
-                alloc[r.run_id] = max(self.cfg.min_bytes_per_file * len(r.files), int(r.total_bytes * budget_fraction))
+        by_sample: dict[str, list[Run]] = {}
+        for r in focal:
+            by_sample.setdefault(r.sample, []).append(r)
+        if iteration == 1 or not by_sample:
+            for s, runs_s in by_sample.items():
+                s_tot = sum(r.total_bytes for r in runs_s)
+                alloc.update(self._distribute_sample_budget(s, runs_s, int(s_tot * budget_fraction), iteration))
         else:
             budget = sum(int(r.total_bytes * budget_fraction) for r in focal)
-            depth = {r.run_id: float(self.accs[r.run_id].n_mapped) for r in focal}
-            bpr = {}
-            for r in focal:
-                a = self.accs[r.run_id]
-                bpr[r.run_id] = (a.bytes_consumed / a.n_mapped) if a.n_mapped > 0 else (r.total_bytes / max(1, r.read_count))
-            mean_depth = max(1.0, float(np.mean(list(depth.values()))))
-            est_new_reads = budget / max(1.0, float(np.mean(list(bpr.values()))))
-            target = (sum(depth.values()) + est_new_reads) / len(focal)
-            want = {k: bpr[k] * max(target - depth[k], 0.25 * target) for k in depth}
+            s_depth = {s: float(sum(self.accs[r.run_id].n_mapped for r in rs)) for s, rs in by_sample.items()}
+            s_bpr: dict[str, float] = {}
+            for s, rs in by_sample.items():
+                cons = sum(self.accs[r.run_id].bytes_consumed for r in rs)
+                mapped = sum(self.accs[r.run_id].n_mapped for r in rs)
+                tot_b = sum(r.total_bytes for r in rs)
+                tot_rc = sum(r.read_count for r in rs)
+                s_bpr[s] = (cons / mapped) if mapped > 0 else (tot_b / max(1, tot_rc))
+            est_new_reads = budget / max(1.0, float(np.mean(list(s_bpr.values()))))
+            target = (sum(s_depth.values()) + est_new_reads) / len(by_sample)
+            s_want = {s: s_bpr[s] * max(target - s_depth[s], 0.25 * target) for s in s_depth}
             if self.cfg.use_dothash_dedup and len(focal) >= 2:
-                self._apply_dothash_dedup_weights(focal, depth, want)
-            # clip to [0.25x, 4x] of the uniform share so no library is starved or hogs the budget
-            share = budget / len(focal)
-            tot_w = sum(want.values()) or 1.0
-            for r in focal:
-                raw = budget * want[r.run_id] / tot_w
-                alloc[r.run_id] = int(min(4.0 * share, max(0.25 * share, raw)))
+                r_depth = {r.run_id: float(self.accs[r.run_id].n_mapped) for r in focal}
+                r_want = {r.run_id: 1.0 for r in focal}
+                self._apply_dothash_dedup_weights(focal, r_depth, r_want)
+                for s, rs in by_sample.items():
+                    s_want[s] *= float(np.mean([r_want[r.run_id] for r in rs]))
+            # clip to [0.25x, 4x] of the uniform per-sample share so no biological library is starved or hogs the budget
+            share = budget / len(by_sample)
+            tot_w = sum(s_want.values()) or 1.0
+            for s, runs_s in by_sample.items():
+                raw = budget * s_want[s] / tot_w
+                s_bud = int(min(4.0 * share, max(0.25 * share, raw)))
+                alloc.update(self._distribute_sample_budget(s, runs_s, s_bud, iteration))
         for r in bg:
             alloc[r.run_id] = max(self.cfg.min_bytes_per_file * len(r.files), int(r.total_bytes * budget_fraction * self.cfg.bg_scale))
         for r in self.manifest.runs:
             rs = self.streams[r.run_id]
-            alloc[r.run_id] = int(min(alloc[r.run_id], max(0, rs.total_bytes - rs.consumed_bytes)))
-        # never stream past the max_bytes_pct cap: scale this iteration down to the remaining allowance,
+            rem_r = max(0, rs.total_bytes - rs.consumed_bytes)
+            want_r = int(min(alloc.get(r.run_id, 0), rem_r))
+            # Snap tiny residual tail slivers (<= 2% of run, up to 64 KiB) on iter > 1 so we never run an extra wave on gzip trailers
+            if iteration > 1 and want_r > 0 and 0 < (rem_r - want_r) <= min(65_536, max(64, int(0.02 * rs.total_bytes))):
+                want_r = rem_r
+            alloc[r.run_id] = want_r
+        # never stream past an explicit max_bytes_pct ceiling: scale down to remaining allowance,
         # and skip near-zero tail slivers after min_iterations so we do not run a full wave + DE solve for <0.1% bytes.
         self._last_alloc_cap_clipped = False
-        cum = sum(a.bytes_consumed for a in self.accs.values())
-        remaining = self.cfg.max_bytes_pct / 100.0 * self.manifest.total_archive_bytes - cum
-        planned = sum(alloc.values())
-        min_sliver = max(int(0.001 * self.manifest.total_archive_bytes), int(0.10 * planned))
-        if remaining <= 0 or (iteration > self.cfg.min_iterations and remaining < min_sliver):
-            alloc = {k: 0 for k in alloc}
-            self._last_alloc_cap_clipped = True
-        elif planned > remaining > 0:
-            f = remaining / planned
-            alloc = {k: int(v * f) for k, v in alloc.items()}
-            self._last_alloc_cap_clipped = True
+        if self.cfg.max_bytes_pct < 100.0:
+            cum = sum(a.bytes_consumed for a in self.accs.values())
+            remaining = self.cfg.max_bytes_pct / 100.0 * self.manifest.total_archive_bytes - cum
+            planned = sum(alloc.values())
+            min_sliver = max(int(0.001 * self.manifest.total_archive_bytes), int(0.10 * planned))
+            if remaining <= 0 or (iteration > self.cfg.min_iterations and remaining < min_sliver):
+                alloc = {k: 0 for k in alloc}
+                self._last_alloc_cap_clipped = True
+            elif planned > remaining > 0:
+                f = remaining / planned
+                alloc = {k: int(v * f) for k, v in alloc.items()}
+                self._last_alloc_cap_clipped = True
         return alloc
 
     def _apply_dothash_dedup_weights(
@@ -230,7 +411,7 @@ class Focaloop:
                 rep_hvs.append(hv)
 
     # ---------------- streaming + mapping ----------------
-    def stream_and_map(self, alloc: dict[str, int]) -> tuple[float, float]:
+    def _stream_and_map_wave(self, alloc: dict[str, int]) -> tuple[float, float]:
         t0 = time.time()
 
         def _fetch(run_id: str):
@@ -239,13 +420,17 @@ class Focaloop:
             r1, r2 = rs.advance_bytes(alloc[run_id])
             return run_id, r1, r2, rs.consumed_bytes - before
 
-        with ThreadPoolExecutor(max_workers=self.cfg.fetch_workers) as ex:
-            fetched = list(ex.map(_fetch, [k for k, v in alloc.items() if v > 0]))
+        active_ids = [k for k, v in alloc.items() if v > 0]
+        if not active_ids:
+            return 0.0, 0.0
+        with ThreadPoolExecutor(max_workers=min(self.cfg.fetch_workers, len(active_ids))) as ex:
+            fetched = list(ex.map(_fetch, active_ids))
         io_s = time.time() - t0
         t1 = time.time()
         for run_id, _r1, _r2, delta in fetched:
             self.accs[run_id].bytes_consumed += delta
         todo = [(run_id, r1, r2) for run_id, r1, r2, _d in fetched if r1]
+        del fetched
         if self.cfg.use_dothash_dedup and todo:
             from .dothash import update_sketch_from_reads
             for run_id, r1, r2 in todo:
@@ -261,23 +446,128 @@ class Focaloop:
                     self._dothash_seen[run_id],
                 )
                 self._dothash_reads[run_id] += n_take
+        # Pool multi-lane batches belonging to the same biological (sample, condition, layout) before kernel invocation
+        # so multi-lane cohorts (e.g. 256 runs = 16 biological samples x 16 lanes) load the mapper index 16x instead of 256x.
+        sample_lanes: dict[tuple[str, str, bool], list[str]] = {}
+        grouped_todo: dict[tuple[str, str, bool], list[tuple[str, list, list | None]]] = {}
+        wgs_todo: list[tuple[str, list, list | None]] = []
+        for run_id, r1, r2 in todo:
+            r_obj = self.accs[run_id].run
+            if r_obj.is_wgs:
+                wgs_todo.append((run_id, r1, r2))
+            else:
+                sk = (r_obj.sample, r_obj.condition, r2 is not None)
+                grouped_todo.setdefault(sk, []).append((run_id, r1, r2))
+                sample_lanes.setdefault(sk, []).append(run_id)
+        del todo
+
+        map_items: list[tuple[str, list, list | None]] = list(wgs_todo)
+        rep_to_lanes: dict[str, list[str]] = {}
+        for sk, items in grouped_todo.items():
+            # Canonical biological-sample accumulator is always the first lane of that sample in manifest order
+            canon_rid = next(
+                (
+                    r.run_id
+                    for r in self.manifest.rna_runs
+                    if r.sample == sk[0] and r.condition == sk[1] and (r.layout == "PE") == sk[2]
+                ),
+                items[0][0],
+            )
+            rep_to_lanes[canon_rid] = sample_lanes[sk]
+            if len(items) == 1 and items[0][0] == canon_rid:
+                map_items.append(items[0])
+            else:
+                cat_r1: list = []
+                cat_r2: list | None = [] if sk[2] else None
+                for _rid, x1, x2 in items:
+                    cat_r1.extend(x1)
+                    if cat_r2 is not None and x2 is not None:
+                        cat_r2.extend(x2)
+                map_items.append((canon_rid, cat_r1, cat_r2))
+        del grouped_todo
+
         if self.cfg.pool_samples and (getattr(self.kernel, "supports_pooling", False) or hasattr(self.kernel, "clone_with_threads")):
             for paired in (True, False):
-                grp = [(rid, r1, r2, self.accs[rid].calibrator) for rid, r1, r2 in todo if (r2 is not None) == paired]
+                grp = [(rid, r1, r2, self.accs[rid].calibrator) for rid, r1, r2 in map_items if (r2 is not None) == paired]
                 if grp:
                     self.pooled_calls += 1
                     for rid, res in map_pooled(self.kernel, grp).items():
                         self.accs[rid].add(res)
         else:
-            for run_id, r1, r2 in todo:
+            for run_id, r1, r2 in map_items:
                 acc = self.accs[run_id]
                 acc.add(self.kernel.map_batch(r1, r2, acc.calibrator))
+        del map_items
         # LOW_MAP_RATE: sources that partition reads (sra_odp) keep serving discovery blocks only to flagged runs
-        for run_id, _r1, _r2 in todo:
-            st = self.streams[run_id]
-            if hasattr(st, "flag_low_map_rate") and st.flag_low_map_rate(self.accs[run_id].mapped_fraction):
-                self.low_map_rate_runs.add(run_id)
+        for canon_rid, lane_rids in rep_to_lanes.items():
+            mf = self.accs[canon_rid].mapped_fraction
+            for rid in lane_rids:
+                st = self.streams[rid]
+                if hasattr(st, "flag_low_map_rate") and st.flag_low_map_rate(mf):
+                    self.low_map_rate_runs.add(rid)
         return io_s, time.time() - t1
+
+    def stream_and_map(self, alloc: dict[str, int]) -> tuple[float, float]:
+        """Bounded-RAM streaming + mapping: caps raw reads in Python heap per micro-wave (~1.2 GB compressed)."""
+        import gc
+        import math
+        import os
+
+        max_wave_bytes = int(os.environ.get("PANEXPR_MAX_WAVE_BYTES", "1200000000"))
+        tot_planned = sum(v for v in alloc.values() if v > 0)
+        if tot_planned <= max_wave_bytes:
+            return self._stream_and_map_wave(alloc)
+
+        # Group run allocations by biological sample so multi-lane pooling stays intact within each wave
+        units: list[dict[str, int]] = []
+        by_smp: dict[tuple[str, str, str], dict[str, int]] = {}
+        for r in self.manifest.runs:
+            v = int(alloc.get(r.run_id, 0))
+            if v <= 0:
+                continue
+            key = ("wgs", r.run_id, "") if r.is_wgs else (r.sample, r.condition, r.layout)
+            by_smp.setdefault(key, {})[r.run_id] = v
+
+        for smp_alloc in by_smp.values():
+            s_bytes = sum(smp_alloc.values())
+            if s_bytes <= max_wave_bytes:
+                units.append(smp_alloc)
+            else:
+                n_sub = max(2, int(math.ceil(s_bytes / max_wave_bytes)))
+                rem = dict(smp_alloc)
+                for step_i in range(n_sub):
+                    left_steps = n_sub - step_i
+                    chunk = {}
+                    for rid, rem_b in rem.items():
+                        take = rem_b if left_steps == 1 else int(math.ceil(rem_b / left_steps))
+                        if take > 0:
+                            chunk[rid] = take
+                            rem[rid] -= take
+                    if chunk:
+                        units.append(chunk)
+
+        waves: list[dict[str, int]] = []
+        cur_wave: dict[str, int] = {}
+        cur_bytes = 0
+        for u in units:
+            u_bytes = sum(u.values())
+            if cur_wave and (cur_bytes + u_bytes > max_wave_bytes):
+                waves.append(cur_wave)
+                cur_wave = {}
+                cur_bytes = 0
+            for rid, b in u.items():
+                cur_wave[rid] = cur_wave.get(rid, 0) + b
+            cur_bytes += u_bytes
+        if cur_wave:
+            waves.append(cur_wave)
+
+        io_tot = map_tot = 0.0
+        for w in waves:
+            wi, wm = self._stream_and_map_wave(w)
+            io_tot += wi
+            map_tot += wm
+            gc.collect()
+        return io_tot, map_tot
 
     # ---------------- solving ----------------
     def _enrich_meta(self, meta: pd.DataFrame) -> pd.DataFrame:
@@ -346,6 +636,8 @@ class Focaloop:
         telemetry: list[dict] = []
         schedule: list[dict] = []
         prev_de: pd.DataFrame | None = None
+        prev_sec_de: dict[tuple[str, ...], pd.DataFrame] = {}
+        last_sec_de: dict[tuple[str, ...], pd.DataFrame] = {}
         self._last_zoom_table: pa.Table | None = None
         self._last_zoom_ctx: dict | None = None
         io_tot = map_tot = solve_tot = 0.0
@@ -360,7 +652,16 @@ class Focaloop:
             t_it = time.time()
             alloc = self.allocate(it, frac)
             if sum(alloc.values()) <= 0:
-                stop_reason = "max_bytes_pct_cap"
+                stop_reason = (
+                    "archive_exhausted"
+                    if all(
+                        self.streams[r.run_id].exhausted
+                        or (self.streams[r.run_id].consumed_bytes >= self.streams[r.run_id].total_bytes > 0)
+                        for r in self.manifest.rna_runs
+                        if self._focal(r)
+                    )
+                    else "max_bytes_pct_cap"
+                )
                 it -= 1
                 break
             schedule.append({"iteration": it, "alloc": dict(alloc)})
@@ -369,14 +670,28 @@ class Focaloop:
             map_tot += map_s
             t_s = time.time()
             de, table, extra = self.solve(it, fast_de=(cfg.fast_intermediate_de and it < cfg.max_iterations))
+            gl_it = extra["gene_tables"]
+            counts_it = gl_it.get("counts_length_scaled", gl_it["counts"]) if cfg.length_offsets else gl_it["counts"]
+            sec_contrasts = self._active_contrasts(gl_it["meta"])[1:]
+            cur_sec_de: dict[tuple[str, ...], pd.DataFrame] = {}
+            for sc in sec_contrasts:
+                try:
+                    cur_sec_de[tuple(sc)] = fast_nb_mom_de(
+                        counts_it, gl_it["avar"], gl_it["meta"], sc, cfg.design, gl_it["dna_prob"],
+                        self.symbols, self.gene_ids, it, cfg.expressed_reads,
+                    )
+                except Exception:
+                    pass
             solve_tot += time.time() - t_s
             cum = sum(a.bytes_consumed for a in self.accs.values())
             pct = 100.0 * cum / max(1, total_archive)
             expressed = de[(de["streamed_reads"] >= cfg.expressed_reads) & de["log2fc"].notna()]
-            med_tech = float(expressed["tech_var_fraction"].median()) if len(expressed) else 1.0
+            conv_expr, conv_min_r = self._conv_expr_subset(de)
+            med_tech = float(conv_expr["tech_var_fraction"].median()) if len(conv_expr) else 1.0
             if prev_de is not None:
-                j = expressed.set_index("group_id")[["log2fc"]].merge(prev_de.set_index("group_id")[["log2fc", "streamed_reads"]], left_index=True, right_index=True, how="inner", suffixes=("", "_prev"))
-                j = j[j["streamed_reads"] >= cfg.expressed_reads]
+                j = conv_expr.set_index("group_id")[["log2fc"]].merge(prev_de.set_index("group_id")[["log2fc", "streamed_reads"]], left_index=True, right_index=True, how="inner", suffixes=("", "_prev"))
+                prev_min_r = max(float(cfg.expressed_reads), 1.0 * float(prev_de["streamed_reads"].sum()) / 1_000_000.0)
+                j = j[j["streamed_reads"] >= prev_min_r]
                 if len(j):
                     abs_d = (j["log2fc"] - j["log2fc_prev"]).abs()
                     med_delta = float(abs_d.median())
@@ -386,15 +701,52 @@ class Focaloop:
                     med_delta = p90_delta = p95_delta = float("nan")
             else:
                 med_delta = p90_delta = p95_delta = float("nan")
+            worst_delta = med_delta
+            worst_tech = med_tech
+            for sc_key, sde in cur_sec_de.items():
+                sexpr, _ = self._conv_expr_subset(sde)
+                st_f = float(sexpr["tech_var_fraction"].median()) if len(sexpr) else 1.0
+                if st_f > worst_tech:
+                    worst_tech = st_f
+                if sc_key in prev_sec_de:
+                    p_sde = prev_sec_de[sc_key]
+                    p_smin = max(float(cfg.expressed_reads), 1.0 * float(p_sde["streamed_reads"].sum()) / 1_000_000.0)
+                    sj = sexpr.set_index("group_id")[["log2fc"]].merge(
+                        p_sde.set_index("group_id")[["log2fc", "streamed_reads"]],
+                        left_index=True, right_index=True, how="inner", suffixes=("", "_prev"),
+                    )
+                    sj = sj[sj["streamed_reads"] >= p_smin]
+                    sd_f = float((sj["log2fc"] - sj["log2fc_prev"]).abs().median()) if len(sj) else float("nan")
+                else:
+                    sd_f = float("nan")
+                if np.isnan(sd_f) or np.isnan(worst_delta):
+                    worst_delta = float("nan")
+                elif sd_f > worst_delta:
+                    worst_delta = sd_f
+            floors_met, _mean_sample_mapped = self._sample_depth_floors_met()
             n_deg = int((de["padj"] < 0.05).sum())
             total_reads = sum(a.n_reads for a in self.accs.values() if not a.run.is_wgs)
             mapped = sum(a.n_mapped for a in self.accs.values() if not a.run.is_wgs)
             reason = ""
-            converged = (it >= cfg.min_iterations and not np.isnan(med_delta) and med_delta < cfg.delta_lfc_stop and med_tech <= cfg.tech_var_stop)
-            exhausted = all(self.streams[r.run_id].exhausted for r in self.manifest.rna_runs)
+            converged = (
+                it >= cfg.min_iterations
+                and floors_met
+                and not np.isnan(worst_delta)
+                and worst_delta < cfg.delta_lfc_stop
+                and worst_tech <= cfg.tech_var_stop
+            )
+            exhausted = all(
+                self.streams[r.run_id].exhausted
+                or (self.streams[r.run_id].consumed_bytes >= self.streams[r.run_id].total_bytes > 0)
+                for r in self.manifest.rna_runs
+                if self._focal(r)
+            )
             if converged:
                 reason = "converged_tech_var_below_bio_var"
-            elif pct >= cfg.max_bytes_pct - 1e-6 or (self._last_alloc_cap_clipped and it >= cfg.min_iterations and pct >= cfg.max_bytes_pct * 0.98):
+            elif cfg.max_bytes_pct < 100.0 and (
+                pct >= cfg.max_bytes_pct - 1e-6
+                or (self._last_alloc_cap_clipped and it >= cfg.min_iterations and pct >= cfg.max_bytes_pct * 0.98)
+            ):
                 reason = "max_bytes_pct_cap"
             elif exhausted:
                 reason = "archive_exhausted"
@@ -404,7 +756,8 @@ class Focaloop:
                 solve_tot += time.time() - t_exact
                 extra["used_fast_de"] = False
                 expressed = de[(de["streamed_reads"] >= cfg.expressed_reads) & de["log2fc"].notna()]
-                med_tech = float(expressed["tech_var_fraction"].median()) if len(expressed) else 1.0
+                conv_expr_ex, _ = self._conv_expr_subset(de)
+                med_tech = float(conv_expr_ex["tech_var_fraction"].median()) if len(conv_expr_ex) else 1.0
                 n_deg = int((de["padj"] < 0.05).sum())
                 if reason == "converged_tech_var_below_bio_var" and med_tech > cfg.tech_var_stop and it < cfg.max_iterations:
                     reason = ""
@@ -415,12 +768,15 @@ class Focaloop:
                 "median_tech_var_fraction": med_tech, "n_deg_fdr05": n_deg, "wall_seconds": time.time() - t_it, "stop_reason": reason,
             })
             self.log(f"  [iter {it}] {cum / 1e6:9.1f} MB ({pct:5.2f}%) reads={total_reads:,} mapped={mapped:,} expressed={len(expressed):,} "
-                     f"DEG={n_deg} median|dLFC|={med_delta:.4f} p90|dLFC|={p90_delta:.4f} median_tech_var={med_tech:.3f} [{time.time() - t_it:.1f}s] {reason}")
+                     f"DEG={n_deg} median|dLFC|={med_delta:.4f} p90|dLFC|={p90_delta:.4f} median_tech_var={med_tech:.3f} "
+                     f"floors_met={floors_met} [{time.time() - t_it:.1f}s] {reason}")
             prev_de = de
+            prev_sec_de = cur_sec_de
+            last_sec_de = cur_sec_de
             if reason:
                 stop_reason = reason
                 break
-            frac *= cfg.growth
+            frac = self._floor_aware_next_fraction(frac, pct)
         assert de is not None and table is not None and extra is not None
         if extra.get("used_fast_de"):
             t_exact = time.time()
@@ -439,14 +795,75 @@ class Focaloop:
         # Zoom
         zoom_res: ZoomResult | None = None
         de_post = de_pre
-        if cfg.zoom:
-            groups = select_borderline(de_pre, cfg.zoom_padj[0], cfg.zoom_padj[1], cfg.zoom_reads[0], cfg.zoom_reads[1])
-            if groups:
+        any_stream_left = any(
+            not self.streams[r.run_id].exhausted
+            and (self.streams[r.run_id].total_bytes - self.streams[r.run_id].consumed_bytes) > 0
+            for r in self.manifest.rna_runs
+        )
+        if cfg.zoom and any_stream_left:
+            use_v24_sieve = cfg.abundant_sieve and (
+                (len(self.catalog.groups) >= 500 and cfg.zoom_extra_fraction <= 0.02)
+                or cfg.abundant_sieve_force
+            )
+            abundant_groups: list[str] | None = None
+            if use_v24_sieve:
+                groups, abundant_groups = select_zoom_targets(
+                    de_pre, padj_lo=cfg.zoom_padj[0], padj_hi=cfg.zoom_padj[1], low_reads_hi=cfg.sieve_low_reads_hi,
+                )
+                if last_sec_de:
+                    gset_u = set(groups)
+                    aset_u = set(abundant_groups)
+                    for sde in last_sec_de.values():
+                        sg, sa = select_zoom_targets(
+                            sde, padj_lo=cfg.zoom_padj[0], padj_hi=cfg.zoom_padj[1], low_reads_hi=cfg.sieve_low_reads_hi,
+                        )
+                        gset_u.update(sg)
+                        aset_u &= set(sa)
+                    groups = [g for g in de_pre["group_id"] if g in gset_u]
+                    abundant_groups = [g for g in abundant_groups if g in aset_u and g not in gset_u]
+                _fl_met, mean_sample_mapped = self._sample_depth_floors_met()
+                global_frac = bytes_global / max(1, total_archive)
+                rem_frac = max(0.0, 1.0 - global_frac)
+                rem_slice = cfg.sieve_max_rem_fraction * rem_frac
+                target_zoom_mapped = (
+                    28_000_000.0
+                    if len(self.catalog.groups) >= 20_000
+                    else max(3_000_000.0, 2.0 * float(self._effective_min_mapped_per_sample()))
+                )
+                if mean_sample_mapped > 0 and global_frac > 0:
+                    needed_frac = global_frac * max(
+                        0.35, (target_zoom_mapped - mean_sample_mapped) / max(1.0, mean_sample_mapped)
+                    )
+                    zoom_frac = max(cfg.zoom_extra_fraction, min(rem_slice, needed_frac))
+                else:
+                    zoom_frac = max(cfg.zoom_extra_fraction, rem_slice)
+                if cfg.max_bytes_pct < 100.0:
+                    zoom_frac = min(zoom_frac, max(cfg.zoom_extra_fraction, cfg.max_bytes_pct / 100.0 - global_frac))
+            else:
+                groups = select_borderline(de_pre, cfg.zoom_padj[0], cfg.zoom_padj[1], cfg.zoom_reads[0], cfg.zoom_reads[1])
+                zoom_frac = cfg.zoom_extra_fraction
+            if groups and zoom_frac > 0:
                 t_z = time.time()
                 rna_streams = {k: v for k, v in self.streams.items() if not v.run.is_wgs}
+                z_lane_alloc: dict[str, int] | None = None
+                by_smp_z: dict[str, list[Run]] = {}
+                for r in self.manifest.rna_runs:
+                    by_smp_z.setdefault(r.sample, []).append(r)
+                if any(len(rs_z) > 1 for rs_z in by_smp_z.values()):
+                    z_lane_alloc = {}
+                    for s_z, rs_z in by_smp_z.items():
+                        s_tot_z = sum(self.streams[r.run_id].total_bytes for r in rs_z)
+                        s_rem_z = sum(max(0, self.streams[r.run_id].total_bytes - self.streams[r.run_id].consumed_bytes) for r in rs_z)
+                        want_z = min(s_rem_z, max(cfg.min_bytes_per_file * 2, int(s_tot_z * zoom_frac)))
+                        z_lane_alloc.update(self._distribute_sample_budget(s_z, rs_z, want_z, it + 1))
                 zoom_res = zoom_pass(
                     self.kernel, self.catalog, self.accs, rna_streams, groups,
-                    cfg.zoom_extra_fraction, log=self.log, fetch_workers=cfg.fetch_workers, pool_samples=cfg.pool_samples,
+                    zoom_frac, log=self.log, fetch_workers=cfg.fetch_workers, pool_samples=cfg.pool_samples,
+                    abundant_groups=abundant_groups,
+                    sieve_mode=(cfg.sieve_mode if use_v24_sieve else "include"),
+                    sieve_threads=getattr(self.kernel, "threads", 4),
+                    sample_lane_alloc=z_lane_alloc,
+                    close_streams=True,
                 )
                 de_post, table = self._post_zoom_de(it, groups, zoom_res, extra, de_global=de_pre, global_table=table)
                 telemetry.append({
@@ -488,8 +905,16 @@ class Focaloop:
                     st.close()
                 except Exception:
                     pass
+        tx_table = transcript_level_table(
+            table,
+            self.catalog,
+            zoom_table=self._last_zoom_table,
+            zoom_groups=(self._last_zoom_ctx["groups"] if self._last_zoom_ctx else None),
+            depth_scale=(self._last_zoom_ctx["depth_scale"] if self._last_zoom_ctx else None),
+        )
         paths = {
             "target_counts": str(self.state.write("target_counts", table, TARGET_COUNTS_SCHEMA)),
+            "transcript_abundances": str(self.state.write("transcript_abundances", tx_table, TRANSCRIPT_ABUNDANCE_SCHEMA)),
             "gene_de_prezoom": str(self.state.write("gene_de_prezoom", pa.Table.from_pandas(de_pre, preserve_index=False), GENE_DE_SCHEMA)),
             "gene_de_postzoom": str(self.state.write("gene_de_postzoom", pa.Table.from_pandas(de_post, preserve_index=False), GENE_DE_SCHEMA)),
             "telemetry": str(self.state.write("telemetry", pa.Table.from_pylist(telemetry), ITERATION_TELEMETRY_SCHEMA)),

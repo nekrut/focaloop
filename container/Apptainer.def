@@ -2,15 +2,16 @@ Bootstrap: docker
 From: mambaorg/micromamba:2.0.5-ubuntu24.04
 
 # Build from repository root (no Docker daemon or public registry push required):
-#   APPTAINER_TMPDIR=/tmp apptainer build focaloop_proto_0.2.0.sif container/Apptainer.def
+#   APPTAINER_TMPDIR=/tmp apptainer build focaloop_proto_0.3.0.sif container/Apptainer.def
 
 %files
-    container/environment.yml /tmp/environment.yml
+    container/environment.yml /opt/focaloop/environment.yml
     pyproject.toml /opt/focaloop/src/pyproject.toml
     README.md /opt/focaloop/src/README.md
     focaloop /opt/focaloop/src/focaloop
     blueprints/panexpr/blueprint.focaloop.yml /opt/focaloop/blueprints/panexpr/blueprint.focaloop.yml
     blueprints/malariavar/blueprint.focaloop.yml /opt/focaloop/blueprints/malariavar/blueprint.focaloop.yml
+    blueprints/geneloop/blueprint.focaloop.yml /opt/focaloop/blueprints/geneloop/blueprint.focaloop.yml
     blueprints/focaloop_query/blueprint.focaloop.yml /opt/focaloop/blueprints/focaloop_query/blueprint.focaloop.yml
     blueprints/focaloop_bait/blueprint.focaloop.yml /opt/focaloop/blueprints/focaloop_bait/blueprint.focaloop.yml
 
@@ -18,22 +19,26 @@ From: mambaorg/micromamba:2.0.5-ubuntu24.04
     export PATH=/opt/conda/bin:$PATH
     export FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints
     export FOCALOOP_NATIVE_DIR=/opt/focaloop/native_cache
+    export FOCALOOP_NATIVE_CACHE=/opt/focaloop/native_cache
+    export FOCALOOP_PORTABLE_ISA=1
     export FOCALOOP_PF3D7_FASTA=/opt/focaloop/ref/Pf3D7.fasta
     export FOCALOOP_PLA_SIEVE=/opt/focaloop/ref/pf_pla_sieve.pla
+    export PANEXPR_DESEQ2_CPUS=1
 
 %post
     set -eux
     apt-get update && apt-get install -y --no-install-recommends \
         iproute2 ca-certificates gcc libc6-dev libgomp1 \
         && rm -rf /var/lib/apt/lists/*
-    micromamba install -y -n base -f /tmp/environment.yml
+    micromamba install -y -n base -f /opt/focaloop/environment.yml
     micromamba clean --all --yes
     export PATH=/opt/conda/bin:$PATH
     mkdir -p /opt/focaloop/native_cache /opt/focaloop/ref
     python -m pip install --no-deps --no-cache-dir /opt/focaloop/src
     # Portable -O3 -msse4.2 -mpopcnt so mixed Slurm partitions (Ivy Bridge + Cascade Lake) never SIGILL
     FOCALOOP_PORTABLE_ISA=1 FOCALOOP_BUILD_NATIVE_DIR=/opt/focaloop/native_cache \
+        FOCALOOP_NATIVE_CACHE=/opt/focaloop/native_cache \
         python -c "from focaloop.galaxy_runners import prebuild_all_native_libs; print(prebuild_all_native_libs())"
-    chmod -R a+rX /opt/focaloop
+    chmod -R a+rX /opt/focaloop /opt/conda
     focaloop --version
-    FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints focaloop validate panexpr malariavar focaloop_query focaloop_bait
+    FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints focaloop validate panexpr malariavar geneloop focaloop_query focaloop_bait
