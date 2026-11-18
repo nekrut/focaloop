@@ -4,8 +4,7 @@
 from local files or public INSDC archives (HTTP `Range`), picks a mapping kernel by tournament, keeps
 strain/paralog ties as equivalence classes, re-solves them with backward expectation-maximization (EM),
 and stops once a replicate-variance / posterior-precision gate says more bytes stop changing the answer.
-Each study is a declarative `.focaloop.yml` **blueprint**, packaged for Galaxy both as a user-defined tool
-(UDT) and as a ToolShed XML wrapper.
+Each study is packaged for Galaxy via first-class `tools-iuc` XML wrappers under `tools/focaloop/`. Legacy `.focaloop.yml` / UDT blueprints under `blueprints/` are frozen archival prototypes.
 
 ## Install and test
 
@@ -43,8 +42,8 @@ pip install .            # provides the `focaloop` entry point
 | `focaloop/conditioner.py`, `stop_gate.py` | blueprint backward EM + stop gate |
 | `focaloop/engine.py`, `ops.py`, `cli.py` | blueprint engine, `query`/`bait`/`steer`, unified `focaloop` CLI |
 | `focaloop/galaxy_lint.py` | offline strict UDT and XML checks (+ official `galaxy-tool-util` when installed) |
-| `tools/focaloop/` | tools-iuc wrappers (`expressionloop.xml`, `variationloop.xml`, `geneloop.xml`, `focaloop_query.xml`, `macros.xml`, `.shed.yml`, `test-data/`) |
-| `blueprints/<id>/` | `blueprint.focaloop.yml`, `galaxy_udt.yml` (`GalaxyUserTool`), `galaxy_tool.xml` (Tool Panel XML), `test-data/` |
+| `tools/focaloop/` | **First-class `tools-iuc` XML suite (`0.3.0+galaxy0`)**: `expressionloop.xml`, `variationloop.xml`, `geneloop.xml`, `focaloop_query.xml`, `macros.xml`, `.shed.yml`, `test-data/` |
+| `blueprints/<id>/` | **Frozen archival prototypes (0.1–0.2)**: legacy `blueprint.focaloop.yml`, `galaxy_udt.yml` (`GalaxyUserTool`), and standalone `galaxy_tool.xml` drafts |
 | `container/` | `Dockerfile`, `Apptainer.def`, and pinned `environment.yml` for `ghcr.io/galaxyproject/focaloop:0.3.0` |
 | `galaxy/` | Galaxy 25.0+/27.0+ config, tool panel, TPV rules, and deployment notes |
 | `skills/` | agent skills: `focaloop-run`, `focaloop-query`, `focaloop-distill` |
@@ -71,8 +70,9 @@ pip install .            # provides the `focaloop` entry point
 
 ## Galaxy deployment (`0.3.0`)
 
-- **Dual tool surfaces:** tools-iuc XML wrappers live under `tools/focaloop/` (`expressionloop.xml`, `variationloop.xml`, `geneloop.xml`, `focaloop_query.xml`, `macros.xml`, `.shed.yml`), alongside `class: GalaxyUserTool` YAML definitions under `blueprints/*/galaxy_udt.yml`.
+- **First-class XML suite (`tools/focaloop/`):** `expressionloop.xml`, `variationloop.xml`, `geneloop.xml`, `focaloop_query.xml`, `macros.xml`, and `.shed.yml` target `tools-iuc` (`suite_focaloop`, Galaxy profile `25.0`). Legacy `blueprints/*/galaxy_udt.yml` prototypes are frozen (see `blueprints/README.md`).
+- **Two-step packaging:** `0.3.0` runs via the self-contained container (`container/Apptainer.def` / `container/Dockerfile`, `ghcr.io/galaxyproject/focaloop:0.3.0`) for cluster validation, followed by a clean Bioconda recipe for `tools-iuc` / `usegalaxy.org` CVMFS BioContainers.
+- **Portable asset resolution:** No hardcoded workstation paths remain. `VariationLoop` takes a History reference FASTA by default (with optional `FOCALOOP_PF3D7_DIR` / `S` server mount override for pathogen surveillance). `GeneLoop` resolves Tiberius model weights via `--tiberius-weights`, `TIBERIUS_WEIGHTS_DIR`, or CVMFS, falling back cleanly to `fast_evidence` when absent.
 - **Production engines:** `focaloop expressionloop`, `focaloop variationloop`, and `focaloop geneloop` emit compact `.focaloop.tar.zst` warm-state bundles queried in seconds with `0` network bytes by `focaloop query`.
-- **Container resolution:** Build locally via `container/Dockerfile` or `container/Apptainer.def`; on Slurm + Apptainer clusters without public registry pushes, point TPV `singularity_container_id_override` at the shared `.sif` image.
 
 License: MIT.

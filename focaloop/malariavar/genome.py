@@ -6,6 +6,7 @@ mask, 1 kb bins with GC content, curated loci from the PlasmoDB-55 GFF, and codo
 import gzip
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -13,7 +14,29 @@ from pathlib import Path
 import numpy as np
 
 _DEFAULT_PF3D7 = Path("/opt/focaloop/pf3d7_ref")
-S = Path(os.environ.get("S") or (str(_DEFAULT_PF3D7) if _DEFAULT_PF3D7.exists() else "/media/anton/hd2/malariavar_staging"))
+
+
+def default_staging_dir() -> Path:
+    env_s = os.environ.get("S", "").strip()
+    if env_s:
+        return Path(env_s)
+    env_pf = os.environ.get("FOCALOOP_PF3D7_DIR", "").strip()
+    if env_pf:
+        p = Path(env_pf)
+        return p.parent if p.name == "ref" else p
+    if _DEFAULT_PF3D7.exists():
+        return _DEFAULT_PF3D7
+    return Path(tempfile.gettempdir()) / "focaloop_ref"
+
+
+def default_work_dir() -> Path:
+    env_w = os.environ.get("W", "").strip()
+    if env_w:
+        return Path(env_w)
+    return Path(tempfile.gettempdir()) / "focaloop_work"
+
+
+S = default_staging_dir()
 REFDIR = Path(
     os.environ.get("FOCALOOP_PF3D7_DIR")
     or os.environ.get("MALARIAVAR_REFDIR")

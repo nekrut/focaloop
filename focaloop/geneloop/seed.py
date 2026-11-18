@@ -35,7 +35,7 @@ def _default_build_root() -> Path:
     env_br = os.environ.get("GENELOOP_BUILD_ROOT")
     if env_br:
         return Path(env_br)
-    for cand in ("/opt/focaloop/geneloop", "/home/anton/geneloop_build"):
+    for cand in ("/opt/focaloop/geneloop", "/cvmfs/data.galaxyproject.org/byhand/focaloop/geneloop"):
         if Path(cand).exists():
             return Path(cand)
     return Path("/opt/focaloop/geneloop")
@@ -534,8 +534,8 @@ def discover_tiberius_weights(model_cfg: str, explicit_weights: str | Path | Non
     search_roots.extend([
         Path("/opt/Tiberius/model_weights"),
         Path("/opt/focaloop/tiberius_weights"),
+        Path("/cvmfs/data.galaxyproject.org/byhand/tiberius_weights"),
         BUILD_ROOT / "weights",
-        Path("/home/anton/geneloop_build/weights"),
     ])
     for root in search_roots:
         if _is_weights_dir(root) and any(nm in root.name for nm in cands_names):
@@ -566,7 +566,6 @@ def detect_tiberius_runtime() -> dict[str, Any]:
     sif_cands = [Path(env_sif)] if env_sif else []
     sif_cands.extend([
         BUILD_ROOT / "sif" / "tiberius_2.0.9.sif",
-        Path("/home/anton/geneloop_build/sif/tiberius_2.0.9.sif"),
         Path("/opt/focaloop/sif/tiberius_2.0.9.sif"),
     ])
     app_exe = shutil.which("apptainer") or shutil.which("singularity")

@@ -23,8 +23,8 @@ import numpy as np
 from . import genome as G
 from . import regime as R
 
-W = Path(os.environ.get("W", "/media/anton/wd4tb/malariavar"))
-S = Path(os.environ.get("S", "/media/anton/hd2/malariavar_staging"))
+W = G.default_work_dir()
+S = G.default_staging_dir()
 TDIR = S / "ref" / "tournament"
 WORK = W / "tmp" / "tournament"
 HERE = Path(__file__).resolve().parent

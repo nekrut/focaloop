@@ -130,8 +130,8 @@ focaloop variationloop
                         </param>
                     </when>
                 </conditional>
-                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" optional="true" label="Reference genome FASTA (optional for bundled Pf3D7)" help="Leave empty to use the bundled PlasmoDB-54 Pf3D7 reference; provide a FASTA(.gz) for custom organisms or targeted panels."/>
-                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Custom target regions BED (optional)" help="Optional 0-based BED intervals appended to bundled Pf3D7 surveillance windows or used to restrict custom-reference CRAM range slicing."/>
+                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" optional="true" label="Reference genome FASTA (required unless server Pf3D7 reference is configured)" help="Provide a reference FASTA(.gz) from your Galaxy History. Leave empty only when a server-mounted PlasmoDB-54 Pf3D7 reference is configured via FOCALOOP_PF3D7_DIR or S."/>
+                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Custom target regions BED (optional)" help="Optional 0-based BED intervals appended to configured Pf3D7 surveillance windows or used to restrict custom-reference CRAM range slicing."/>
                 <param argument="--cram-pad-bp" type="integer" min="0" max="50000" value="1000" label="Target window padding (bp)" help="Flanking bases added around custom BED intervals when selecting CRAM containers."/>
                 <param argument="--streams" type="integer" min="1" max="64" value="24" label="Concurrent HTTP range streams" help="Number of parallel HTTP byte-range connections used when fetching remote CRAM containers."/>
                 <param name="emit_drm" type="boolean" truevalue="true" falsevalue="false" checked="true" label="Emit WHO drug-resistance and CNV summary TSV" help="Outputs per-isolate WHO antimalarial resistance, CNV, hrp2/3 deletion, and F_WS calls for Pf3D7 cohorts."/>
@@ -154,7 +154,7 @@ focaloop variationloop
                         </param>
                     </when>
                 </conditional>
-                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" optional="true" label="Reference genome FASTA (optional for bundled Pf3D7)" help="Leave empty to use bundled PlasmoDB-54 Pf3D7; provide a FASTA(.gz) for non-Pf3D7 pathogen references."/>
+                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" optional="true" label="Reference genome FASTA (required unless server Pf3D7 reference is configured)" help="Provide a reference FASTA(.gz) from your Galaxy History. Leave empty only when a server-mounted PlasmoDB-54 Pf3D7 reference is configured via FOCALOOP_PF3D7_DIR or S."/>
                 <param argument="--targets-bed" type="data" format="bed" optional="true" label="Custom target regions BED (optional)" help="Optional 0-based BED intervals restricting 31-mer target baiting and variant calling on custom references."/>
                 <param argument="--target-depth" type="float" min="5.0" max="150.0" value="24.0" label="Target median core depth (stop gate)" help="Adaptive streaming halts early once median core depth and breadth stability criteria are satisfied."/>
                 <param argument="--host-depletion" type="boolean" truevalue="" falsevalue="--no-host-depletion" checked="true" label="Enable C 31-mer / PLA host depletion filter" help="Filters non-target/host reads on the fly in C before short-read alignment."/>
@@ -183,7 +183,7 @@ focaloop variationloop
                     </when>
                     <when value="history_bam">
                         <param argument="--bam" type="data" format="bam,cram" label="Aligned reads (BAM or CRAM)" help="Coordinate-sorted BAM or CRAM dataset matching the selected reference FASTA."/>
-                        <param argument="--crai" type="data" format="data" optional="true" label="CRAM/BAM index (.crai or .bai, optional)" help="Optional index dataset; generated automatically if omitted for local datasets."/>
+                        <param argument="--crai" type="data" format="data" optional="true" label="CRAM/BAM index (.crai or .bai, optional)" help="Optional index dataset, generated automatically if omitted for local datasets."/>
                         <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier (VCF SM tag)" help="Sample name written to the VCF SM column and summary table.">
                             <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">[A-Za-z0-9_.-]+</validator>
                         </param>
@@ -211,7 +211,7 @@ focaloop variationloop
             <param argument="--min-bq" type="integer" min="0" max="45" value="13" label="Minimum base quality (Phred)" help="Individual bases below this Phred score are excluded from SNV counts."/>
             <param argument="--snv-min-qual" type="float" min="0.0" max="200.0" value="20.0" label="Minimum SNV Phred QUAL" help="Posterior Phred quality threshold for emitting SNV calls."/>
             <param argument="--indel-min-qual" type="float" min="0.0" max="200.0" value="15.0" label="Minimum Indel Phred QUAL" help="Posterior Phred quality threshold for emitting indel calls."/>
-            <param argument="--dedup-bits" type="integer" min="16" max="24" value="20" label="PCR duplicate filter table size (log2 slots per shard)" help="20 bits = 1,048,576 slots/shard (~8 MB/shard); increase to 24 for deep 35x human WGS."/>
+            <param argument="--dedup-bits" type="integer" min="16" max="24" value="20" label="PCR duplicate filter table size (log2 slots per shard)" help="20 bits = 1,048,576 slots/shard (~8 MB/shard). Increase to 24 for deep 35x human WGS."/>
             <param argument="--sample-timeout" type="float" min="30.0" max="7200.0" value="420.0" label="Per-sample streaming timeout (seconds)" help="Maximum wall time allowed per remote sample fetch or stream."/>
         </section>
     </inputs>

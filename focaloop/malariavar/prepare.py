@@ -14,7 +14,7 @@ import numpy as np
 from . import genome as G
 from . import kernels as Kn
 
-W = Path(os.environ.get("W", "/media/anton/wd4tb/malariavar"))
+W = G.default_work_dir()
 KSET = G.REFDIR / "pf_kset31.u64"
 KSET_BITS = 26
 DUST_MAX = 80

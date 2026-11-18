@@ -193,7 +193,7 @@ class OdpXsra(Source):
 
 
 ODP_URL = "https://sra-pub-run-odp.s3.amazonaws.com/sra/{0}/{0}"
-CRAI_DIR = Path(os.environ.get("S", "/media/anton/hd2/malariavar_staging")) / "data" / "crai"
+CRAI_DIR = G.default_staging_dir() / "data" / "crai"
 # CRAM 3.0 EOF container: htslib's constant, also the last 38 bytes of every complete Sanger Pf8 CRAM
 CRAM_EOF = bytes.fromhex("0f000000ffffffff0fe0454f4600000000010005bdd94f0001000606010001000100ee63014b")
 N_NUCLEAR = 14

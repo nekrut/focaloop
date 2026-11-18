@@ -49,9 +49,8 @@ from . import streamer as ST
 
 import tempfile
 
-_DEFAULT_PF3D7 = Path("/opt/focaloop/pf3d7_ref")
-S = Path(os.environ.get("S") or (str(_DEFAULT_PF3D7) if _DEFAULT_PF3D7.exists() else "/media/anton/hd2/malariavar_staging"))
-W = Path(os.environ.get("W") or tempfile.gettempdir())
+S = G.default_staging_dir()
+W = G.default_work_dir()
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "manifests" / "pf8_cram_24409.parquet"
 CRAI_DIR = S / "data" / "crai"
@@ -947,8 +946,8 @@ def main():
     if a.cmd != "plan":
         for v in ("TMPDIR",):
             val = os.environ.get(v, "")
-            if not (val.startswith(str(W)) or val.startswith("/media/anton/hd2/medvedev_ab")):
-                sys.exit(f"{v} must point into {W} or /media/anton/hd2/medvedev_ab (source env.sh)")
+            if val and not (val.startswith(str(W)) or val.startswith(tempfile.gettempdir())):
+                sys.exit(f"{v} must point into {W} or {tempfile.gettempdir()}")
     {"plan": cmd_plan, "run": cmd_run, "project": cmd_project, "eval": cmd_eval, "queries": cmd_queries}[a.cmd](a)
 
 

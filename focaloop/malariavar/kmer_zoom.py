@@ -14,7 +14,7 @@ import numpy as np
 from . import genome as G
 
 K = 31
-CRAI_DIR = Path(os.environ.get("S", "/media/anton/hd2/malariavar_staging")) / "data" / "crai"
+CRAI_DIR = G.default_staging_dir() / "data" / "crai"
 
 
 def kmer_counts(reads, k=K):

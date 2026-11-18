@@ -494,10 +494,15 @@ def _worker(args):
 
 def load_manifest(path):
     m = pd.read_parquet(path)
-    if "order_hint" in m.columns:  # precomputed (Jetstream2 shard manifests ship without ena_runs.parquet)
+    if "order_hint" in m.columns:  # precomputed (shard manifests ship without ena_runs.parquet)
         return m
-    e = pd.read_parquet(Path(os.environ.get("S", "/media/anton/hd2/malariavar_staging")) / "data" / "ena_runs.parquet",
-                        columns=["run_accession", "submitted_format"]).set_index("run_accession")
+    ena_path = G.default_staging_dir() / "data" / "ena_runs.parquet"
+    if not ena_path.exists():
+        raise FileNotFoundError(
+            f"Missing {ena_path}. Set S or FOCALOOP_PF3D7_DIR to a staging directory containing data/ena_runs.parquet, "
+            "or include an order_hint column in the manifest."
+        )
+    e = pd.read_parquet(ena_path, columns=["run_accession", "submitted_format"]).set_index("run_accession")
     fmt = m.ena_runs.apply(lambda r: [str(e.submitted_format.get(x, "")).split(";")[0] for x in (list(r) if r is not None else [])])
     m["order_hint"] = fmt.apply(lambda f: "flowcell" if f and all(x == "SRF" for x in f) else "sorted")
     return m

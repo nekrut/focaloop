@@ -293,6 +293,10 @@ def verify_pf8_release(rel_dir: Path) -> dict:
 
 
 if __name__ == "__main__":
+    import os
     import sys
-    rel = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/media/anton/hd2/malariavar_staging/data/pf8_release")
+    rel_arg = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PF8_RELEASE_DIR", "")
+    if not rel_arg:
+        sys.exit("Usage: python -m focaloop.malariavar.who_resistance <pf8_release_dir> (or set PF8_RELEASE_DIR)")
+    rel = Path(rel_arg)
     print(json.dumps(verify_pf8_release(rel), indent=2))
