@@ -53,3 +53,20 @@ def test_geneloop_auto_falls_back_cleanly_without_weights(monkeypatch):
     res = runners_geneloop.resolve_execution_mode("auto", "vertebrates", None)
     assert res["effective_mode"] == "fast_evidence"
     assert res["weights_dir"] is None
+
+
+def test_focaloop_query_writes_html_report_for_blueprint_state(tmp_path):
+    from focaloop.ops import run_query
+
+    for fname, contrast, mode in [
+        ("panexpr_state.tar.zst", "treated:control", "auto"),
+        ("malariavar_state.tar.zst", "site=Ghana:Mali", "fst"),
+    ]:
+        state_arc = REPO_ROOT / "tools" / "focaloop" / "test-data" / fname
+        out_tbl = tmp_path / f"{fname}.tsv"
+        out_ver = tmp_path / f"{fname}.json"
+        out_rep = tmp_path / f"{fname}.html"
+        run_query(state_arc, contrast, "agent:test", out_tbl, out_ver, mode=mode, out_report=out_rep)
+        html = out_rep.read_text(encoding="utf-8")
+        assert "0 B" in html
+        assert "Focaloop Query" in html

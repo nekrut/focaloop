@@ -118,6 +118,22 @@ def run_query(state_ref: str | Path, contrast: str, actor: str, out_table: str |
             "blueprint_id": meta.get("blueprint_id"),
         }
         write_json(out_verdict, out)
+        if out_report:
+            from .reports import render_query_report
+
+            vdict = {
+                **verdict.__dict__,
+                "wall_seconds": out["wall_seconds"],
+                "headline_metric": f"{mode}: {clean(d_est):.4g}",
+                "headline_detail": spec,
+            }
+            render_query_report(
+                out_report,
+                engine=str(meta.get("blueprint_id") or meta.get("engine") or mode),
+                contrast_str=contrast,
+                verdict=vdict,
+                table_df=table,
+            )
         if out_state_archive:
             pack_state(state_dir, out_state_archive)
         return out
