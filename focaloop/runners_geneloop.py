@@ -190,6 +190,18 @@ def resolve_execution_mode(
             "gpu_detected": has_gpu,
             "reason": "Auto-detected Tiberius runtime and cached weights (CPU mode)",
         }
+    missing: list[str] = []
+    if not has_runtime:
+        missing.append("Tiberius runtime")
+    if wdir is None:
+        missing.append("Tiberius weights")
+    if not has_gpu:
+        missing.append("usable GPU")
+    reason = (
+        f"Falling back to Fast Evidence + Miniprot ({', '.join(missing)} unavailable)"
+        if missing
+        else "Running Fast Evidence + Miniprot mode cleanly"
+    )
     return {
         "effective_mode": "fast_evidence",
         "skip_tiberius": True,
@@ -198,7 +210,7 @@ def resolve_execution_mode(
         "tiberius_backend": rt.get("backend", "none"),
         "weights_dir": str(wdir) if wdir else None,
         "gpu_detected": has_gpu,
-        "reason": "Tiberius GPU/weights not present; running Fast Evidence + Miniprot mode cleanly",
+        "reason": reason,
     }
 
 

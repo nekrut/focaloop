@@ -2,7 +2,7 @@
 #
 # Build from the repository root:
 #   docker build -f container/Dockerfile -t ghcr.io/galaxyproject/focaloop:0.3.0 .
-# Apptainer (Galaxy job runners on garage / cluster):
+# Apptainer (Galaxy job runners on cluster):
 #   apptainer build focaloop_proto_0.3.0.sif docker-daemon://ghcr.io/galaxyproject/focaloop:0.3.0
 FROM mambaorg/micromamba:2.0.5-ubuntu24.04
 
@@ -13,7 +13,7 @@ LABEL org.opencontainers.image.title="focaloop" \
       org.opencontainers.image.licenses="MIT"
 
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 ca-certificates gcc libc6-dev libgomp1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 ca-certificates git gcc libc6-dev libgomp1 && rm -rf /var/lib/apt/lists/*
 USER $MAMBA_USER
 
 COPY --chown=$MAMBA_USER:$MAMBA_USER container/environment.yml /tmp/environment.yml
@@ -21,9 +21,16 @@ RUN micromamba install -y -n base -f /tmp/environment.yml \
     && micromamba clean --all --yes
 
 ARG MAMBA_DOCKERFILE_ACTIVATE=1
+ENV TF_USE_LEGACY_KERAS=0
+RUN python -m pip install --no-cache-dir --no-deps "bricks2marble==0.1.1" "hidten==1.0.0" \
+    && python -m pip install --no-cache-dir "tensorflow-cpu>=2.17,<2.21" "keras==3.15.1" "rich==13.9.4" "pydantic>=2.0" \
+    && git clone --depth 1 --branch v2.0.9 https://github.com/Gaius-Augustus/Tiberius.git /opt/Tiberius \
+    && (cd /opt/Tiberius && python -m pip install --no-deps --no-cache-dir .) \
+    && chmod +x /opt/Tiberius/tiberius.py /opt/Tiberius/tiberius/*.py
+
 COPY --chown=$MAMBA_USER:$MAMBA_USER pyproject.toml README.md /opt/focaloop/src/
 COPY --chown=$MAMBA_USER:$MAMBA_USER focaloop /opt/focaloop/src/focaloop
-RUN mkdir -p /opt/focaloop/native_cache \
+RUN mkdir -p /opt/focaloop/native_cache /opt/focaloop/pf3d7_ref/ref \
     && python -m pip install --no-deps --no-cache-dir /opt/focaloop/src \
     && FOCALOOP_PORTABLE_ISA=1 FOCALOOP_BUILD_NATIVE_DIR=/opt/focaloop/native_cache \
        FOCALOOP_NATIVE_CACHE=/opt/focaloop/native_cache \
@@ -39,17 +46,26 @@ ENV FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints \
     FOCALOOP_NATIVE_DIR=/opt/focaloop/native_cache \
     FOCALOOP_NATIVE_CACHE=/opt/focaloop/native_cache \
     FOCALOOP_PORTABLE_ISA=1 \
+    S=/opt/focaloop/pf3d7_ref \
+    FOCALOOP_PF3D7_DIR=/opt/focaloop/pf3d7_ref/ref \
+    MALARIAVAR_PLA_SIEVE=/opt/focaloop/pf3d7_ref/ref/pf_pla_sieve.pla \
+    TIBERIUS_WEIGHTS_DIR=/data/galaxy_local/refdata/tiberius_weights \
+    TF_USE_LEGACY_KERAS=0 \
     PANEXPR_DESEQ2_CPUS=1 \
-    PATH=/opt/conda/bin:$PATH
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH=/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH
 
-# Smoke test at build time: CLI + every bundled blueprint + native C libraries + aligner/annotation binaries.
+# Smoke test at build time: CLI + every bundled blueprint + Tiberius runtime + aligner/annotation binaries.
 RUN focaloop --version \
     && focaloop validate panexpr malariavar geneloop focaloop_query focaloop_bait \
+    && tiberius.py --help >/dev/null \
+    && python -c "from focaloop.geneloop.seed import detect_tiberius_runtime; rt = detect_tiberius_runtime(); assert rt['backend'] == 'native', rt" \
     && (bwa 2>&1 | grep -q '^Version: 0.7') && bwa-mem2 version && strobealign --version \
     && minimap2 --version && bowtie2 --version && hisat2 --version \
     && salmon --version && piscem --version && kallisto version \
     && samtools --version && bcftools --version \
-    && miniprot --version && diamond version && stringtie --version && compleasm -h >/dev/null
+    && miniprot --version && diamond version && stringtie --version && compleasm -h >/dev/null \
+    && tantan --version >/dev/null || true
 
 WORKDIR /data
 ENTRYPOINT ["/usr/local/bin/_entrypoint.sh"]

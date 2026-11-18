@@ -147,9 +147,9 @@ focaloop variationloop
                         <param argument="--reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Galaxy History FASTQ files (optional)" help="Optional History FASTQ datasets matched to manifest rows by element identifier or sample_id."/>
                     </when>
                     <when value="history_fq">
-                        <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ/FASTQ.GZ)"/>
-                        <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ/FASTQ.GZ)"/>
-                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier">
+                        <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ/FASTQ.GZ)" help="Forward (R1) FASTQ or FASTQ.GZ dataset from your Galaxy History."/>
+                        <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ/FASTQ.GZ)" help="Reverse (R2) FASTQ or FASTQ.GZ dataset paired with R1."/>
+                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier" help="Sample identifier used in VCF/summary outputs.">
                             <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">[A-Za-z0-9_.-]+</validator>
                         </param>
                     </when>
@@ -175,16 +175,16 @@ focaloop variationloop
                         <option value="manifest">Multi-sample or remote manifest TSV (FASTQ, INSDC, or CRAM+CRAI)</option>
                     </param>
                     <when value="history_fq">
-                        <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ/FASTQ.GZ)"/>
-                        <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ/FASTQ.GZ)"/>
-                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier (VCF SM tag)">
+                        <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ/FASTQ.GZ)" help="Forward (R1) FASTQ or FASTQ.GZ dataset from your Galaxy History."/>
+                        <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ/FASTQ.GZ)" help="Reverse (R2) FASTQ or FASTQ.GZ dataset paired with R1."/>
+                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier (VCF SM tag)" help="Sample name written to the VCF SM column and summary table.">
                             <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">[A-Za-z0-9_.-]+</validator>
                         </param>
                     </when>
                     <when value="history_bam">
-                        <param argument="--bam" type="data" format="bam,cram" label="Aligned reads (BAM or CRAM)"/>
-                        <param argument="--crai" type="data" format="data" optional="true" label="CRAM/BAM index (.crai or .bai, optional)"/>
-                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier (VCF SM tag)">
+                        <param argument="--bam" type="data" format="bam,cram" label="Aligned reads (BAM or CRAM)" help="Coordinate-sorted BAM or CRAM dataset matching the selected reference FASTA."/>
+                        <param argument="--crai" type="data" format="data" optional="true" label="CRAM/BAM index (.crai or .bai, optional)" help="Optional index dataset; generated automatically if omitted for local datasets."/>
+                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier (VCF SM tag)" help="Sample name written to the VCF SM column and summary table.">
                             <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">[A-Za-z0-9_.-]+</validator>
                         </param>
                     </when>
@@ -211,7 +211,7 @@ focaloop variationloop
             <param argument="--min-bq" type="integer" min="0" max="45" value="13" label="Minimum base quality (Phred)" help="Individual bases below this Phred score are excluded from SNV counts."/>
             <param argument="--snv-min-qual" type="float" min="0.0" max="200.0" value="20.0" label="Minimum SNV Phred QUAL" help="Posterior Phred quality threshold for emitting SNV calls."/>
             <param argument="--indel-min-qual" type="float" min="0.0" max="200.0" value="15.0" label="Minimum Indel Phred QUAL" help="Posterior Phred quality threshold for emitting indel calls."/>
-            <param argument="--dedup-bits" type="integer" min="16" max="24" value="20" label="PCR duplicate filter table size (log2 slots per shard)" help="20 bits = 1,048,576 slots/shard (~8 Mb/shard); increase to 24 for deep 35x human WGS."/>
+            <param argument="--dedup-bits" type="integer" min="16" max="24" value="20" label="PCR duplicate filter table size (log2 slots per shard)" help="20 bits = 1,048,576 slots/shard (~8 MB/shard); increase to 24 for deep 35x human WGS."/>
             <param argument="--sample-timeout" type="float" min="30.0" max="7200.0" value="420.0" label="Per-sample streaming timeout (seconds)" help="Maximum wall time allowed per remote sample fetch or stream."/>
         </section>
     </inputs>
@@ -362,7 +362,7 @@ focaloop variationloop
 Choose the analysis mode matching your biological question and data source:
 
 - **Focused CRAM range surveillance (`focused_cram`)**:
-  Reads only the `.crai` container index and fetches the byte ranges overlapping either the 55 curated *Plasmodium falciparum* drug-resistance/CNV/*hrp2/3* barcode windows (when using the bundled Pf3D7 reference) or your custom BED intervals. Ideal for large remote CRAM surveillance cohorts (~20 Mb transferred per 1.5 Gb CRAM) or targeted clinical panels.
+  Reads only the `.crai` container index and fetches the byte ranges overlapping either the 55 curated *Plasmodium falciparum* drug-resistance/CNV/*hrp2/3* barcode windows (when using the bundled Pf3D7 reference) or your custom BED intervals. Ideal for large remote CRAM surveillance cohorts (~20 MB transferred per 1.5 GB CRAM) or targeted clinical panels.
 - **Pathogen WGS adaptive streaming with host depletion (`wgs_stream`)**:
   Streams raw INSDC (`ERR`/`SRR`) runs, HTTP FASTQ URLs, or History FASTQs through an inline C 31-mer / PLA host-depletion filter that strips host/off-target reads in memory before mapping, halting automatically once the adaptive stop gate reaches target core depth and breadth stability.
 - **Diploid human / eukaryotic VariationLoop (`diploid_wgs`)**:

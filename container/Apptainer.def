@@ -1,7 +1,7 @@
 Bootstrap: docker
 From: mambaorg/micromamba:2.0.5-ubuntu24.04
 
-# Build from repository root (no Docker daemon or public registry push required):
+# Build from repository root (with optional staged cluster assets under $PWD/cluster_assets/):
 #   APPTAINER_TMPDIR=/tmp apptainer build focaloop_proto_0.3.0.sif container/Apptainer.def
 
 %files
@@ -16,29 +16,97 @@ From: mambaorg/micromamba:2.0.5-ubuntu24.04
     blueprints/focaloop_bait/blueprint.focaloop.yml /opt/focaloop/blueprints/focaloop_bait/blueprint.focaloop.yml
 
 %environment
-    export PATH=/opt/conda/bin:$PATH
-    export FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints
-    export FOCALOOP_NATIVE_DIR=/opt/focaloop/native_cache
-    export FOCALOOP_NATIVE_CACHE=/opt/focaloop/native_cache
-    export FOCALOOP_PORTABLE_ISA=1
-    export FOCALOOP_PF3D7_FASTA=/opt/focaloop/ref/Pf3D7.fasta
-    export FOCALOOP_PLA_SIEVE=/opt/focaloop/ref/pf_pla_sieve.pla
-    export PANEXPR_DESEQ2_CPUS=1
+    export PATH="/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH"
+    export FOCALOOP_BLUEPRINT_PATH="/opt/focaloop/blueprints"
+    export FOCALOOP_NATIVE_DIR="/opt/focaloop/native_cache"
+    export FOCALOOP_NATIVE_CACHE="/opt/focaloop/native_cache"
+    export FOCALOOP_PORTABLE_ISA="1"
+    export S="/opt/focaloop/pf3d7_ref"
+    export FOCALOOP_PF3D7_DIR="/opt/focaloop/pf3d7_ref/ref"
+    export MALARIAVAR_PLA_SIEVE="/opt/focaloop/pf3d7_ref/ref/pf_pla_sieve.pla"
+    export TIBERIUS_WEIGHTS_DIR="/data/galaxy_local/refdata/tiberius_weights"
+    export TF_USE_LEGACY_KERAS="0"
+    export PANEXPR_DESEQ2_CPUS="1"
+    export PYTHONDONTWRITEBYTECODE="1"
 
 %post
     set -eux
     apt-get update && apt-get install -y --no-install-recommends \
-        iproute2 ca-certificates gcc libc6-dev libgomp1 \
+        iproute2 ca-certificates git gcc libc6-dev libgomp1 \
         && rm -rf /var/lib/apt/lists/*
+    export MAMBA_ROOT_PREFIX=/opt/conda
     micromamba install -y -n base -f /opt/focaloop/environment.yml
     micromamba clean --all --yes
-    export PATH=/opt/conda/bin:$PATH
-    mkdir -p /opt/focaloop/native_cache /opt/focaloop/ref
+    export PATH="/opt/conda/bin:$PATH"
+
+    # Optional cluster-staged external binaries & Pf3D7 reference assets if mounted under /opt/focaloop/stage
+    if [ -x /opt/focaloop/stage/bin_extra/piscem ]; then
+        cp -f /opt/focaloop/stage/bin_extra/piscem /opt/conda/bin/piscem
+        chmod 0755 /opt/conda/bin/piscem
+    fi
+    if [ -x /opt/focaloop/stage/bin_extra/xsra ]; then
+        cp -f /opt/focaloop/stage/bin_extra/xsra /opt/conda/bin/xsra
+        chmod 0755 /opt/conda/bin/xsra
+    fi
+    if [ -x /opt/focaloop/stage/themisto ]; then
+        mkdir -p /opt/themisto
+        cp -f /opt/focaloop/stage/themisto /opt/themisto/themisto
+        chmod 0755 /opt/themisto/themisto
+        printf '#!/bin/sh\nLD_LIBRARY_PATH=/opt/conda/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec /opt/themisto/themisto "$@"\n' > /opt/conda/bin/themisto
+        chmod 0755 /opt/conda/bin/themisto
+    fi
+
+    # Install CPU TensorFlow + Tiberius v2.0.9 runtime (--no-deps on bricks2marble/hidten to avoid PyPI CUDA wheels)
+    export TF_USE_LEGACY_KERAS="0"
+    python -m pip install --no-cache-dir --no-deps "bricks2marble==0.1.1" "hidten==1.0.0"
+    python -m pip install --no-cache-dir "tensorflow-cpu>=2.17,<2.21" "keras==3.15.1" "rich==13.9.4" "pydantic>=2.0"
+    if [ -d /opt/focaloop/stage/Tiberius ]; then
+        cp -a /opt/focaloop/stage/Tiberius /opt/Tiberius
+    else
+        git clone --depth 1 --branch v2.0.9 https://github.com/Gaius-Augustus/Tiberius.git /opt/Tiberius \
+            || git clone --depth 1 https://github.com/Gaius-Augustus/Tiberius.git /opt/Tiberius
+    fi
+    (cd /opt/Tiberius && python -m pip install --no-deps --no-cache-dir .)
+    chmod +x /opt/Tiberius/tiberius.py /opt/Tiberius/tiberius/*.py
+
+    mkdir -p /opt/focaloop/native_cache /opt/focaloop/pf3d7_ref/ref
     python -m pip install --no-deps --no-cache-dir /opt/focaloop/src
+
     # Portable -O3 -msse4.2 -mpopcnt so mixed Slurm partitions (Ivy Bridge + Cascade Lake) never SIGILL
-    FOCALOOP_PORTABLE_ISA=1 FOCALOOP_BUILD_NATIVE_DIR=/opt/focaloop/native_cache \
-        FOCALOOP_NATIVE_CACHE=/opt/focaloop/native_cache \
-        python -c "from focaloop.galaxy_runners import prebuild_all_native_libs; print(prebuild_all_native_libs())"
-    chmod -R a+rX /opt/focaloop /opt/conda
+    export FOCALOOP_PORTABLE_ISA="1"
+    export FOCALOOP_BUILD_NATIVE_DIR="/opt/focaloop/native_cache"
+    export FOCALOOP_NATIVE_CACHE="/opt/focaloop/native_cache"
+    export FOCALOOP_NATIVE_DIR="/opt/focaloop/native_cache"
+    export FOCALOOP_BLUEPRINT_PATH="/opt/focaloop/blueprints"
+    export S="/opt/focaloop/pf3d7_ref"
+    export FOCALOOP_PF3D7_DIR="/opt/focaloop/pf3d7_ref/ref"
+    export MALARIAVAR_PLA_SIEVE="/opt/focaloop/pf3d7_ref/ref/pf_pla_sieve.pla"
+    export PATH="/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH"
+    export NUMBA_CACHE_DIR="/tmp/build_numba_cache"
+
+    python -c "
+from focaloop.galaxy_runners import prebuild_all_native_libs
+libs = prebuild_all_native_libs()
+print('Native libs count:', len(libs), sorted(libs))
+"
+    if [ -f /opt/focaloop/pf3d7_ref/ref/Pf3D7_v54.fa ]; then
+        python -c "
+from focaloop.malariavar import genome as G, prepare as P
+g = G.load()
+print('Pf3D7 genome loaded: L=', g.L)
+meta = P.build_pla_sieve(num_threads=8)
+print('PLA depletion built:', meta['total_mb'], 'MB')
+"
+        bwa index /opt/focaloop/pf3d7_ref/ref/Pf3D7_v54.fa
+        bwa-mem2 index /opt/focaloop/pf3d7_ref/ref/Pf3D7_v54.fa
+    fi
+    rm -rf /tmp/build_numba_cache
+    chmod -R a+rX /opt/focaloop /opt/conda /opt/Tiberius
+
     focaloop --version
-    FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints focaloop validate panexpr malariavar geneloop focaloop_query focaloop_bait
+    focaloop validate panexpr malariavar geneloop focaloop_query focaloop_bait
+    tiberius.py --help >/dev/null
+    python -c "from focaloop.geneloop.seed import detect_tiberius_runtime; rt = detect_tiberius_runtime(); assert rt['backend'] == 'native', rt"
+
+%runscript
+    exec focaloop "$@"

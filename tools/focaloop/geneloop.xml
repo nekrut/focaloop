@@ -187,10 +187,10 @@ focaloop geneloop
             </when>
             <when value="combined">
                 <param argument="--rna-manifest" type="data" format="tabular,txt" optional="true" label="INSDC RNA-seq run manifest (optional)" help="Optional TSV/CSV or one-per-line list of SRR/ERR/DRR accessions."/>
-                <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz" optional="true" label="Paired-end FASTQ collection (optional)"/>
-                <param argument="--long-reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" optional="true" label="Long-read FASTQ datasets (optional)"/>
-                <param argument="--short-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned short-read BAMs (optional)"/>
-                <param argument="--long-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned long-read BAMs (optional)"/>
+                <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz" optional="true" label="Paired-end FASTQ collection (optional)" help="Optional Galaxy list-of-pairs short-read RNA-seq collection."/>
+                <param argument="--long-reads" type="data" format="fastqsanger,fastqsanger.gz" multiple="true" optional="true" label="Long-read FASTQ datasets (optional)" help="Optional full-length cDNA or direct-RNA long-read FASTQ(.gz) datasets."/>
+                <param argument="--short-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned short-read BAMs (optional)" help="Optional coordinate-sorted short-read RNA-seq BAM datasets."/>
+                <param argument="--long-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned long-read BAMs (optional)" help="Optional coordinate-sorted long-read RNA-seq BAM datasets."/>
             </when>
             <when value="none"/>
         </conditional>

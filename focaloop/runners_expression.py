@@ -519,6 +519,8 @@ def run_expressionloop_galaxy(
         org_mode = _detect_organism_mode(p_gtf, organism_mode)
 
         specs = [AssemblySpec(primary_label, p_fna, p_gtf)]
+        if bool(secondary_fasta) ^ bool(secondary_gtf):
+            raise ValueError("Both --secondary-fasta and --secondary-gtf must be provided together.")
         if secondary_fasta and secondary_gtf:
             s_fna = _gunzip_if_needed(secondary_fasta, refs_dir, f"{secondary_label}.fna")
             s_ext = ".gff3" if str(secondary_gtf).endswith((".gff", ".gff3", ".gff.gz", ".gff3.gz")) else ".gtf"

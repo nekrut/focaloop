@@ -664,6 +664,7 @@ def run_tiberius(
         "TMPDIR": str(tmp),
         "HOME": str(tmp),
         "TF_CPP_MIN_LOG_LEVEL": "2",
+        "TF_USE_LEGACY_KERAS": "0",
     }
     if cpu_only:
         onednn = "0" if model_cfg == "vertebrates" else "1"
