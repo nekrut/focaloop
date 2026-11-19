@@ -653,9 +653,7 @@ def run_tiberius(
         )
 
     ru_json = out_dir / f"tiberius_{tag}.rusage.json"
-    import tempfile
-
-    base_tmp = Path(os.environ.get("TMPDIR", str(out_dir / ".tib_tmp")))
+    base_tmp = out_dir / ".tib_tmp"
     base_tmp.mkdir(parents=True, exist_ok=True)
     tmp = base_tmp / f"tib_{tag}_{os.getpid()}_{threading.get_ident()}"
     tmp.mkdir(parents=True, exist_ok=True)
