@@ -270,13 +270,21 @@ def test_expressionloop_xml_structure_help_testdata_and_no_sieve_wording() -> No
     assert tags[:2] == expected_prefix
     assert tags.index("command") < tags.index("inputs") < tags.index("outputs") < tags.index("tests") < tags.index("help")
 
-    # Every input parameter name/argument appears in command (parameter parity)
+    # Every input parameter name/argument appears in command or configfiles (parameter parity)
+    cf_text = "\n".join(cf.text or "" for cf in root.findall("configfiles/configfile"))
+    template_text = cmd_text + "\n" + cf_text
     inputs_el = root.find("inputs")
     assert inputs_el is not None
     for p in inputs_el.iter("param"):
         pname = p.get("name") or (p.get("argument") or "").lstrip("-").replace("-", "_")
         assert pname, f"Param missing name/argument: {ET.tostring(p, encoding='unicode')}"
-        assert re.search(r"\b" + re.escape(pname) + r"\b", cmd_text), f"Orphaned param {pname!r}"
+        assert re.search(r"\b" + re.escape(pname) + r"\b", template_text), f"Orphaned param {pname!r}"
+
+    # Inline condition-group + accession builder present under manifest_insdc
+    cf_names = {cf.get("name") for cf in root.findall("configfiles/configfile")}
+    assert "inline_manifest_tsv" in cf_names
+    assert "$inline_manifest_tsv" in cmd_text
+    assert "$input_source.insdc_input.condition_groups" in cf_text
 
     # Every test declares expect_num_outputs and references < 1 MB test-data
     tests_el = root.find("tests")
@@ -309,3 +317,105 @@ def test_expressionloop_xml_structure_help_testdata_and_no_sieve_wording() -> No
             # Internal PanExpr LoopConfig kwargs only
             continue
         assert "siev" not in line.lower(), f"Forbidden wording in runners_expression.py: {line}"
+
+
+def test_panexpr_html_report_tournament_keys_contrast_and_logan_layout(tmp_path: Path) -> None:
+    from focaloop.reports import render_panexpr_report
+
+    de_df = pd.DataFrame(
+        [
+            {
+                "gene_id": "G1",
+                "gene_name": "entFM",
+                "ortholog_bridge": "",
+                "baseMean": 410.2,
+                "log2FoldChange": 1.37,
+                "lfcSE_total": 0.24,
+                "pvalue": 0.0002,
+                "padj": 0.004,
+                "placement_var_frac": 0.01,
+                "zoomed": False,
+                "status": "sig",
+            }
+        ]
+    )
+    sample_rows = [
+        {"sample_id": "s1", "condition": "glucose", "layout": "PE", "bytes_read_mb": 45.2, "bytes_pct": 3.5, "mapped_reads": 900000}
+    ]
+    cat_summary = {"primary_assembly": "primary", "assemblies": ["primary"], "n_groups": 5000, "n_targets": 5000}
+
+    # Case 1: Tournament mode using exact KernelScore.as_dict() keys
+    html_tourn = tmp_path / "tourn.html"
+    render_panexpr_report(
+        html_tourn,
+        contrast_str="condition:glucose:control",
+        winner="bwa_spa",
+        scoreboard=[
+            {
+                "kernel": "bwa_spa",
+                "optimality_score": 0.912,
+                "overall_synthetic_recall_pct": 98.4,
+                "mate_tie_symmetry": 0.996,
+                "real_mapped_pct": 94.3,
+                "reads_per_sec": 31200.0,
+            },
+            {
+                "kernel": "strobealign",
+                "optimality_score": 0.101,
+                "overall_synthetic_recall_pct": 0.0,
+                "mate_tie_symmetry": 1.0,
+                "real_mapped_pct": 0.0,
+                "reads_per_sec": 85000.0,
+            },
+        ],
+        per_sample_rows=sample_rows,
+        catalog_summary=cat_summary,
+        loop_summary={
+            "source_mode": "sra_odp",
+            "tournament_reads": 25000,
+            "stop_reason": "converged_tech_var_below_bio_var",
+            "iterations": 3,
+            "wall_seconds": 120.5,
+            "assembly_prior": {"primary": 1.0},
+            "telemetry": [
+                {"iteration": 1, "bytes_pct": 2.0, "max_delta_lfc": 0.4, "median_v_tech_ratio": 0.6, "n_sig": 12},
+                {"iteration": 2, "bytes_pct": 5.0, "max_delta_lfc": 0.04, "median_v_tech_ratio": 0.18, "n_sig": 20},
+            ],
+        },
+        de_df=de_df,
+    )
+    txt_t = html_tourn.read_text(encoding="utf-8")
+    assert ".hero code {" in txt_t
+    assert "0.912" in txt_t and "98.4%" in txt_t and "0.996" in txt_t and "94.3%" in txt_t and "31,200" in txt_t
+    assert "Converged (low technical noise)" in txt_t
+    assert "primary: 100.0%" in txt_t
+    assert "{'primary': 1.0}" not in txt_t
+
+    # Case 2: Logan unitigs mode omits empty tournament table & iterative telemetry placeholder
+    html_logan = tmp_path / "logan.html"
+    render_panexpr_report(
+        html_logan,
+        contrast_str="condition:glucose:control",
+        winner="logan_bwa_spa",
+        scoreboard=[],
+        per_sample_rows=sample_rows,
+        catalog_summary=cat_summary,
+        loop_summary={
+            "source_mode": "logan_unitigs",
+            "wire_reduction_x": 28.9,
+            "stop_reason": "LOGAN_UNITIGS_COMPLETE",
+            "iterations": 1,
+            "wall_seconds": 62.5,
+            "assembly_prior": {"primary": 1.0},
+            "telemetry": [],
+        },
+        de_df=de_df,
+    )
+    txt_l = html_logan.read_text(encoding="utf-8")
+    assert "Logan unitigs complete" in txt_l
+    assert "28.9x smaller" in txt_l
+    assert "No iterative telemetry points recorded." not in txt_l
+    assert "Stage 1 — Streaming Engine Selection" in txt_l
+    assert "primary: 100.0%" in txt_l
+    assert "{'primary': 1.0}" not in txt_l
+    assert "sieve" not in txt_l.lower()

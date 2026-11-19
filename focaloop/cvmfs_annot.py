@@ -57,12 +57,14 @@ def _norm_token(val: str) -> str:
 
 
 def read_fasta_contig_lengths(fasta_path: str | Path) -> dict[str, int]:
-    """Return ``{contig_name: length_bp}`` using nearby ``.fai`` indexes first, else streaming FASTA."""
+    """Return ``{contig_name: length_bp}`` using nearby ``.fai`` / ``.len`` indexes first, else streaming FASTA."""
     fp = Path(fasta_path)
     fai_candidates = [
         Path(str(fp) + ".fai"),
+        fp.parent.parent / "len" / f"{fp.stem}.len",
         fp.parent.parent / "sam_index" / f"{fp.name}.fai",
         fp.parent.parent / "sam_index" / f"{fp.stem}.fa.fai",
+        fp.parent.parent / "sam_fasta_index" / "v1" / fp.stem / f"{fp.name}.fai",
     ]
     for fai in fai_candidates:
         try:
@@ -163,11 +165,15 @@ def infer_species_from_cached_meta(
         out["ncbi_accession_hint"] = m_acc.group(1).upper()
 
     # 2. Match against UCSC genome catalog (handles hg38, hg38canon, dm6, sacCer3, mm10, etc.)
-    if ucsc_genomes is None:
-        try:
-            ucsc_genomes = fetch_ucsc_genomes()
-        except Exception:
-            ucsc_genomes = {}
+    # Skip UCSC catalog lookup when the build key is explicitly an NCBI GCF_/GCA_ accession (e.g. BRC CVMFS).
+    if not (dbk.upper().startswith(("GCF_", "GCA_")) and val.upper().startswith(("GCF_", "GCA_"))):
+        if ucsc_genomes is None:
+            try:
+                ucsc_genomes = fetch_ucsc_genomes()
+            except Exception:
+                ucsc_genomes = {}
+    elif ucsc_genomes is None:
+        ucsc_genomes = {}
 
     stripped_val = re.sub(r"(?:canon|full|female|male|chrUn|hap|patch\d*)$", "", val, flags=re.IGNORECASE)
     for cand in (dbk, val, stripped_val):
@@ -553,29 +559,49 @@ def _list_ncbi_assembly_versions(base_acc: str) -> list[tuple[int, str, str]]:
     return sorted(found.values(), key=lambda x: (x[0], x[1]), reverse=True)
 
 
-def _discover_candidate_gcf_bases(meta: dict[str, str], max_candidates: int = 5) -> list[tuple[str, str]]:
-    """Return ordered ``[(GCF_base, full_latest_acc)]`` candidates for a cached genome."""
+def _discover_candidate_gcf_bases(
+    meta: dict[str, str],
+    max_candidates: int = 5,
+    *,
+    include_taxon_search: bool = True,
+) -> list[tuple[str, str]]:
+    """Return ordered ``[(acc_base, full_latest_acc)]`` candidates for a cached genome.
+
+    Prefers RefSeq (``GCF_``) because it carries curated gene annotations, while retaining
+    the original GenBank (``GCA_``) accession as a secondary fallback for BRC GenBank-only
+    assemblies that host GenBank GFF3 files without a paired RefSeq release.
+    """
     import urllib.parse
 
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
 
-    def _add(acc: str) -> None:
+    def _add(acc: str, *, allow_gca_fallback: bool = False) -> None:
         a = acc.strip().upper()
         if not _NCBI_ACC_RE.match(a):
             return
         if a.startswith("GCA_"):
-            a = "GCF_" + a[4:]
+            gcf = "GCF_" + a[4:]
+            gcf_base = gcf.split(".")[0]
+            if gcf_base not in seen:
+                seen.add(gcf_base)
+                out.append((gcf_base, gcf))
+            if allow_gca_fallback:
+                gca_base = a.split(".")[0]
+                if gca_base not in seen:
+                    seen.add(gca_base)
+                    out.append((gca_base, a))
+            return
         base = a.split(".")[0]
         if base not in seen:
             seen.add(base)
             out.append((base, a))
 
     if meta.get("ncbi_accession_hint"):
-        _add(meta["ncbi_accession_hint"])
+        _add(meta["ncbi_accession_hint"], allow_gca_fallback=True)
 
     species = meta.get("species_name", "").strip()
-    if species:
+    if include_taxon_search and species:
         encoded = urllib.parse.quote(species, safe="")
         url = f"{_NCBI_DATASETS_API}/taxon/{encoded}/dataset_report"
         params = {
@@ -689,8 +715,10 @@ def _try_ncbi_refseq_gff(
     min_gene_frac: float = 0.80,
     log: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
-    """Find exact-length matching NCBI RefSeq assembly, download GFF3, and remap contigs."""
-    cands = _discover_candidate_gcf_bases(meta)
+    """Find exact-length matching NCBI RefSeq (or GenBank fallback) assembly, download GFF3, and remap contigs."""
+    hint_cands = _discover_candidate_gcf_bases(meta, include_taxon_search=False) if meta.get("ncbi_accession_hint") else []
+    cands = list(hint_cands) if hint_cands else _discover_candidate_gcf_bases(meta, include_taxon_search=True)
+    taxon_searched = not bool(hint_cands)
     if not cands:
         return None, (
             f"Could not map built-in genome ({meta.get('species_name') or 'unknown organism'}) "
@@ -699,51 +727,63 @@ def _try_ncbi_refseq_gff(
 
     best_match: dict[str, Any] | None = None
     diagnostics: list[str] = []
+    tried_bases: set[str] = set()
 
-    for base_acc, latest_acc in cands:
-        versions = _list_ncbi_assembly_versions(base_acc)
-        if not versions:
-            continue
-        for ver_num, asm_dir, base_url in versions:
-            rep_url = f"{base_url}/{asm_dir}_assembly_report.txt"
-            try:
-                rep_txt = _fetch_text(rep_url, timeout=20.0, retries=2)
-            except Exception:
+    def _scan_candidates(cand_list: list[tuple[str, str]]) -> None:
+        nonlocal best_match
+        for base_acc, latest_acc in cand_list:
+            if base_acc in tried_bases:
                 continue
-            rows = _parse_assembly_report(rep_txt)
-            if not rows:
+            tried_bases.add(base_acc)
+            versions = _list_ncbi_assembly_versions(base_acc)
+            if not versions:
                 continue
-            cmap, bp_frac, ctg_frac, mm = _build_exact_contig_map(rows, fasta_lengths)
-            if bp_frac < min_bp_frac:
-                if mm and len(diagnostics) < 3:
-                    diagnostics.append(f"{latest_acc}: {mm[0]}")
-                continue
+            for ver_num, asm_dir, base_url in versions:
+                rep_url = f"{base_url}/{asm_dir}_assembly_report.txt"
+                try:
+                    rep_txt = _fetch_text(rep_url, timeout=20.0, retries=2)
+                except Exception:
+                    continue
+                rows = _parse_assembly_report(rep_txt)
+                if not rows:
+                    continue
+                cmap, bp_frac, ctg_frac, mm = _build_exact_contig_map(rows, fasta_lengths)
+                if bp_frac < min_bp_frac:
+                    if mm and len(diagnostics) < 3:
+                        diagnostics.append(f"{latest_acc}: {mm[0]}")
+                    continue
 
-            gff_url = f"{base_url}/{asm_dir}_genomic.gff.gz"
-            if not _url_exists(gff_url):
-                diagnostics.append(
-                    f"{asm_dir} matches contig lengths ({100.0 * bp_frac:.1f}% bp) but NCBI no longer hosts its GFF3 "
-                    f"(latest annotated RefSeq revision is {latest_acc})"
-                )
-                continue
+                gff_url = f"{base_url}/{asm_dir}_genomic.gff.gz"
+                if not _url_exists(gff_url):
+                    diagnostics.append(
+                        f"{asm_dir} matches contig lengths ({100.0 * bp_frac:.1f}% bp) but NCBI no longer hosts its GFF3 "
+                        f"(latest annotated RefSeq revision is {latest_acc})"
+                    )
+                    continue
 
-            score = (round(bp_frac, 6), round(ctg_frac, 6), ver_num)
-            if best_match is None or score > best_match["score"]:
-                best_match = {
-                    "score": score,
-                    "asm_dir": asm_dir,
-                    "base_url": base_url,
-                    "gff_url": gff_url,
-                    "accession": asm_dir.split("_", 2)[0] + "_" + asm_dir.split("_", 2)[1],
-                    "contig_map": cmap,
-                    "bp_frac": bp_frac,
-                    "ctg_frac": ctg_frac,
-                }
-            # Perfect 100% bp & 100% contig match on newest revision -> stop early
-            if bp_frac >= 0.999999 and ctg_frac >= 0.999999:
+                score = (round(bp_frac, 6), round(ctg_frac, 6), ver_num)
+                if best_match is None or score > best_match["score"]:
+                    best_match = {
+                        "score": score,
+                        "asm_dir": asm_dir,
+                        "base_url": base_url,
+                        "gff_url": gff_url,
+                        "accession": asm_dir.split("_", 2)[0] + "_" + asm_dir.split("_", 2)[1],
+                        "contig_map": cmap,
+                        "bp_frac": bp_frac,
+                        "ctg_frac": ctg_frac,
+                    }
+                # Perfect 100% bp & 100% contig match on newest revision -> stop early
+                if bp_frac >= 0.999999 and ctg_frac >= 0.999999:
+                    break
+            if best_match is not None and best_match["bp_frac"] >= 0.999999 and best_match["ctg_frac"] >= 0.999999:
                 break
-        if best_match is not None and best_match["bp_frac"] >= 0.999999 and best_match["ctg_frac"] >= 0.999999:
-            break
+
+    _scan_candidates(cands)
+    if best_match is None and not taxon_searched and meta.get("species_name"):
+        more_cands = _discover_candidate_gcf_bases(meta, include_taxon_search=True)
+        cands = more_cands or cands
+        _scan_candidates(more_cands)
 
     if best_match is None:
         detail = (" Details: " + " | ".join(diagnostics[:3])) if diagnostics else ""

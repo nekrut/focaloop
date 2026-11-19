@@ -44,7 +44,13 @@ focaloop expressionloop
             --auto-expand-taxon '${str($secondary_reference.auto_expand.auto_expand_taxon).strip()}'
         #end if
     #end if
-    --manifest '$input_source.manifest'
+    #if str($input_source.source_type) == "manifest_insdc" and str($input_source.insdc_input.mode) == "inline"
+        --manifest '$inline_manifest_tsv'
+    #elif str($input_source.source_type) == "manifest_insdc"
+        --manifest '$input_source.insdc_input.manifest'
+    #else
+        --manifest '$input_source.manifest'
+    #end if
     #if str($input_source.source_type) == "history_paired"
         --reads-r1
         #for $pair in $input_source.paired_reads
@@ -158,6 +164,19 @@ focaloop expressionloop
 #end if
 #end for
 ]]]></configfile>
+        <configfile name="inline_manifest_tsv"><![CDATA[#if str($input_source.source_type) == "manifest_insdc" and str($input_source.insdc_input.mode) == "inline"
+sample_id	condition	run_or_url
+#for $grp in $input_source.insdc_input.condition_groups
+#set $gname = str($grp.group_name).strip()
+#set $raw_accs = str($grp.accessions).replace('__cn__', ' ').replace('__cr__', ' ').replace('__tt__', ' ').replace(',', ' ').replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+#for $acc in $raw_accs.split()
+#set $a = $acc.strip().upper()
+#if $a
+${a}	${gname}	${a}
+#end if
+#end for
+#end for
+#end if]]></configfile>
     </configfiles>
     <inputs>
         <conditional name="ref_source">
@@ -201,7 +220,7 @@ focaloop expressionloop
             <param name="source_type" type="select" label="RNA-seq read source" help="Analyze FASTQ files already in your Galaxy History, or stream public SRA/ENA run accessions and remote URLs on demand.">
                 <option value="history_paired" selected="true">Galaxy History paired-end collection (list:paired) and sample sheet</option>
                 <option value="history_single">Galaxy History single-end FASTQ files and sample sheet</option>
-                <option value="manifest_insdc">Public SRA/ENA accessions or remote FASTQ URLs (TSV/CSV manifest)</option>
+                <option value="manifest_insdc">Public SRA/ENA accessions or remote FASTQ URLs</option>
             </param>
             <when value="history_paired">
                 <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Paired-end FASTQ collection (list:paired)" help="Galaxy list-of-pairs collection where each pair's element identifier matches sample_id in the sample sheet."/>
@@ -212,8 +231,35 @@ focaloop expressionloop
                 <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Sample sheet (TSV or CSV)" help="Table with required columns sample_id and condition (plus optional run_or_url or covariates such as batch)."/>
             </when>
             <when value="manifest_insdc">
-                <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Sample manifest (TSV or CSV)" help="Table with required columns sample_id, condition, and run_or_url (public run accession or HTTPS FASTQ URL), plus optional mate2_url, layout, and covariates."/>
-                <param argument="--logan-mode" type="select" label="Pre-assembled Logan unitig streaming" help="When all runs in your manifest are public SRA/ENA accessions available in the public Logan archive, ExpressionLoop can stream compact pre-assembled unitig graphs (~15-35x smaller than raw FASTQ files) and quantify gene expression directly via operon-aware equivalence-class EM.">
+                <conditional name="insdc_input">
+                    <param name="mode" type="select" label="How to specify public runs and experimental groups" help="Provide a TSV or CSV manifest from your Galaxy History (supports extra covariates such as batch and custom remote HTTPS FASTQ URLs), or type experimental groups and public SRA/ENA run accessions directly into the form.">
+                        <option value="manifest" selected="true">Sample manifest from Galaxy History (TSV or CSV)</option>
+                        <option value="inline">Enter condition groups and run accessions directly (inline builder)</option>
+                    </param>
+                    <when value="manifest">
+                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Sample manifest (TSV or CSV)" help="Table with required columns sample_id, condition, and run_or_url (public run accession or HTTPS FASTQ URL), plus optional mate2_url, layout, and covariates."/>
+                    </when>
+                    <when value="inline">
+                        <repeat name="condition_groups" title="Experimental condition group" min="2" default="2" help="Define at least two experimental condition groups (for example, treated and control) and list the public SRA/ENA run accessions belonging to each group. Make sure Primary differential expression contrast below uses these exact group names (for example, condition:treated:control).">
+                            <param name="group_name" type="text" value="" label="Condition group name" help="Short group label used in your differential expression contrast (letters, digits, underscores, dots, or hyphens only, for example treated or control).">
+                                <validator type="empty_field" message="Enter a condition group name (for example, treated or control)."/>
+                                <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only.">^[A-Za-z0-9_.-]+$</validator>
+                            </param>
+                            <param name="accessions" type="text" area="true" value="" label="Public SRA/ENA run accessions" help="Enter one or more public SRA/ENA run accessions (SRR, ERR, or DRR prefix) separated by newlines, spaces, or commas.">
+                                <sanitizer invalid_char="">
+                                    <valid initial="string.ascii_letters,string.digits,string.whitespace">
+                                        <add value=","/>
+                                        <add value="_"/>
+                                        <add value="-"/>
+                                    </valid>
+                                </sanitizer>
+                                <validator type="empty_field" message="Enter at least one public SRA/ENA run accession for this condition group."/>
+                                <validator type="regex" message="Enter public SRA/ENA run accessions (SRR, ERR, or DRR prefix) separated by newlines, spaces, or commas.">^[\s,]*[SEDeds][Rr][Rr][0-9]{5,}(?:[\s,]+[SEDeds][Rr][Rr][0-9]{5,})*[\s,]*$</validator>
+                            </param>
+                        </repeat>
+                    </when>
+                </conditional>
+                <param argument="--logan-mode" type="select" label="Pre-assembled Logan unitig streaming" help="When all runs in your manifest or inline groups are public SRA/ENA accessions available in the public Logan archive, ExpressionLoop can stream compact pre-assembled unitig graphs (~15-35x smaller than raw FASTQ files) and quantify gene expression directly via operon-aware equivalence-class EM.">
                     <option value="auto" selected="true">Automatic (use Logan unitigs when all runs are available, fall back to raw reads otherwise)</option>
                     <option value="logan_only">Logan unitigs only (require pre-assembled Logan graphs for all runs)</option>
                     <option value="off">Off (stream raw partial FASTQ/SRA slices only)</option>
@@ -596,7 +642,7 @@ The `.focaloop.tar.zst` archive stores the transcript catalog, per-sample gene a
 |---|---|---|
 | Paired-end FASTQs in your Galaxy History | **Galaxy History paired-end collection (list:paired)** | A `list:paired` collection plus a sample sheet TSV matching collection IDs |
 | Single-end FASTQs in your Galaxy History | **Galaxy History single-end FASTQ files** | Selected FASTQ(.gz) datasets plus a sample sheet TSV matching dataset names |
-| Public SRA/ENA runs or remote HTTPS FASTQs | **Public SRA/ENA accessions or remote FASTQ URLs** | One TSV/CSV manifest listing samples, conditions, and run accessions or URLs |
+| Public SRA/ENA runs or remote HTTPS FASTQs | **Public SRA/ENA accessions or remote FASTQ URLs** | Either upload a TSV/CSV manifest or type condition groups and run accessions directly into the inline builder |
 
 -----
 

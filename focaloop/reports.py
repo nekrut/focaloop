@@ -41,16 +41,19 @@ _BASE_CSS = """
   }
   .hero h1 { margin: 0 0 6px 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
   .hero p { margin: 0; color: #cbd5e1; font-size: 13.5px; }
+  .hero code { background: rgba(255, 255, 255, 0.16); color: #f8fafc; padding: 2px 6px; border-radius: 4px; }
   .kpis {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 12px; margin-bottom: 18px;
   }
   .kpi {
     background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+    min-width: 0;
   }
   .kpi .label { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
-  .kpi .val { font-size: 22px; font-weight: 700; margin-top: 4px; color: var(--ink); }
-  .kpi .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .kpi .val { font-size: 20px; font-weight: 700; margin-top: 4px; color: var(--ink); overflow-wrap: anywhere; word-break: break-word; line-height: 1.25; }
+  .kpi .val.val-sm { font-size: 15.5px; }
+  .kpi .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
   .section {
     background: var(--card); border: 1px solid var(--border); border-radius: 10px;
     padding: 18px 20px; margin-bottom: 16px;
@@ -192,6 +195,64 @@ def _svg_volcano(de_df: pd.DataFrame) -> str:
     """
 
 
+def _pretty_stop_reason(raw: Any) -> str:
+    txt = str(raw or "").strip()
+    if not txt:
+        return "Completed"
+    low = txt.lower()
+    if low.startswith("logan_unitigs_complete"):
+        return "Logan unitigs complete"
+    if "converged_tech_var_below_bio_var" in low:
+        return "Converged (low technical noise)"
+    if "converged" in low:
+        return "Converged"
+    if "max_bytes_pct_cap" in low:
+        return "Reached reading budget cap"
+    if "all_streams_exhausted" in low or "exhausted" in low:
+        return "All reads processed"
+    if "max_iterations" in low:
+        return "Reached wave limit"
+    return txt.replace("_", " ").capitalize()
+
+
+def _fmt_assembly_priors(priors: Any) -> str:
+    if isinstance(priors, dict) and priors:
+        parts = []
+        for k, v in priors.items():
+            try:
+                parts.append(f"{k}: {100.0 * float(v):.1f}%")
+            except Exception:
+                parts.append(f"{k}: {v}")
+        return ", ".join(parts)
+    return str(priors or "—")
+
+
+def _fmt_pct(v: Any, *, already_pct: bool = True, digits: int = 1) -> str:
+    if v is None:
+        return "—"
+    try:
+        fv = float(v)
+        if not np.isfinite(fv):
+            return "—"
+        if not already_pct:
+            fv *= 100.0
+        return f"{fv:.{digits}f}%"
+    except Exception:
+        return _esc(v)
+
+
+def _fmt_int_commas(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        fv = float(v)
+        if not np.isfinite(fv):
+            return "—"
+        return f"{int(round(fv)):,}"
+    except Exception:
+        return _esc(v)
+
+
 def render_panexpr_report(
     out_path: str | Path,
     *,
@@ -218,13 +279,24 @@ def render_panexpr_report(
         kname = str(b.get("kernel", ""))
         is_win = kname == winner
         badge = '<span class="badge b-teal">WINNER</span>' if is_win else ""
+        comp_v = b.get("optimality_score", b.get("composite_raw", b.get("composite", b.get("score"))))
+        if "overall_synthetic_recall_pct" in b or "core4_recall_pct" in b:
+            rec_s = _fmt_pct(b.get("overall_synthetic_recall_pct", b.get("core4_recall_pct")), already_pct=True, digits=1)
+        else:
+            rec_s = _fmt_pct(b.get("synth_spearman", b.get("accuracy")), already_pct=False, digits=1)
+        sym_v = b.get("mate_tie_symmetry", b.get("tie_symmetry", b.get("symmetry")))
+        if "real_mapped_pct" in b:
+            map_s = _fmt_pct(b.get("real_mapped_pct"), already_pct=True, digits=1)
+        else:
+            map_s = _fmt_pct(b.get("mapped_frac", b.get("real_mapped_fraction")), already_pct=False, digits=1)
+        rps_v = b.get("reads_per_sec", b.get("throughput_rps"))
         board_rows_html.append(
             f"<tr><td><code>{_esc(kname)}</code> {badge}</td>"
-            f"<td class='num'>{_fmt_num(b.get('composite', b.get('score')), 3)}</td>"
-            f"<td class='num'>{_fmt_num(b.get('synth_spearman', b.get('accuracy')), 3)}</td>"
-            f"<td class='num'>{_fmt_num(b.get('tie_symmetry', b.get('symmetry')), 3)}</td>"
-            f"<td class='num'>{_fmt_num(b.get('mapped_frac', b.get('real_mapped_fraction')), 3)}</td>"
-            f"<td class='num'>{_fmt_num(b.get('reads_per_sec', b.get('throughput_rps')), 0)}</td></tr>"
+            f"<td class='num'>{_fmt_num(comp_v, 3)}</td>"
+            f"<td class='num'>{rec_s}</td>"
+            f"<td class='num'>{_fmt_num(sym_v, 3)}</td>"
+            f"<td class='num'>{map_s}</td>"
+            f"<td class='num'>{_fmt_int_commas(rps_v)}</td></tr>"
         )
 
     sample_rows_html = []
@@ -258,15 +330,27 @@ def render_panexpr_report(
             f"<td>{z_badge}</td></tr>"
         )
 
+    is_logan = str(loop_summary.get("source_mode") or "") == "logan_unitigs"
+    wire_x = float(loop_summary.get("wire_reduction_x", 1.0) or 1.0)
     zoom_info = loop_summary.get("zoom") or {}
-    zoom_html = (
-        f"<p><strong>Borderline groups baited:</strong> {len(zoom_info.get('groups', []))} &nbsp;|&nbsp; "
-        f"<strong>Extra bytes scanned:</strong> {float(zoom_info.get('bytes_scanned', 0)) / 1e6:.2f} MB &nbsp;|&nbsp; "
-        f"<strong>Reads scanned:</strong> {int(zoom_info.get('reads_scanned', 0)):,} &nbsp;|&nbsp; "
-        f"<strong>Bait-matched reads mapped:</strong> {int(zoom_info.get('reads_mapped', 0)):,}</p>"
-        if zoom_info
-        else "<p>Borderline 31-mer zoom pass did not need additional reads (or disabled).</p>"
-    )
+    if is_logan:
+        n_anti = int(zoom_info.get("n_antisense_genes", 0) or 0)
+        n_zcand = int(zoom_info.get("n_zoom_candidates", 0) or 0)
+        zoom_html = (
+            f"<p><strong>Logan unitig coverage:</strong> full-run k=31 unitig graphs integrated across all samples "
+            f"({wire_x:.1f}x wire reduction vs raw FASTQ) &nbsp;|&nbsp; "
+            f"<strong>Antisense-overlap loci flagged:</strong> {n_anti:,} &nbsp;|&nbsp; "
+            f"<strong>Low-count / borderline candidates:</strong> {n_zcand:,}</p>"
+        )
+    elif zoom_info:
+        zoom_html = (
+            f"<p><strong>Borderline groups baited:</strong> {len(zoom_info.get('groups', [])):,} &nbsp;|&nbsp; "
+            f"<strong>Extra bytes scanned:</strong> {float(zoom_info.get('bytes_scanned', 0)) / 1e6:.2f} MB &nbsp;|&nbsp; "
+            f"<strong>Reads scanned:</strong> {int(zoom_info.get('reads_scanned', 0)):,} &nbsp;|&nbsp; "
+            f"<strong>Bait-matched reads mapped:</strong> {int(zoom_info.get('reads_mapped', 0)):,}</p>"
+        )
+    else:
+        zoom_html = "<p>Borderline 31-mer zoom pass did not need additional reads (or disabled).</p>"
 
     conv_svg = _svg_convergence(
         loop_summary.get("telemetry", []),
@@ -275,12 +359,42 @@ def render_panexpr_report(
     )
     volc_svg = _svg_volcano(de_df)
 
-    is_logan = str(loop_summary.get("source_mode") or "") == "logan_unitigs"
     winner_sub = (
-        f"Logan unitig streaming ({float(loop_summary.get('wire_reduction_x', 1.0)):.1f}x wire reduction)"
+        f"Logan unitig streaming ({wire_x:.1f}x wire reduction)"
         if is_logan
         else f"{len(scoreboard)} aligners benchmarked on {int(loop_summary.get('tournament_reads', 0)):,} reads"
     )
+    stop_pretty = _pretty_stop_reason(loop_summary.get("stop_reason"))
+    priors_pretty = _fmt_assembly_priors(loop_summary.get("assembly_prior"))
+
+    if is_logan and not board_rows_html:
+        stage1_html = f"""
+  <div class="section">
+    <h2>Stage 1 — Streaming Engine Selection</h2>
+    <p>All public run accessions in the manifest were available in the pre-assembled Logan archive. ExpressionLoop streamed compact k=31 unitig graphs directly (<strong>{wire_x:.1f}x smaller</strong> than raw FASTQ archives), aligned unitigs with <code>{_esc(winner)}</code>, resolved shared equivalence classes with operon-aware expectation-maximization, and scaled k-mer abundance to expected fragment counts using ENA read lengths.</p>
+  </div>"""
+    else:
+        stage1_html = f"""
+  <div class="section">
+    <h2>Stage 1 — Regime Classifier &amp; Empirical Aligner Tournament</h2>
+    <table>
+      <thead><tr><th>Aligner Kernel</th><th class="num">Composite Score</th><th class="num">Synth Recall (%)</th><th class="num">Tie Symmetry</th><th class="num">Real Mapped (%)</th><th class="num">Reads / sec</th></tr></thead>
+      <tbody>{''.join(board_rows_html) or '<tr><td colspan="6">Aligner selected directly.</td></tr>'}</tbody>
+    </table>
+  </div>"""
+
+    if is_logan and not loop_summary.get("telemetry"):
+        stage34_body = f"""
+    <p>Catalog conditioned across assemblies <code>{_esc(', '.join(catalog_summary.get('assemblies', [])))}</code> ({int(catalog_summary.get('n_groups', 0)):,} gene groups, assembly weights: <code>{_esc(priors_pretty)}</code>).</p>
+    <div>{volc_svg}</div>"""
+    else:
+        stage34_body = f"""
+    <p>Catalog conditioned across assemblies <code>{_esc(', '.join(catalog_summary.get('assemblies', [])))}</code> ({int(catalog_summary.get('n_groups', 0)):,} gene groups, assembly weights: <code>{_esc(priors_pretty)}</code>).</p>
+    <div class="grid2">
+      <div>{conv_svg}</div>
+      <div>{volc_svg}</div>
+    </div>"""
+
     doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>{_esc(brand)} Report — {_esc(contrast_str)}</title>{_BASE_CSS}</head>
@@ -295,16 +409,9 @@ def render_panexpr_report(
     <div class="kpi"><div class="label">Aligner Engine</div><div class="val">{_esc(winner)}</div><div class="sub">{_esc(winner_sub)}</div></div>
     <div class="kpi"><div class="label">Significant DEGs</div><div class="val">{n_deg:,}</div><div class="sub">FDR &lt; 0.05 across {len(de_df):,} quantified genes</div></div>
     <div class="kpi"><div class="label">Ortholog Bridge</div><div class="val">{n_bridge:,}</div><div class="sub">Primary: {_esc(catalog_summary.get('primary_assembly'))} ({int(catalog_summary.get('n_targets', 0)):,} targets)</div></div>
-    <div class="kpi"><div class="label">Loop Stopping</div><div class="val">{_esc(loop_summary.get('stop_reason'))}</div><div class="sub">{int(loop_summary.get('iterations', 0))} iterations · {float(loop_summary.get('wall_seconds', 0.0)):.1f}s</div></div>
+    <div class="kpi"><div class="label">Loop Stopping</div><div class="val val-sm">{_esc(stop_pretty)}</div><div class="sub">{int(loop_summary.get('iterations', 0))} {'pass' if is_logan else 'iterations'} · {float(loop_summary.get('wall_seconds', 0.0)):.1f}s</div></div>
   </div>
-
-  <div class="section">
-    <h2>Stage 1 — Regime Classifier &amp; Empirical Aligner Tournament</h2>
-    <table>
-      <thead><tr><th>Aligner Kernel</th><th class="num">Composite Score</th><th class="num">Synth Spearman</th><th class="num">Tie Symmetry</th><th class="num">Real Mapped Frac</th><th class="num">Reads / sec</th></tr></thead>
-      <tbody>{''.join(board_rows_html) or '<tr><td colspan="6">Logan unitig engine selected directly.</td></tr>'}</tbody>
-    </table>
-  </div>
+{stage1_html}
 
   <div class="section">
     <h2>Stage 2 — Per-Sample Streaming Summary</h2>
@@ -316,11 +423,7 @@ def render_panexpr_report(
 
   <div class="section">
     <h2>Stage 3 &amp; 4 — EM Conditioning, Convergence &amp; Volcano</h2>
-    <p>Catalog conditioned across assemblies <code>{_esc(', '.join(catalog_summary.get('assemblies', [])))}</code> ({int(catalog_summary.get('n_groups', 0)):,} ortholog groups, assembly priors: <code>{_esc(loop_summary.get('assembly_prior'))}</code>).</p>
-    <div class="grid2">
-      <div>{conv_svg}</div>
-      <div>{volc_svg}</div>
-    </div>
+{stage34_body}
   </div>
 
   <div class="section">

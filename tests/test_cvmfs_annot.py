@@ -32,11 +32,28 @@ def test_read_fasta_contig_lengths_fai_sam_index_and_gz(tmp_path: Path) -> None:
     (sam_dir / "hg38canon.fa.fai").write_text("chr1\t248956422\t6\t50\t51\nchrM\t16569\t0\t50\t51\n", encoding="utf-8")
     assert ca.read_fasta_contig_lengths(fa2) == {"chr1": 248956422, "chrM": 16569}
 
+    # BRC CVMFS len/<stem>.len layout
+    brc_seq = tmp_path / "GCF_000005845.2" / "seq"
+    brc_len = tmp_path / "GCF_000005845.2" / "len"
+    brc_seq.mkdir(parents=True)
+    brc_len.mkdir(parents=True)
+    fa_brc = brc_seq / "GCF_000005845.2.fa"
+    fa_brc.write_text(">placeholder\nA\n", encoding="utf-8")
+    (brc_len / "GCF_000005845.2.len").write_text("NC_000913.3\t4641652\n", encoding="utf-8")
+    assert ca.read_fasta_contig_lengths(fa_brc) == {"NC_000913.3": 4641652}
+
     # Gzipped FASTA fallback
     fa3 = tmp_path / "tiny.fa.gz"
     with gzip.open(fa3, "wt", encoding="utf-8") as fh:
         fh.write(">chrA desc\nACGTACGT\nAA\n>chrB\nGGG\n")
     assert ca.read_fasta_contig_lengths(fa3) == {"chrA": 10, "chrB": 3}
+
+    # BRC GCA_-only hint keeps GCF_ primary + GCA_ secondary fallback without taxon query
+    cands_gca = ca._discover_candidate_gcf_bases(
+        {"ncbi_accession_hint": "GCA_002759435.3", "species_name": "Candida auris"},
+        include_taxon_search=False,
+    )
+    assert cands_gca == [("GCF_002759435", "GCF_002759435.3"), ("GCA_002759435", "GCA_002759435.3")]
 
 
 def test_infer_species_from_cached_meta_ucsc_plants_and_microbes() -> None:
@@ -167,7 +184,7 @@ def test_resolve_cvmfs_annotation_ucsc_happy_and_fail_fast(tmp_path: Path, monke
 
     # Now introduce a chromosome length mismatch -> must fail fast (never silently shift coordinates)
     monkeypatch.setattr(ca, "fetch_ucsc_chrom_lengths", lambda db, timeout=20.0: {"chrI": 5100, "chrII": 8000})
-    monkeypatch.setattr(ca, "_discover_candidate_gcf_bases", lambda meta, max_candidates=5: [])
+    monkeypatch.setattr(ca, "_discover_candidate_gcf_bases", lambda meta, max_candidates=5, **kw: [])
     with pytest.raises(ValueError, match="Chromosome length mismatch"):
         ca.resolve_cvmfs_annotation(fa, tmp_path / "out_bad", dbkey="sacCer3", display_name="Yeast: sacCer3", value="sacCer3")
 
@@ -179,7 +196,7 @@ def test_resolve_cvmfs_annotation_ncbi_picks_exact_length_version_and_fails_on_4
     fa.write_text(">chr1\n" + "A" * 5000 + "\n>chrM\n" + "G" * 1000 + "\n", encoding="utf-8")
 
     monkeypatch.setattr(ca, "fetch_ucsc_genomes", lambda timeout=20.0: {})
-    monkeypatch.setattr(ca, "_discover_candidate_gcf_bases", lambda meta, max_candidates=5: [("GCF_000001735", "GCF_000001735.4")])
+    monkeypatch.setattr(ca, "_discover_candidate_gcf_bases", lambda meta, max_candidates=5, **kw: [("GCF_000001735", "GCF_000001735.4")])
     monkeypatch.setattr(
         ca,
         "_list_ncbi_assembly_versions",
