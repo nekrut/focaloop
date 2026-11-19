@@ -73,7 +73,15 @@ def discover_related_ncbi_assemblies(
     if not q:
         raise ValueError("Provide a species name or NCBI taxonomy ID to auto-fetch related RefSeq strains.")
     want_pool = max(int(max_strains) * 3, int(candidate_pool))
-    excl_accs = {str(a).strip().upper().split(".")[0] for a in exclude_accessions if str(a).strip()}
+    excl_accs: set[str] = set()
+    for a in exclude_accessions:
+        base_a = str(a).strip().upper().split(".")[0]
+        if base_a:
+            excl_accs.add(base_a)
+            if base_a.startswith("GCA_"):
+                excl_accs.add("GCF_" + base_a[4:])
+            elif base_a.startswith("GCF_"):
+                excl_accs.add("GCA_" + base_a[4:])
     excl_strains = {_norm_strain(s) for s in exclude_strains if _norm_strain(s)}
 
     encoded_q = urllib.parse.quote(q, safe="")

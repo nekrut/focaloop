@@ -303,6 +303,8 @@ def build_spliced_transcripts(spec: AssemblySpec, min_exon_total: int = 30) -> l
             gid = a.get("gene_id") or ""
             if gid:
                 tx_gene[tk] = gid
+                if "gene_name" in a and gid not in gene_sym:
+                    gene_sym[gid] = spec.symbol_overrides.get(gid) or a["gene_name"]
             if "transcript_biotype" in a:
                 tx_biotype[tk] = a["transcript_biotype"]
         elif f.ftype == "CDS" and "product" in a:

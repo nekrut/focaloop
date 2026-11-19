@@ -164,6 +164,10 @@ def cmd_expressionloop(a: argparse.Namespace) -> int:
             manifest_path=a.manifest,
             ref_fasta=a.ref_fasta,
             ref_gtf=a.ref_gtf,
+            ref_dbkey=a.ref_dbkey,
+            ref_name=a.ref_name,
+            ref_value=a.ref_value,
+            auto_ref_gtf=a.auto_ref_gtf,
             ncbi_accession=a.ncbi_accession,
             contrast=a.contrast,
             out_de=a.out_de,
@@ -455,6 +459,10 @@ def build_parser() -> argparse.ArgumentParser:
     el.add_argument("--manifest", required=True, help="TSV/CSV sample manifest")
     el.add_argument("--ref-fasta", help="primary reference genome FASTA(.gz)")
     el.add_argument("--ref-gtf", help="primary reference annotation GTF/GFF3(.gz)")
+    el.add_argument("--ref-dbkey", default="", help="optional Galaxy dbkey for built-in CVMFS genome metadata")
+    el.add_argument("--ref-name", default="", help="optional Galaxy display name for built-in CVMFS genome metadata")
+    el.add_argument("--ref-value", default="", help="optional Galaxy data-table value for built-in CVMFS genome metadata")
+    el.add_argument("--auto-ref-gtf", action="store_true", help="automatically fetch and verify matching RefSeq annotation for a built-in CVMFS genome")
     el.add_argument("--ncbi-accession", help="optional NCBI assembly accession (GCF_.../GCA_...) to fetch genome FASTA and matching GFF3")
     el.add_argument("--secondary-fasta", help="optional secondary strain/assembly/pathogen FASTA(.gz)")
     el.add_argument("--secondary-gtf", help="optional secondary strain/assembly/pathogen GTF/GFF3(.gz)")

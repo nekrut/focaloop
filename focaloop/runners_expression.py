@@ -481,6 +481,10 @@ def run_expressionloop_galaxy(
     manifest_path: str | Path,
     ref_fasta: str | Path | None = None,
     ref_gtf: str | Path | None = None,
+    ref_dbkey: str = "",
+    ref_name: str = "",
+    ref_value: str = "",
+    auto_ref_gtf: bool = False,
     ncbi_accession: str | None = None,
     contrast: str,
     out_de: str | Path,
@@ -567,6 +571,7 @@ def run_expressionloop_galaxy(
             eff_source_mode = source_mode
 
         refs_dir = work_dir / "refs"
+        primary_cvmfs_meta: dict[str, Any] = {}
         if ncbi_accession and str(ncbi_accession).strip():
             from .ncbi_ref import fetch_ncbi_assembly
 
@@ -579,10 +584,24 @@ def run_expressionloop_galaxy(
                 ref_gtf = fetched["gff"]
             if primary_label == "primary":
                 primary_label = acc_clean
+        elif auto_ref_gtf and ref_fasta and (ref_gtf is None or not str(ref_gtf).strip()):
+            from .cvmfs_annot import resolve_cvmfs_annotation
+
+            primary_cvmfs_meta = resolve_cvmfs_annotation(
+                ref_fasta,
+                refs_dir / "cvmfs_annot" / "primary",
+                dbkey=ref_dbkey,
+                display_name=ref_name,
+                value=ref_value,
+                log=_log,
+            )
+            ref_gtf = primary_cvmfs_meta["gtf_path"]
+            if primary_label == "primary" and (ref_value or ref_dbkey):
+                primary_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(ref_value or ref_dbkey).strip()).strip("._") or "primary"
 
         if not ref_fasta or not ref_gtf:
             raise ValueError(
-                "Provide either a reference genome FASTA and GTF/GFF3 annotation, or an NCBI assembly accession (--ncbi-accession)."
+                "Provide either a reference genome FASTA and GTF/GFF3 annotation (or --auto-ref-gtf for a built-in genome), or an NCBI assembly accession (--ncbi-accession)."
             )
 
         p_fna = _gunzip_if_needed(ref_fasta, refs_dir, f"{primary_label}.fna")
@@ -595,6 +614,8 @@ def run_expressionloop_galaxy(
         used_ncbi_accs: list[str] = []
         if ncbi_accession and str(ncbi_accession).strip():
             used_ncbi_accs.append(str(ncbi_accession).strip().upper())
+        if primary_cvmfs_meta.get("ncbi_accession"):
+            used_ncbi_accs.append(str(primary_cvmfs_meta["ncbi_accession"]).strip().upper())
 
         def _unique_label(raw: str, fallback: str) -> str:
             base = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(raw or "").strip()).strip("._") or fallback
@@ -620,6 +641,10 @@ def run_expressionloop_galaxy(
             e_acc = str(eref.get("ncbi_accession") or "").strip()
             e_fa = str(eref.get("fasta") or "").strip()
             e_gtf = str(eref.get("gtf") or "").strip()
+            e_auto_gtf = bool(eref.get("auto_gtf"))
+            e_dbkey = str(eref.get("dbkey") or "").strip()
+            e_name = str(eref.get("ref_name") or "").strip()
+            e_val = str(eref.get("value") or "").strip()
             e_lbl_raw = str(eref.get("label") or "").strip()
             if e_acc:
                 from .ncbi_ref import fetch_ncbi_assembly
@@ -633,9 +658,25 @@ def run_expressionloop_galaxy(
                 used_ncbi_accs.append(e_acc.upper())
                 if not e_lbl_raw:
                     e_lbl_raw = e_acc.upper()
+            elif e_auto_gtf and e_fa and not e_gtf:
+                from .cvmfs_annot import resolve_cvmfs_annotation
+
+                ecvmfs = resolve_cvmfs_annotation(
+                    e_fa,
+                    refs_dir / "cvmfs_annot" / f"extra_{idx_e}",
+                    dbkey=e_dbkey,
+                    display_name=e_name,
+                    value=e_val,
+                    log=_log,
+                )
+                e_gtf = str(ecvmfs["gtf_path"])
+                if ecvmfs.get("ncbi_accession"):
+                    used_ncbi_accs.append(str(ecvmfs["ncbi_accession"]).strip().upper())
+                if not e_lbl_raw and (e_val or e_dbkey):
+                    e_lbl_raw = e_val or e_dbkey
             if not e_fa or not e_gtf:
                 raise ValueError(
-                    f"Additional reference #{idx_e} requires either an NCBI assembly accession or both a genome FASTA and GTF/GFF3 annotation."
+                    f"Additional reference #{idx_e} requires either an NCBI assembly accession, a built-in genome with auto-annotation, or both a genome FASTA and GTF/GFF3 annotation."
                 )
             e_lbl = _unique_label(e_lbl_raw, f"extra_{idx_e}")
             efna_p = _gunzip_if_needed(e_fa, refs_dir, f"{e_lbl}.fna")
@@ -661,10 +702,33 @@ def run_expressionloop_galaxy(
                         f"Auto-expand inferred species {taxon_q!r} from primary accession {ncbi_accession!r}"
                         + (f" (excluding primary strain {tax_meta['strain']!r})" if tax_meta.get("strain") else "")
                     )
+                elif ref_dbkey or ref_name or ref_value:
+                    from .cvmfs_annot import infer_species_from_cached_meta
+
+                    cmeta = (
+                        primary_cvmfs_meta
+                        if primary_cvmfs_meta.get("species_name")
+                        else infer_species_from_cached_meta(dbkey=ref_dbkey, display_name=ref_name, value=ref_value)
+                    )
+                    taxon_q = str(cmeta.get("species_name") or "").strip()
+                    c_strain = str(cmeta.get("strain") or "").strip()
+                    if c_strain:
+                        excl_strains.append(c_strain)
+                    if cmeta.get("ncbi_accession_hint"):
+                        used_ncbi_accs.append(str(cmeta["ncbi_accession_hint"]).strip().upper())
+                    if not taxon_q:
+                        raise ValueError(
+                            f"Could not infer species automatically from built-in genome {ref_name or ref_dbkey or ref_value!r}. "
+                            "Enter a species name or NCBI taxonomy ID in the Auto-expand taxon field."
+                        )
+                    _log(
+                        f"Auto-expand inferred species {taxon_q!r} from built-in genome {ref_name or ref_dbkey or ref_value!r}"
+                        + (f" (excluding primary strain {c_strain!r})" if c_strain else "")
+                    )
                 else:
                     raise ValueError(
                         "Auto-expanding related RefSeq strains requires a species name or NCBI taxonomy ID "
-                        "when the primary genome is selected from CVMFS or Galaxy History."
+                        "when the primary genome comes from your Galaxy History."
                     )
             cands = discover_related_ncbi_assemblies(
                 taxon_q,

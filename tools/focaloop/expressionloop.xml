@@ -17,8 +17,11 @@
 focaloop expressionloop
     #if str($ref_source.source) == "cached"
         --ref-fasta '$ref_source.cached_fasta.fields.path'
-        #if str($ref_source.cached_gtf_source.gtf_source) == "cached"
-            --ref-gtf '$ref_source.cached_gtf_source.cached_gff.fields.path'
+        --ref-dbkey '${str($ref_source.cached_fasta.fields.dbkey).replace("'", "_")}'
+        --ref-name '${str($ref_source.cached_fasta.fields.name).replace("'", "_")}'
+        --ref-value '${str($ref_source.cached_fasta.fields.value).replace("'", "_")}'
+        #if str($ref_source.cached_gtf_source.gtf_source) == "auto"
+            --auto-ref-gtf
         #else
             --ref-gtf '$ref_source.cached_gtf_source.ref_gtf'
         #end if
@@ -135,12 +138,15 @@ focaloop expressionloop
 #set $lbl = str($er.label).strip().replace('\\', '\\\\').replace('"', '\\"')
 #if str($er.extra_source.source) == "cached"
 #set $efa = str($er.extra_source.cached_fasta.fields.path).replace('\\', '\\\\').replace('"', '\\"')
-#if str($er.extra_source.cached_gtf_source.gtf_source) == "cached"
-#set $egtf = str($er.extra_source.cached_gtf_source.cached_gff.fields.path).replace('\\', '\\\\').replace('"', '\\"')
+#set $edbkey = str($er.extra_source.cached_fasta.fields.dbkey).replace('\\', '\\\\').replace('"', '\\"')
+#set $ename = str($er.extra_source.cached_fasta.fields.name).replace('\\', '\\\\').replace('"', '\\"')
+#set $eval = str($er.extra_source.cached_fasta.fields.value).replace('\\', '\\\\').replace('"', '\\"')
+#if str($er.extra_source.cached_gtf_source.gtf_source) == "auto"
+{"label": "$lbl", "fasta": "$efa", "gtf": "", "auto_gtf": true, "dbkey": "$edbkey", "ref_name": "$ename", "value": "$eval", "ncbi_accession": ""}
 #else
 #set $egtf = str($er.extra_source.cached_gtf_source.ref_gtf).replace('\\', '\\\\').replace('"', '\\"')
+{"label": "$lbl", "fasta": "$efa", "gtf": "$egtf", "auto_gtf": false, "dbkey": "$edbkey", "ref_name": "$ename", "value": "$eval", "ncbi_accession": ""}
 #end if
-{"label": "$lbl", "fasta": "$efa", "gtf": "$egtf", "ncbi_accession": ""}
 #elif str($er.extra_source.source) == "history"
 #set $efa = str($er.extra_source.ref_fasta).replace('\\', '\\\\').replace('"', '\\"')
 #set $egtf = str($er.extra_source.ref_gtf).replace('\\', '\\\\').replace('"', '\\"')
@@ -168,20 +174,13 @@ focaloop expressionloop
                     </options>
                 </param>
                 <conditional name="cached_gtf_source">
-                    <param name="gtf_source" type="select" label="Gene annotation source" help="Provide a matching GTF or GFF3 gene annotation from your Galaxy History or select one cached on this server.">
-                        <option value="history" selected="true">From your Galaxy History (GTF or GFF3)</option>
-                        <option value="cached">Built-in Galaxy annotation</option>
+                    <param name="gtf_source" type="select" label="Gene annotation source" help="Automatically fetch and verify the matching RefSeq gene annotation (UCSC RefSeq GTF for standard builds, or contig-normalized NCBI RefSeq GFF3 for microbes and non-UCSC builds), or override with a GTF or GFF3 file from your Galaxy History.">
+                        <option value="auto" selected="true">Auto-fetch matching RefSeq annotation (UCSC / NCBI)</option>
+                        <option value="history">From your Galaxy History (GTF or GFF3)</option>
                     </param>
+                    <when value="auto"/>
                     <when value="history">
                         <param argument="--ref-gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Gene annotation (GTF or GFF3)" help="Gene and exon annotation matching the selected built-in genome. Used to build spliced transcripts and non-coding background decoys."/>
-                    </when>
-                    <when value="cached">
-                        <param name="cached_gff" type="select" label="Built-in gene annotation" help="Select a cached GTF or GFF3 gene annotation matching the built-in genome.">
-                            <options from_data_table="all_gff">
-                                <filter type="sort_by" column="2"/>
-                                <validator type="no_options" message="No built-in gene annotations are cached on this Galaxy server. Choose a GTF or GFF3 file from your Galaxy History instead."/>
-                            </options>
-                        </param>
                     </when>
                 </conditional>
             </when>
@@ -263,20 +262,13 @@ focaloop expressionloop
                             </options>
                         </param>
                         <conditional name="cached_gtf_source">
-                            <param name="gtf_source" type="select" label="Gene annotation source" help="Provide a matching GTF or GFF3 annotation from your Galaxy History or select one cached on this server.">
-                                <option value="history" selected="true">From your Galaxy History (GTF or GFF3)</option>
-                                <option value="cached">Built-in Galaxy annotation</option>
+                            <param name="gtf_source" type="select" label="Gene annotation source" help="Automatically fetch and verify the matching RefSeq annotation for this built-in genome, or provide a GTF or GFF3 file from your Galaxy History.">
+                                <option value="auto" selected="true">Auto-fetch matching RefSeq annotation (UCSC / NCBI)</option>
+                                <option value="history">From your Galaxy History (GTF or GFF3)</option>
                             </param>
+                            <when value="auto"/>
                             <when value="history">
                                 <param name="ref_gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Gene annotation (GTF or GFF3)" help="Gene and exon annotation matching the selected built-in genome."/>
-                            </when>
-                            <when value="cached">
-                                <param name="cached_gff" type="select" label="Built-in gene annotation" help="Select a cached GTF or GFF3 annotation matching the built-in genome.">
-                                    <options from_data_table="all_gff">
-                                        <filter type="sort_by" column="2"/>
-                                        <validator type="no_options" message="No built-in gene annotations are cached on this Galaxy server. Select a GTF or GFF3 file from your Galaxy History instead."/>
-                                    </options>
-                                </param>
                             </when>
                         </conditional>
                     </when>
@@ -294,7 +286,7 @@ focaloop expressionloop
                 <when value="no"/>
                 <when value="yes">
                     <param argument="--auto-expand-strains" type="integer" min="1" max="10" value="3" label="Number of additional distinct strains to fetch" help="Fetches up to this many strain-deduplicated RefSeq genomes with gene annotations and joins them into the ortholog catalog alongside your primary genome."/>
-                    <param argument="--auto-expand-taxon" type="text" value="" optional="true" label="Species name or NCBI taxonomy ID (optional if primary genome is an NCBI accession)" help="Required when your primary genome comes from CVMFS or Galaxy History (for example, Escherichia coli or Saccharomyces cerevisiae). Leave empty when using an NCBI primary accession to infer the species automatically.">
+                    <param argument="--auto-expand-taxon" type="text" value="" optional="true" label="Species name or NCBI taxonomy ID (optional for Built-in CVMFS and NCBI genomes)" help="Leave empty when your primary genome comes from Built-in CVMFS cache or an NCBI accession to infer the species automatically. Required only when your primary genome is uploaded from Galaxy History (for example, Escherichia coli or Saccharomyces cerevisiae).">
                         <validator type="regex" message="Use letters, digits, spaces, underscores, dots, or hyphens only">^[A-Za-z0-9 _.-]*$</validator>
                     </param>
                 </when>
@@ -612,14 +604,14 @@ The `.focaloop.tar.zst` archive stores the transcript catalog, per-sample gene a
 
 Choose your primary reference genome and matching gene annotation using one of three sources:
 
-- **Built-in Galaxy genome (CVMFS cache, default):** Pick a genome pre-cached on this Galaxy server and pair it with a matching GTF/GFF3 annotation from your History or the server cache.
+- **Built-in Galaxy genome (CVMFS cache, default):** Pick a genome pre-cached on this Galaxy server. By default ExpressionLoop fetches and verifies the matching RefSeq gene annotation automatically (UCSC RefSeq GTF for standard builds, or contig-normalized NCBI RefSeq GFF3 for microbes and non-UCSC builds) and rejects mismatched contig lengths instead of silently shifting coordinates. You can override this with a GTF or GFF3 file from your History at any time.
 - **Genome and annotation from your Galaxy History:** Select your own reference genome FASTA and GTF or GFF3 file (`.gz` supported).
 - **Fetch automatically by NCBI assembly accession:** Enter a RefSeq (`GCF_` prefix, recommended because it provides curated gene annotation) or GenBank (`GCA_` prefix) assembly accession to download both the genome FASTA and its matching NCBI GFF3 automatically, with an optional History GTF/GFF3 override.
 
 Optionally expand **Additional reference genomes and multi-strain pan-transcriptome** to include extra assemblies in two ways:
 
-- **Explicit additional reference genomes:** Add any number of extra strains, older annotation releases, plasmids, or co-infecting pathogens (each chosen from NCBI accession, built-in CVMFS cache, or your History).
-- **Automatic related RefSeq strain expansion (opt-in):** Automatically discover and fetch up to *K* strain-deduplicated RefSeq genomes with gene annotations for the same species on NCBI (inferred automatically from a primary NCBI accession, or specified by species name/taxonomy ID for CVMFS or History genomes) to capture accessory genes absent from your primary assembly.
+- **Explicit additional reference genomes:** Add any number of extra strains, older annotation releases, plasmids, or co-infecting pathogens (each chosen from NCBI accession, built-in CVMFS cache with automatic RefSeq annotation or History GTF/GFF3, or your History).
+- **Automatic related RefSeq strain expansion (opt-in):** Automatically discover and fetch up to *K* strain-deduplicated RefSeq genomes with gene annotations for the same species on NCBI (inferred automatically from a built-in CVMFS genome or primary NCBI accession, or specified by species name or taxonomy ID for History genomes) to capture accessory genes absent from your primary assembly.
 
 Your sample sheet or manifest must be a tab-separated (TSV) or comma-separated (CSV) file with a header row:
 
