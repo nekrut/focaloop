@@ -226,7 +226,7 @@ def strip_genus_proteins(
                         reason = "taxid"
                 if reason is None and genus_word.search(hdr):
                     reason = "header_genus_token"
-                if reason is None and species_l in hdr.lower():
+                if reason is None and species_l and species_l in hdr.lower():
                     reason = "species_name"
                 keep = reason is None
                 if keep:
@@ -513,18 +513,19 @@ def discover_tiberius_weights(model_cfg: str, explicit_weights: str | Path | Non
                 sub = ep / nm
                 if _is_weights_dir(sub):
                     return sub.resolve()
-        if ep.is_file() and ep.name.endswith((".tar.gz", ".tgz")):
+        if ep.is_file():
             import tarfile
             import tempfile
 
-            dest = Path(tempfile.mkdtemp(prefix="tiberius_weights_"))
-            with tarfile.open(ep, "r:gz") as tf:
-                tf.extractall(dest)
-            if _is_weights_dir(dest):
-                return dest.resolve()
-            for sub in dest.iterdir():
-                if _is_weights_dir(sub):
-                    return sub.resolve()
+            if tarfile.is_tarfile(ep):
+                dest = Path(tempfile.mkdtemp(prefix="tiberius_weights_"))
+                with tarfile.open(ep, "r:*") as tf:
+                    tf.extractall(dest)
+                if _is_weights_dir(dest):
+                    return dest.resolve()
+                for sub in dest.iterdir():
+                    if _is_weights_dir(sub):
+                        return sub.resolve()
 
     search_roots: list[Path] = []
     for env_k in ("GENELOOP_TIBERIUS_WEIGHTS", "TIBERIUS_WEIGHTS_DIR"):
@@ -1752,8 +1753,7 @@ def scan_readthrough_protein_ids(fasta_path: Path, cache_json: Path | None = Non
         except (OSError, ValueError):
             pass
     ids: set[str] = set()
-    op = gzip.open if str(p).endswith(".gz") else open
-    with op(p, "rt") as fh:
+    with _open_maybe_gz(p) as fh:
         for line in fh:
             if line.startswith(">") and "readthrough" in line.lower():
                 acc = line[1:].split()[0]

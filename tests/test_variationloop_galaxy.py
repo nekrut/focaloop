@@ -328,6 +328,14 @@ def test_variationloop_xml_iuc_standards_and_no_sieve() -> None:
     help_el = root.find("help")
     assert help_el.attrib.get("format") == "markdown"
     help_txt = help_el.text or ""
-    for heading in ("**What It Does**", "**Mode Selection Guide**", "**Manifest & Input Requirements**", "**Parameter Guide**", "**Outputs**", "**Citations**"):
+    for heading in (
+        "**What this tool does**",
+        "**How it works**",
+        "**Choosing a workflow**",
+        "**Inputs and manifest format**",
+        "**Key parameters**",
+        "**Outputs**",
+        "**Tips and troubleshooting**",
+    ):
         assert heading in help_txt, f"Missing help section {heading}"
     assert re.search(r"-----\n", help_txt)

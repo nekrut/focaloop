@@ -1,64 +1,24 @@
 <tool id="focaloop_variationloop" name="Focaloop VariationLoop" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
-    <description>adaptive CRAM range surveillance, host-depleted pathogen streaming, and diploid human variant calling</description>
+    <description>call genomic variants (SNVs and indels) from FASTQ, BAM, or indexed CRAM</description>
     <macros>
         <import>macros.xml</import>
     </macros>
-    <expand macro="edam_topics"/>
+    <expand macro="edam_topics">
+        <edam_topic>topic_0199</edam_topic>
+    </expand>
     <edam_operations>
         <edam_operation>operation_3227</edam_operation>
         <edam_operation>operation_3196</edam_operation>
     </edam_operations>
+    <expand macro="creator"/>
     <expand macro="requirements"/>
     <version_command>focaloop --version</version_command>
     <command detect_errors="aggressive"><![CDATA[
 focaloop variationloop
     --analysis-mode '$analysis_mode.mode'
-    #if str($analysis_mode.mode) == "focused_cram"
-        #if str($analysis_mode.input_source.source_type) == "manifest"
-            --manifest '$analysis_mode.input_source.manifest'
-        #else
-            --bam '$analysis_mode.input_source.bam'
-            #if $analysis_mode.input_source.crai
-                --crai '$analysis_mode.input_source.crai'
-            #end if
-            --sample-name '$analysis_mode.input_source.sample_name'
-        #end if
-        #if $analysis_mode.ref_fasta
-            --ref-fasta '$analysis_mode.ref_fasta'
-        #end if
-        #if $analysis_mode.targets_bed
-            --targets-bed '$analysis_mode.targets_bed'
-        #end if
-        --cram-pad-bp $analysis_mode.cram_pad_bp
-        --streams $analysis_mode.streams
-    #elif str($analysis_mode.mode) == "wgs_stream"
-        #if str($analysis_mode.input_source.source_type) == "manifest"
-            --manifest '$analysis_mode.input_source.manifest'
-            #if $analysis_mode.input_source.reads
-                --reads
-                #for $r in $analysis_mode.input_source.reads
-                    '$r'
-                #end for
-                --read-ids
-                #for $r in $analysis_mode.input_source.reads
-                    '${r.element_identifier}'
-                #end for
-            #end if
-        #else
-            --reads-r1 '$analysis_mode.input_source.reads_r1'
-            --reads-r2 '$analysis_mode.input_source.reads_r2'
-            --sample-name '$analysis_mode.input_source.sample_name'
-        #end if
-        #if $analysis_mode.ref_fasta
-            --ref-fasta '$analysis_mode.ref_fasta'
-        #end if
-        #if $analysis_mode.targets_bed
-            --targets-bed '$analysis_mode.targets_bed'
-        #end if
-        --target-depth $analysis_mode.target_depth
-        $analysis_mode.host_depletion
-        --mapper '$analysis_mode.mapper'
-    #else
+    --ref-fasta '$ref_fasta'
+    --reference-label '${str($ref_fasta.element_identifier).replace("'", "_")}'
+    #if str($analysis_mode.mode) == "diploid_wgs"
         #if str($analysis_mode.input_source.source_type) == "history_fq"
             --reads-r1 '$analysis_mode.input_source.reads_r1'
             --reads-r2 '$analysis_mode.input_source.reads_r2'
@@ -67,6 +27,10 @@ focaloop variationloop
             --bam '$analysis_mode.input_source.bam'
             #if $analysis_mode.input_source.crai
                 --crai '$analysis_mode.input_source.crai'
+            #elif $analysis_mode.input_source.bam.is_of_type("cram") and str($analysis_mode.input_source.bam.metadata.cram_index) not in ("", "None")
+                --crai '$analysis_mode.input_source.bam.metadata.cram_index'
+            #elif $analysis_mode.input_source.bam.is_of_type("bam") and str($analysis_mode.input_source.bam.metadata.bam_index) not in ("", "None")
+                --crai '$analysis_mode.input_source.bam.metadata.bam_index'
             #end if
             --sample-name '$analysis_mode.input_source.sample_name'
         #else
@@ -78,163 +42,189 @@ focaloop variationloop
                 #end for
                 --read-ids
                 #for $r in $analysis_mode.input_source.reads
-                    '${r.element_identifier}'
+                    '${str($r.element_identifier).replace("'", "_")}'
                 #end for
             #end if
         #end if
-        --ref-fasta '$analysis_mode.ref_fasta'
         #if $analysis_mode.targets_bed
             --targets-bed '$analysis_mode.targets_bed'
         #end if
         --mapper '$analysis_mode.mapper'
         --subsample-fraction $analysis_mode.subsample_fraction
+    #elif str($analysis_mode.mode) == "focused_cram"
+        #if str($analysis_mode.input_source.source_type) == "history_cram"
+            --bam '$analysis_mode.input_source.bam'
+            #if $analysis_mode.input_source.crai
+                --crai '$analysis_mode.input_source.crai'
+            #elif $analysis_mode.input_source.bam.is_of_type("cram") and str($analysis_mode.input_source.bam.metadata.cram_index) not in ("", "None")
+                --crai '$analysis_mode.input_source.bam.metadata.cram_index'
+            #elif $analysis_mode.input_source.bam.is_of_type("bam") and str($analysis_mode.input_source.bam.metadata.bam_index) not in ("", "None")
+                --crai '$analysis_mode.input_source.bam.metadata.bam_index'
+            #end if
+            --sample-name '$analysis_mode.input_source.sample_name'
+        #else
+            --manifest '$analysis_mode.input_source.manifest'
+        #end if
+        #if $analysis_mode.targets_bed
+            --targets-bed '$analysis_mode.targets_bed'
+        #end if
+        --cram-pad-bp $analysis_mode.cram_pad_bp
+    #else
+        #if str($analysis_mode.input_source.source_type) == "history_fq"
+            --reads-r1 '$analysis_mode.input_source.reads_r1'
+            --reads-r2 '$analysis_mode.input_source.reads_r2'
+            --sample-name '$analysis_mode.input_source.sample_name'
+        #else
+            --manifest '$analysis_mode.input_source.manifest'
+            #if $analysis_mode.input_source.reads
+                --reads
+                #for $r in $analysis_mode.input_source.reads
+                    '$r'
+                #end for
+                --read-ids
+                #for $r in $analysis_mode.input_source.reads
+                    '${str($r.element_identifier).replace("'", "_")}'
+                #end for
+            #end if
+        #end if
+        #if $analysis_mode.targets_bed
+            --targets-bed '$analysis_mode.targets_bed'
+        #end if
+        $analysis_mode.host_depletion
+        --mapper '$analysis_mode.mapper'
     #end if
     $calling_options.reassembly
     --min-mapq $calling_options.min_mapq
     --min-bq $calling_options.min_bq
     --snv-min-qual $calling_options.snv_min_qual
     --indel-min-qual $calling_options.indel_min_qual
-    --dedup-bits $calling_options.dedup_bits
-    --sample-timeout $calling_options.sample_timeout
     @THREADS@
     --state-dir variationloop_state_dir
     --state-archive '$variationloop_state'
     --out-variants '$variants_summary'
     --out-vcf '$variants_vcf'
-    #if str($analysis_mode.mode) in ("focused_cram", "wgs_stream") and str($analysis_mode.emit_drm) == "true"
-        --out-drm '$drm_calls'
-    #end if
     --out-report '$variationloop_report'
     ]]></command>
     <inputs>
+        <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" label="Reference genome (FASTA)" help="Reference genome assembly matching your reads or alignment files (uncompressed or gzip-compressed)."/>
+
         <conditional name="analysis_mode">
-            <param argument="--analysis-mode" name="mode" type="select" label="Analysis mode" help="Choose focused CRAM range surveillance, adaptive pathogen WGS streaming with host depletion, or diploid human/eukaryotic VariationLoop.">
-                <option value="focused_cram" selected="true">Focused CRAM range surveillance (pathogen panel or custom BED windows)</option>
-                <option value="wgs_stream">Pathogen WGS adaptive streaming with host depletion filter</option>
-                <option value="diploid_wgs">Diploid human / eukaryotic VariationLoop (WGS short-read or CRAM/BAM)</option>
+            <param argument="--analysis-mode" name="mode" type="select" label="Variant calling workflow" help="Choose standard whole-genome or targeted variant calling, indexed CRAM region slicing, or target-filtered FASTQ calling for samples containing host or off-target DNA.">
+                <option value="diploid_wgs" selected="true">Whole-genome or targeted variant calling (FASTQ, BAM, or CRAM)</option>
+                <option value="focused_cram">Indexed CRAM region slicing (fetch only target windows)</option>
+                <option value="wgs_stream">Target-filtered FASTQ calling (remove host or off-target reads before alignment)</option>
             </param>
-            <when value="focused_cram">
-                <conditional name="input_source">
-                    <param name="source_type" type="select" label="Input source" help="Analyze a multi-isolate manifest of remote/local CRAM URLs or a single Galaxy History CRAM/BAM dataset.">
-                        <option value="manifest" selected="true">Isolate manifest TSV (remote CRAM+CRAI URLs or local paths)</option>
-                        <option value="history_cram">Single Galaxy History CRAM/BAM + optional index</option>
-                    </param>
-                    <when value="manifest">
-                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Isolate manifest (TSV/CSV)" help="Columns: sample_id, country_or_group, source_uri_or_srr[, crai_uri, population, sample_type]."/>
-                    </when>
-                    <when value="history_cram">
-                        <param argument="--bam" type="data" format="cram,bam" label="Aligned reads (CRAM or BAM)" help="Pre-aligned CRAM or BAM file from your Galaxy History."/>
-                        <param argument="--crai" type="data" format="data" optional="true" label="CRAM/BAM index (.crai or .bai, optional)" help="Supplying a .crai index enables exact container-level byte-range slicing on CRAM files."/>
-                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier" help="Sample identifier written to output tables, VCF header, and HTML report.">
-                            <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">[A-Za-z0-9_.-]+</validator>
-                        </param>
-                    </when>
-                </conditional>
-                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" optional="true" label="Reference genome FASTA (required unless server Pf3D7 reference is configured)" help="Provide a reference FASTA(.gz) from your Galaxy History. Leave empty only when a server-mounted PlasmoDB-54 Pf3D7 reference is configured via FOCALOOP_PF3D7_DIR or S."/>
-                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Custom target regions BED (optional)" help="Optional 0-based BED intervals appended to configured Pf3D7 surveillance windows or used to restrict custom-reference CRAM range slicing."/>
-                <param argument="--cram-pad-bp" type="integer" min="0" max="50000" value="1000" label="Target window padding (bp)" help="Flanking bases added around custom BED intervals when selecting CRAM containers."/>
-                <param argument="--streams" type="integer" min="1" max="64" value="24" label="Concurrent HTTP range streams" help="Number of parallel HTTP byte-range connections used when fetching remote CRAM containers."/>
-                <param name="emit_drm" type="boolean" truevalue="true" falsevalue="false" checked="true" label="Emit WHO drug-resistance and CNV summary TSV" help="Outputs per-isolate WHO antimalarial resistance, CNV, hrp2/3 deletion, and F_WS calls for Pf3D7 cohorts."/>
-            </when>
-            <when value="wgs_stream">
-                <conditional name="input_source">
-                    <param name="source_type" type="select" label="Input source" help="Stream INSDC accessions / HTTP FASTQ URLs from a manifest (with optional History FASTQs) or pass paired History FASTQs directly.">
-                        <option value="manifest" selected="true">Isolate manifest TSV (INSDC ERR/SRR accessions, URLs, or History FASTQs)</option>
-                        <option value="history_fq">Single Galaxy History paired-end FASTQ(.gz)</option>
-                    </param>
-                    <when value="manifest">
-                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Isolate manifest (TSV/CSV)" help="Columns: sample_id, country_or_group, source_uri_or_srr[, mate2_url, population, sample_type]."/>
-                        <param argument="--reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Galaxy History FASTQ files (optional)" help="Optional History FASTQ datasets matched to manifest rows by element identifier or sample_id."/>
-                    </when>
-                    <when value="history_fq">
-                        <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ/FASTQ.GZ)" help="Forward (R1) FASTQ or FASTQ.GZ dataset from your Galaxy History."/>
-                        <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ/FASTQ.GZ)" help="Reverse (R2) FASTQ or FASTQ.GZ dataset paired with R1."/>
-                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier" help="Sample identifier used in VCF/summary outputs.">
-                            <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">[A-Za-z0-9_.-]+</validator>
-                        </param>
-                    </when>
-                </conditional>
-                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" optional="true" label="Reference genome FASTA (required unless server Pf3D7 reference is configured)" help="Provide a reference FASTA(.gz) from your Galaxy History. Leave empty only when a server-mounted PlasmoDB-54 Pf3D7 reference is configured via FOCALOOP_PF3D7_DIR or S."/>
-                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Custom target regions BED (optional)" help="Optional 0-based BED intervals restricting 31-mer target baiting and variant calling on custom references."/>
-                <param argument="--target-depth" type="float" min="5.0" max="150.0" value="24.0" label="Target median core depth (stop gate)" help="Adaptive streaming halts early once median core depth and breadth stability criteria are satisfied."/>
-                <param argument="--host-depletion" type="boolean" truevalue="" falsevalue="--no-host-depletion" checked="true" label="Enable C 31-mer / PLA host depletion filter" help="Filters non-target/host reads on the fly in C before short-read alignment."/>
-                <param argument="--mapper" type="select" label="Short-read aligner" help="Auto selects the fastest probe-verified aligner available on the cluster node.">
-                    <option value="auto" selected="true">Auto (probe-verified strobealign / minimap2 / bwa-mem2 / bwa)</option>
-                    <option value="strobealign">strobealign</option>
-                    <option value="minimap2">minimap2</option>
-                    <option value="bwa-mem2">bwa-mem2</option>
-                    <option value="bwa">bwa</option>
-                </param>
-                <param name="emit_drm" type="boolean" truevalue="true" falsevalue="false" checked="true" label="Emit WHO drug-resistance and CNV summary TSV" help="Outputs per-isolate WHO antimalarial resistance, CNV, hrp2/3 deletion, and F_WS calls for Pf3D7 cohorts."/>
-            </when>
             <when value="diploid_wgs">
                 <conditional name="input_source">
-                    <param name="source_type" type="select" label="Input source" help="Provide paired-end History FASTQ(.gz), a pre-aligned History BAM/CRAM, or a cohort manifest.">
-                        <option value="history_fq" selected="true">Galaxy History paired-end FASTQ(.gz)</option>
-                        <option value="history_bam">Galaxy History aligned BAM or CRAM</option>
-                        <option value="manifest">Multi-sample or remote manifest TSV (FASTQ, INSDC, or CRAM+CRAI)</option>
+                    <param name="source_type" type="select" label="Sequencing input source" help="Analyze paired FASTQ files or an aligned BAM/CRAM from your Galaxy History, or supply a multi-sample manifest.">
+                        <option value="history_fq" selected="true">Galaxy History paired-end FASTQ files (R1 and R2)</option>
+                        <option value="history_bam">Galaxy History aligned BAM or CRAM file</option>
+                        <option value="manifest">Multi-sample or remote manifest (TSV/CSV)</option>
                     </param>
                     <when value="history_fq">
-                        <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ/FASTQ.GZ)" help="Forward (R1) FASTQ or FASTQ.GZ dataset from your Galaxy History."/>
-                        <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ/FASTQ.GZ)" help="Reverse (R2) FASTQ or FASTQ.GZ dataset paired with R1."/>
-                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier (VCF SM tag)" help="Sample name written to the VCF SM column and summary table.">
-                            <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">[A-Za-z0-9_.-]+</validator>
+                        <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ)" help="Forward (R1) sequencing reads in FASTQ or gzip-compressed FASTQ format."/>
+                        <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ)" help="Reverse (R2) sequencing reads paired with R1."/>
+                        <param argument="--sample-name" type="text" value="sample_1" label="Sample name" help="Sample name written into the VCF header, summary table, and HTML report.">
+                            <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
                         </param>
                     </when>
                     <when value="history_bam">
-                        <param argument="--bam" type="data" format="bam,cram" label="Aligned reads (BAM or CRAM)" help="Coordinate-sorted BAM or CRAM dataset matching the selected reference FASTA."/>
-                        <param argument="--crai" type="data" format="data" optional="true" label="CRAM/BAM index (.crai or .bai, optional)" help="Optional index dataset, generated automatically if omitted for local datasets."/>
-                        <param argument="--sample-name" type="text" value="SAMPLE" label="Sample identifier (VCF SM tag)" help="Sample name written to the VCF SM column and summary table.">
-                            <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">[A-Za-z0-9_.-]+</validator>
+                        <param argument="--bam" type="data" format="bam,cram" label="Aligned reads (BAM or CRAM)" help="Coordinate-sorted BAM or CRAM dataset aligned to the selected reference genome."/>
+                        <param argument="--crai" type="data" format="data" optional="true" label="Explicit alignment index (.crai or .bai, optional)" help="Leave empty to use the index Galaxy already tracks for your BAM or CRAM dataset."/>
+                        <param argument="--sample-name" type="text" value="sample_1" label="Sample name" help="Sample name written into the VCF header, summary table, and HTML report.">
+                            <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
                         </param>
                     </when>
                     <when value="manifest">
-                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Cohort manifest (TSV/CSV)" help="Columns: sample_id, group_or_population, source_uri_or_srr[, mate2_url, crai_uri]."/>
-                        <param argument="--reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Galaxy History FASTQ files (optional)" help="Optional History FASTQ datasets matched to manifest rows by element identifier or sample_id."/>
+                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Cohort manifest (TSV or CSV)" help="Table listing sample_id, group, and source (plus mate2_url for paired remote FASTQs or crai_uri for remote CRAMs). Paired-end reads are required for FASTQ rows."/>
+                        <param argument="--reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Galaxy History FASTQ files (optional)" help="Optional local paired FASTQ datasets named sample_id_R1.fastq.gz and sample_id_R2.fastq.gz matching manifest rows."/>
                     </when>
                 </conditional>
-                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" label="Reference genome FASTA" help="Diploid reference assembly (e.g., GRCh38) matching the reads or BAM/CRAM header."/>
-                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Target calling intervals BED (optional)" help="Restricts variant calling and multi-k local reassembly to declared BED regions (e.g., challenging medically relevant genes or exome panels)."/>
-                <param argument="--mapper" type="select" label="Short-read aligner (for FASTQ inputs)" help="Auto selects the fastest probe-verified aligner available on the cluster node.">
-                    <option value="auto" selected="true">Auto (probe-verified strobealign / minimap2 / bwa-mem2 / bwa)</option>
+                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Target regions (BED, optional)" help="Optional 0-based BED intervals restricting variant calling and local haplotype reassembly to genes or panels of interest."/>
+                <param argument="--mapper" type="select" label="Short-read aligner (for FASTQ inputs)" help="Auto tests installed aligners on the server and selects the fastest working option.">
+                    <option value="auto" selected="true">Auto (fastest available aligner)</option>
                     <option value="strobealign">strobealign</option>
                     <option value="minimap2">minimap2</option>
-                    <option value="bwa-mem2">bwa-mem2</option>
-                    <option value="bwa">bwa</option>
+                    <option value="bwa-mem2">BWA-MEM2</option>
+                    <option value="bwa">BWA</option>
                 </param>
-                <param argument="--subsample-fraction" type="float" min="0.01" max="1.0" value="1.0" label="Read subsampling fraction (C lockstep filter)" help="Set below 1.0 (e.g., 0.5) to deterministically subsample paired FASTQ spots in C before alignment."/>
+                <param argument="--subsample-fraction" type="float" min="0.01" max="1.0" value="1.0" label="Read subsampling fraction (for FASTQ inputs, 1.0 = use all reads)" help="Deterministically keeps this fraction of paired FASTQ reads before alignment (ignored for BAM/CRAM inputs). Leave at 1.0 to analyze every read."/>
+            </when>
+            <when value="focused_cram">
+                <conditional name="input_source">
+                    <param name="source_type" type="select" label="Alignment input source" help="Slice a single CRAM or BAM file from your Galaxy History, or fetch target slices across a manifest of remote CRAM URLs.">
+                        <option value="history_cram" selected="true">Single Galaxy History CRAM or BAM file</option>
+                        <option value="manifest">Multi-sample manifest (TSV/CSV with CRAM and CRAI URLs)</option>
+                    </param>
+                    <when value="history_cram">
+                        <param argument="--bam" type="data" format="cram,bam" label="Aligned reads (CRAM or BAM)" help="Coordinate-sorted CRAM or BAM file aligned to the selected reference genome."/>
+                        <param argument="--crai" type="data" format="data" optional="true" label="Explicit alignment index (.crai or .bai, optional)" help="Leave empty to use Galaxy's built-in index metadata, or select a .crai file explicitly to enable compressed-block CRAM slicing."/>
+                        <param argument="--sample-name" type="text" value="sample_1" label="Sample name" help="Sample name written into the VCF header, summary table, and HTML report.">
+                            <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
+                        </param>
+                    </when>
+                    <when value="manifest">
+                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Sample manifest (TSV or CSV)" help="Table with columns sample_id, group, source (CRAM URL or path), and crai_uri (.crai index URL or path)."/>
+                    </when>
+                </conditional>
+                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Target regions (BED, recommended)" help="0-based BED intervals specifying which genomic regions to slice out of the CRAM file. When omitted, all contigs in the reference are processed."/>
+                <param argument="--cram-pad-bp" type="integer" min="0" max="50000" value="1000" label="Flanking padding around target regions (bp)" help="Extra bases included on both sides of each BED interval when selecting compressed CRAM blocks."/>
+            </when>
+            <when value="wgs_stream">
+                <conditional name="input_source">
+                    <param name="source_type" type="select" label="FASTQ input source" help="Filter and call variants on paired FASTQ files from your Galaxy History or a multi-sample manifest.">
+                        <option value="history_fq" selected="true">Galaxy History paired-end FASTQ files (R1 and R2)</option>
+                        <option value="manifest">Multi-sample manifest (TSV/CSV for History FASTQs, URLs, or public accessions)</option>
+                    </param>
+                    <when value="history_fq">
+                        <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ)" help="Forward (R1) sequencing reads in FASTQ or gzip-compressed FASTQ format."/>
+                        <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ)" help="Reverse (R2) sequencing reads paired with R1."/>
+                        <param argument="--sample-name" type="text" value="sample_1" label="Sample name" help="Sample name written into the VCF header, summary table, and HTML report.">
+                            <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
+                        </param>
+                    </when>
+                    <when value="manifest">
+                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Sample manifest (TSV or CSV)" help="Table with columns sample_id, group, and source (plus mate2_url for remote paired FASTQs). Paired-end reads are required for FASTQ rows."/>
+                        <param argument="--reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Galaxy History FASTQ files (optional)" help="Optional local paired FASTQ datasets named sample_id_R1.fastq.gz and sample_id_R2.fastq.gz matching manifest rows."/>
+                    </when>
+                </conditional>
+                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Target regions (BED, optional)" help="0-based BED intervals restricting both the 31-mer pre-filter and variant calling. Required if your full reference genome is larger than 45 Mb and the pre-filter is enabled."/>
+                <param argument="--host-depletion" type="boolean" truevalue="--host-depletion" falsevalue="--no-host-depletion" checked="true" label="Filter out host and off-target reads before alignment" help="Retains only read pairs sharing 31-mer matches with your reference or target BED regions before short-read alignment (supports target spans up to 45 Mb)."/>
+                <param argument="--mapper" type="select" label="Short-read aligner" help="Auto tests installed aligners on the server and selects the fastest working option.">
+                    <option value="auto" selected="true">Auto (fastest available aligner)</option>
+                    <option value="strobealign">strobealign</option>
+                    <option value="minimap2">minimap2</option>
+                    <option value="bwa-mem2">BWA-MEM2</option>
+                    <option value="bwa">BWA</option>
+                </param>
             </when>
         </conditional>
-        <section name="calling_options" title="Variant calling &amp; local reassembly options" expanded="false">
-            <param argument="--reassembly" type="boolean" truevalue="" falsevalue="--no-reassembly" checked="true" label="Enable multi-k Simple Omnitig local active-region reassembly" help="Reassembles indel, soft-clip, and complex MNP clusters using Phred-weighted k=31/k=55 de Bruijn graphs and C semi-global haplotype scoring."/>
-            <param argument="--min-mapq" type="integer" min="0" max="60" value="20" label="Minimum mapping quality (MAPQ)" help="Reads with MAPQ below this threshold are excluded from pileup accumulation."/>
-            <param argument="--min-bq" type="integer" min="0" max="45" value="13" label="Minimum base quality (Phred)" help="Individual bases below this Phred score are excluded from SNV counts."/>
-            <param argument="--snv-min-qual" type="float" min="0.0" max="200.0" value="20.0" label="Minimum SNV Phred QUAL" help="Posterior Phred quality threshold for emitting SNV calls."/>
-            <param argument="--indel-min-qual" type="float" min="0.0" max="200.0" value="15.0" label="Minimum Indel Phred QUAL" help="Posterior Phred quality threshold for emitting indel calls."/>
-            <param argument="--dedup-bits" type="integer" min="16" max="24" value="20" label="PCR duplicate filter table size (log2 slots per shard)" help="20 bits = 1,048,576 slots/shard (~8 MB/shard). Increase to 24 for deep 35x human WGS."/>
-            <param argument="--sample-timeout" type="float" min="30.0" max="7200.0" value="420.0" label="Per-sample streaming timeout (seconds)" help="Maximum wall time allowed per remote sample fetch or stream."/>
+
+        <section name="calling_options" title="Variant calling and quality filters" expanded="false">
+            <param argument="--reassembly" type="boolean" truevalue="--reassembly" falsevalue="--no-reassembly" checked="true" label="Enable local haplotype reassembly" help="Reassembles active regions around indels, soft-clipped alignments, and clustered variants to improve indel and complex variant accuracy."/>
+            <param argument="--min-mapq" type="integer" min="0" max="60" value="20" label="Minimum mapping quality (MAPQ)" help="Reads with mapping quality below this cutoff are ignored during variant calling."/>
+            <param argument="--min-bq" type="integer" min="0" max="45" value="13" label="Minimum base quality (Phred)" help="Individual read bases with Phred quality below this cutoff are excluded from allele counts."/>
+            <param argument="--snv-min-qual" type="float" min="0.0" max="200.0" value="20.0" label="Minimum SNV quality score (QUAL)" help="Minimum Phred-scaled variant quality required to report a single-nucleotide variant."/>
+            <param argument="--indel-min-qual" type="float" min="0.0" max="200.0" value="15.0" label="Minimum indel quality score (QUAL)" help="Minimum Phred-scaled variant quality required to report an insertion or deletion."/>
         </section>
     </inputs>
     <outputs>
-        <data name="variants_vcf" format="vcf" label="${tool.name} on ${on_string}: variants.vcf"/>
-        <data name="variants_summary" format="tabular" label="${tool.name} on ${on_string}: variants_summary.tsv"/>
-        <data name="drm_calls" format="tabular" label="${tool.name} on ${on_string}: drm_calls.tsv">
-            <filter>analysis_mode['mode'] in ('focused_cram', 'wgs_stream') and analysis_mode['emit_drm']</filter>
-        </data>
-        <data name="variationloop_report" format="html" label="${tool.name} on ${on_string}: variationloop_report.html"/>
-        <data name="variationloop_state" format="data" label="${tool.name} on ${on_string}: variationloop_state.focaloop.tar.zst"/>
+        <data name="variants_vcf" format="vcf" label="${tool.name} on ${on_string}: Variant calls (VCF)"/>
+        <data name="variants_summary" format="tabular" label="${tool.name} on ${on_string}: Variant summary table (TSV)"/>
+        <data name="variationloop_report" format="html" label="${tool.name} on ${on_string}: HTML report"/>
+        <data name="variationloop_state" format="data" label="${tool.name} on ${on_string}: State bundle (.focaloop.tar.zst)"/>
     </outputs>
     <tests>
         <test expect_num_outputs="4">
+            <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
             <conditional name="analysis_mode">
                 <param name="mode" value="diploid_wgs"/>
                 <conditional name="input_source">
                     <param name="source_type" value="history_fq"/>
                     <param name="reads_r1" value="variationloop/sample_R1.fastq.gz" ftype="fastqsanger.gz"/>
                     <param name="reads_r2" value="variationloop/sample_R2.fastq.gz" ftype="fastqsanger.gz"/>
-                    <param name="sample_name" value="HG_MINI"/>
+                    <param name="sample_name" value="sample_diploid"/>
                 </conditional>
-                <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
                 <param name="targets_bed" value="variationloop/targets.bed" ftype="bed"/>
                 <param name="mapper" value="auto"/>
                 <param name="subsample_fraction" value="1.0"/>
@@ -242,12 +232,11 @@ focaloop variationloop
             <section name="calling_options">
                 <param name="reassembly" value="true"/>
                 <param name="min_mapq" value="20"/>
-                <param name="dedup_bits" value="18"/>
             </section>
             <output name="variants_vcf">
                 <assert_contents>
                     <has_text text="#CHROM"/>
-                    <has_text text="HG_MINI"/>
+                    <has_text text="sample_diploid"/>
                     <has_text text="0/1"/>
                     <has_text text="1/1"/>
                 </assert_contents>
@@ -262,7 +251,7 @@ focaloop variationloop
             <output name="variationloop_report">
                 <assert_contents>
                     <has_text text="Focaloop VariationLoop"/>
-                    <has_text text="HG_MINI"/>
+                    <has_text text="sample_diploid"/>
                 </assert_contents>
             </output>
             <output name="variationloop_state">
@@ -272,34 +261,34 @@ focaloop variationloop
             </output>
         </test>
         <test expect_num_outputs="4">
+            <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
             <conditional name="analysis_mode">
                 <param name="mode" value="focused_cram"/>
                 <conditional name="input_source">
                     <param name="source_type" value="history_cram"/>
                     <param name="bam" value="variationloop/sample.cram" ftype="cram"/>
                     <param name="crai" value="variationloop/sample.cram.crai"/>
-                    <param name="sample_name" value="HG_CRAM"/>
+                    <param name="sample_name" value="sample_cram"/>
                 </conditional>
-                <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
                 <param name="targets_bed" value="variationloop/targets.bed" ftype="bed"/>
                 <param name="cram_pad_bp" value="500"/>
-                <param name="emit_drm" value="false"/>
             </conditional>
             <output name="variants_vcf">
                 <assert_contents>
-                    <has_text text="HG_CRAM"/>
+                    <has_text text="sample_cram"/>
                     <has_text text="chr20_mini"/>
                 </assert_contents>
             </output>
             <output name="variants_summary">
                 <assert_contents>
-                    <has_text text="HG_CRAM"/>
+                    <has_text text="sample_cram"/>
                     <has_text text="INDEL"/>
                 </assert_contents>
             </output>
             <output name="variationloop_report">
                 <assert_contents>
                     <has_text text="focused_cram"/>
+                    <has_text text="sample_cram"/>
                 </assert_contents>
             </output>
             <output name="variationloop_state">
@@ -308,7 +297,8 @@ focaloop variationloop
                 </assert_contents>
             </output>
         </test>
-        <test expect_num_outputs="5">
+        <test expect_num_outputs="4">
+            <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
             <conditional name="analysis_mode">
                 <param name="mode" value="wgs_stream"/>
                 <conditional name="input_source">
@@ -316,10 +306,8 @@ focaloop variationloop
                     <param name="manifest" value="variationloop/manifest_wgs.tsv" ftype="tabular"/>
                     <param name="reads" value="variationloop/sample_R1.fastq.gz,variationloop/sample_R2.fastq.gz" ftype="fastqsanger.gz"/>
                 </conditional>
-                <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
                 <param name="targets_bed" value="variationloop/targets.bed" ftype="bed"/>
                 <param name="host_depletion" value="true"/>
-                <param name="emit_drm" value="true"/>
             </conditional>
             <output name="variants_vcf">
                 <assert_contents>
@@ -331,11 +319,6 @@ focaloop variationloop
                 <assert_contents>
                     <has_text text="SNV"/>
                     <has_text text="INDEL"/>
-                </assert_contents>
-            </output>
-            <output name="drm_calls">
-                <assert_contents>
-                    <has_text text="sample_id"/>
                 </assert_contents>
             </output>
             <output name="variationloop_report">
@@ -351,86 +334,112 @@ focaloop variationloop
         </test>
     </tests>
     <help format="markdown"><![CDATA[
-**What It Does**
+**What this tool does**
 
-**Focaloop VariationLoop** performs byte-budgeted, memory-bounded variant calling, drug-resistance surveillance, and diploid genotyping directly from Galaxy History files (FASTQ, BAM, CRAM) or remote INSDC/CRAM archives without materializing full multi-gigabyte intermediate alignments.
-
------
-
-**Mode Selection Guide**
-
-Choose the analysis mode matching your biological question and data source:
-
-- **Focused CRAM range surveillance (`focused_cram`)**:
-  Reads only the `.crai` container index and fetches the byte ranges overlapping either the 55 curated *Plasmodium falciparum* drug-resistance/CNV/*hrp2/3* barcode windows (when using the bundled Pf3D7 reference) or your custom BED intervals. Ideal for large remote CRAM surveillance cohorts (~20 MB transferred per 1.5 GB CRAM) or targeted clinical panels.
-- **Pathogen WGS adaptive streaming with host depletion (`wgs_stream`)**:
-  Streams raw INSDC (`ERR`/`SRR`) runs, HTTP FASTQ URLs, or History FASTQs through an inline C 31-mer / PLA host-depletion filter that strips host/off-target reads in memory before mapping, halting automatically once the adaptive stop gate reaches target core depth and breadth stability.
-- **Diploid human / eukaryotic VariationLoop (`diploid_wgs`)**:
-  Runs a lock-free contig-sharded and 64 kb lazy-paged C pileup accumulator (`PagedContigAccumulator`), 62-bit coordinate+insert-length PCR duplicate filter, Beta-Binomial overdispersed diploid SNV/indel genotyper (`0/0`, `0/1`, `1/1`, `1/2`, spanning-deletion aware), and multi-k (`k=31`, `k=55`) Simple Omnitig + C semi-global Phred haplotype active-region reassembler.
+**Focaloop VariationLoop** calls single-nucleotide variants (SNVs) and small insertions or deletions (indels) for any organism with a reference genome FASTA. It avoids writing large intermediate BAM files by streaming reads directly into a low-memory pileup and duplicate-removal engine, and supports targeted CRAM slicing as well as on-the-fly removal of host or off-target reads before alignment.
 
 -----
 
-**Manifest & Input Requirements**
+**How it works**
 
-For single-sample History runs, select **Single Galaxy History CRAM/BAM** or **Galaxy History paired-end FASTQ(.gz)** directly.
+1. **Input retrieval and optional pre-filtering:** Depending on the workflow you choose, VariationLoop either aligns paired-end FASTQ reads directly, slices only the compressed CRAM blocks overlapping your BED target intervals (using the `.crai` index so unrequested regions are never read), or discards host and off-target read pairs in memory using a fast 31-mer target screen before alignment.
+2. **Single-pass pileup and duplicate removal:** Aligned reads are accumulated directly into contig-level pileups with PCR duplicate filtering scaled automatically to your reference genome size.
+3. **Diploid genotyping and local haplotype reassembly:** Sites passing mapping and base-quality filters are genotyped (`0/1`, `1/1`, `1/2`), and active regions containing indels, soft-clipped reads, or clustered substitutions are reassembled locally to sharpen indel coordinates and allele counts.
+4. **Reporting and state export:** Results are written as a standard VCF file, a clean tabular variant summary, a self-contained HTML report, and a compact `.focaloop.tar.zst` state bundle.
 
-For multi-sample or remote streaming cohorts, provide a tab-separated (TSV) or comma-separated (CSV) manifest with a header row:
+**Local Galaxy History files vs. remote URLs and public accessions**
 
-**Mode A (`focused_cram`) manifest columns:**
+- **Galaxy History FASTQ, BAM, or CRAM files:** Processed directly from Galaxy storage with no network downloads. When you supply a CRAM file with a `.crai` index and a BED file in **Indexed CRAM region slicing** mode, only the compressed blocks overlapping your target intervals are decoded.
+- **Remote CRAM URLs with a `.crai` index:** Only the header and the compressed byte ranges covering your padded BED intervals are fetched over HTTPS, avoiding multi-gigabyte whole-file downloads.
+- **Remote FASTQ URLs or public SRA/ENA accessions:** Retrieved per sample in a manifest and aligned (or pre-filtered against your reference/BED target regions first in target-filtered mode).
+
+**What is saved in the state bundle**
+
+The `.focaloop.tar.zst` archive stores per-sample variant calls, alignment run statistics, and sample group metadata from your manifest. When you analyze a multi-sample cohort containing two or more labeled groups (such as two populations, sampling sites, or treatment arms), you can pass this state bundle directly to **Focaloop Query** to compare allele frequencies and compute population differentiation (Fst) in seconds with zero re-alignment.
+
+-----
+
+**Choosing a workflow**
+
+| Your goal | Workflow to choose | Best inputs |
+|---|---|---|
+| Standard SNV and indel calling across a genome or gene panel | **Whole-genome or targeted variant calling** | Paired FASTQ files, aligned BAM/CRAM, or a multi-sample manifest |
+| Fast variant calling inside specific genes from large CRAM files | **Indexed CRAM region slicing** | CRAM file (History or HTTPS URL) + `.crai` index + BED target regions |
+| Call variants in microbial, viral, or targeted samples contaminated with host DNA | **Target-filtered FASTQ calling** | Paired FASTQ files or manifest + reference genome (or BED intervals under 45 Mb) |
+
+-----
+
+**Inputs and manifest format**
+
+Always select the **Reference genome (FASTA)** matching your sequencing reads or alignment files. Note that FASTQ inputs must be paired-end (R1 and R2).
+
+For single-sample runs, select your paired FASTQ files or aligned BAM/CRAM directly from your Galaxy History. For multi-sample or remote cohorts, upload a tab-separated (TSV) or comma-separated (CSV) manifest with a header row:
+
+| Column | Required | Description |
+|---|---|---|
+| `sample_id` | Yes | Unique sample name written to VCF and summary outputs |
+| `group` (or `population`, `country_or_group`) | Recommended | Cohort, site, or population label used for summaries and **Focaloop Query** comparisons |
+| `source` (or `run_or_url`, `source_uri_or_srr`) | Yes | Local dataset stem, remote CRAM/FASTQ HTTPS URL, or public SRA/ENA accession (`SRR`, `ERR`, or `DRR` prefix) |
+| `mate2_url` | Remote paired FASTQ | Required HTTPS URL of the reverse (R2) FASTQ file whenever `source` is a remote R1 FASTQ URL |
+| `crai_uri` | Remote CRAM | HTTPS URL or path to the `.crai` index matching a remote CRAM file |
+
+Example manifest for **Indexed CRAM region slicing**:
 
 ```
-sample_id	country_or_group	source_uri_or_srr	crai_uri	population
-PH1387-C	Cambodia	https://example.org/cram/PH1387-C.cram	https://example.org/cram/PH1387-C.cram.crai	AS-SE-E
-PF1002-C	Ghana	https://example.org/cram/PF1002-C.cram	https://example.org/cram/PF1002-C.cram.crai	AF-W
+sample_id	group	source	crai_uri
+sample_1	site_north	https://example.org/cram/sample_1.cram	https://example.org/cram/sample_1.cram.crai
+sample_2	site_south	https://example.org/cram/sample_2.cram	https://example.org/cram/sample_2.cram.crai
 ```
 
-**Mode B (`wgs_stream`) manifest columns:**
+Example manifest for **Whole-genome** or **Target-filtered FASTQ calling**:
 
 ```
-sample_id	country_or_group	source_uri_or_srr	population
-ERR123456	Ghana	ERR123456	AF-W
-sample_local	Mali	sample_local	AF-W
-```
-
-- `source_uri_or_srr`: INSDC accession (`ERR...`/`SRR...`/`DRR...`), HTTP(S) FASTQ URL (pair separated by `;`), or the matching Galaxy History FASTQ element identifier when attaching History reads.
-
-**Mode C (`diploid_wgs`) manifest columns:**
-
-```
-sample_id	country_or_group	source_uri_or_srr	mate2_url	crai_uri
-HG002	GIAB	https://example.org/HG002_R1.fastq.gz	https://example.org/HG002_R2.fastq.gz	
+sample_id	group	source	mate2_url
+sample_1	group_a	RUN_ACCESSION_1	
+sample_2	group_b	https://example.org/reads/sample_2_R1.fastq.gz	https://example.org/reads/sample_2_R2.fastq.gz
 ```
 
 -----
 
-**Parameter Guide**
+**Key parameters**
 
-- **Reference genome FASTA (`--ref-fasta`)**: Optional in pathogen surveillance modes when analyzing *P. falciparum* (defaults to bundled PlasmoDB-54 Pf3D7); required for diploid human/eukaryotic calling and custom references.
-- **Custom target regions BED (`--targets-bed`)**: Optional 0-based BED intervals restricting calling, target 31-mer baiting, or CRAM container range selection.
-- **Target median core depth (`--target-depth`)**: Mode B adaptive stop-gate target (default `24.0x`).
-- **Host depletion filter (`--host-depletion`)**: Enables on-the-fly C 31-mer / PLA filtering of host or off-target spots in Mode B.
-- **Short-read aligner (`--mapper`)**: `Auto` probes candidate mappers (`strobealign`, `minimap2`, `bwa-mem2`, `bwa`) at runtime and selects the fastest working binary.
-- **Multi-k Simple Omnitig reassembly (`--reassembly`)**: Reassembles active regions around indels, soft-clips, and clustered variants (`k=31` escalating to `k=55` across tandem repeats) and scores haplotypes with exact Phred-weighted semi-global alignment.
-- **PCR duplicate filter table size (`--dedup-bits`)**: Log2 slots per shard (`20` = ~8 Mb/shard for panels/pathogens; set to `24` for 35x human WGS).
+- **Target regions (BED):** Limits CRAM slicing, 31-mer read pre-filtering, and variant calling to specific chromosomes or intervals. Recommended whenever analyzing targeted panels or slicing large CRAM archives.
+- **Filter out host and off-target reads before alignment:** Available in **Target-filtered FASTQ calling**. Keeps only read pairs sharing 31-mer sequence matches with your reference or BED intervals before mapping. For genomes larger than 45 Mb, supply a target BED file covering your regions of interest (under 45 Mb total) or turn the pre-filter off.
+- **Read subsampling fraction:** Set below `1.0` (for example, `0.5`) to deterministically downsample deep paired-end FASTQ libraries before alignment.
+- **Local haplotype reassembly:** Enabled by default. Substantially improves indel accuracy and multi-nucleotide variant calls around repeat or complex regions.
+- **Minimum MAPQ, base quality, and QUAL thresholds:** Standard quality filters excluding low-confidence alignments, low-quality bases, and weak variant calls.
 
 -----
 
 **Outputs**
 
-1. **`variants.vcf`**: Standard VCFv4.2 variant calls (`GT:GQ:DP:AD` in diploid mode; `GT:DP:AD:WSAF` in pathogen mode).
-2. **`variants_summary.tsv`**: Tab-separated summary of all variant calls (`sample_id`, `chrom`, `pos`, `ref`, `alt`, `kind`, `gt`, `dp`, `ad_ref`, `ad_alt`, `qual`).
-3. **`drm_calls.tsv`** *(pathogen modes when enabled)*: Per-isolate WHO antimalarial resistance classifications, `kelch13` / `crt` / `dhfr` / `dhps` / `mdr1` genotypes, CNV calls (`mdr1`, `pm2_pm3`, `gch1`, `crt`), *hrp2/3* deletions, and within-host clonality ($F_{WS}$).
-4. **`variationloop_report.html`**: Self-contained interactive HTML report summarizing per-sample streaming telemetry, host depletion statistics, variant counts, and cohort prevalence.
-5. **`variationloop_state.focaloop.tar.zst`**: Compressed warm-state archive for zero-new-byte follow-up contrasts and $F_{ST}$ queries in **Focaloop Query**.
+1. **Variant calls (`variants.vcf`):** Standard VCFv4.2 file with per-sample genotype fields (`GT:GQ:DP:AD`). Multi-sample cohorts are merged into a single VCF.
+2. **Variant summary table (`variants_summary.tsv`):** Flat tab-separated table with one row per sample-variant call.
+3. **HTML report:** Self-contained visual summary showing per-sample read counts, duplicate removal, SNV and indel totals, and variant distributions.
+4. **State bundle (`variationloop_state.focaloop.tar.zst`):** Saved cohort archive compatible with **Focaloop Query** for follow-up population allele-frequency and Fst comparisons.
+
+Key columns in `variants_summary.tsv`:
+
+| Column | Meaning |
+|---|---|
+| `sample_id` | Sample identifier from your form or manifest |
+| `chrom`, `pos` | Reference chromosome/contig and 1-based genomic coordinate |
+| `ref`, `alt` | Reference allele and called alternate allele |
+| `kind` | Variant class (`SNV` or `INDEL`) |
+| `gt`, `gq` | Called genotype (`0/1` heterozygous, `1/1` homozygous alternate) and genotype quality |
+| `dp`, `ad_ref`, `ad_alt` | Total filtered read depth and allele depths supporting reference vs. alternate |
+| `qual` | Phred-scaled variant call confidence score |
+| `source` | Variant caller label (`variationloop`) |
 
 -----
 
-**Citations**
+**Tips and troubleshooting**
 
-- MalariaGEN *Pf8* & *P. falciparum* drug-resistance surveillance (`doi:10.12688/wellcomeopenres.18681.1`).
-- Rahman & Medvedev (2022), *Simple Omnitigs*; Sun & Medvedev (2019), *VarGeno*.
+- **Target pre-filter limit exceeded on a large genome:** The in-memory 31-mer host/off-target filter supports target spans up to 45 Mb. For mammalian or large plant genomes, either supply a gene-panel BED file or use **Whole-genome or targeted variant calling**.
+- **Matching local Galaxy History FASTQ files to a manifest:** Name paired datasets as `<sample_id>_R1.fastq.gz` and `<sample_id>_R2.fastq.gz` (or `_1` / `_2`). Trailing mate suffixes and FASTQ extensions are stripped to match `sample_id` in the manifest.
+- **Missing CRAM index:** Galaxy generates `.crai` indexes automatically for CRAM datasets in your History. For remote CRAM URLs, include the `.crai` URL in the `crai_uri` manifest column.
     ]]></help>
     <expand macro="citations">
-        <citation type="doi">10.12688/wellcomeopenres.18681.1</citation>
+        <citation type="doi">10.1093/bioinformatics/bty191</citation>
     </expand>
 </tool>

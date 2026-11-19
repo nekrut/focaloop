@@ -127,7 +127,7 @@ static inline int32_t dust_score_31(const uint8_t *seq, int64_t pos) {
 static inline int kset_insert(uint64_t *tab, uint64_t mask, uint64_t key) {
     uint64_t h = mix64(key) & mask;
     uint64_t k1 = key + 1ULL;
-    for (;;) {
+    for (uint64_t step = 0; step <= mask; step++) {
         uint64_t v = tab[h];
         if (v == 0ULL) {
             tab[h] = k1;
@@ -136,17 +136,19 @@ static inline int kset_insert(uint64_t *tab, uint64_t mask, uint64_t key) {
         if (v == k1) return 0;
         h = (h + 1ULL) & mask;
     }
+    return -1;
 }
 
 static inline int kset_has(const uint64_t *tab, uint64_t mask, uint64_t key) {
     uint64_t h = mix64(key) & mask;
     uint64_t k1 = key + 1ULL;
-    for (;;) {
+    for (uint64_t step = 0; step <= mask; step++) {
         uint64_t v = tab[h];
         if (v == k1) return 1;
         if (v == 0ULL) return 0;
         h = (h + 1ULL) & mask;
     }
+    return 0;
 }
 
 int vl_kset_build(
@@ -161,6 +163,7 @@ int vl_kset_build(
 ) {
     if ((tab_len & (tab_len - 1ULL)) != 0ULL) return -1;
     uint64_t mask = tab_len - 1ULL;
+    int64_t max_ins = (int64_t)((tab_len * 3ULL) / 4ULL);
     int64_t n_ins = 0, n_dust = 0;
     for (int64_t iv = 0; iv < n_iv; iv++) {
         int64_t s = iv_starts[iv], e = iv_ends[iv];
@@ -181,7 +184,10 @@ int vl_kset_build(
                     continue;
                 }
                 uint64_t canon = fw < rv ? fw : rv;
-                n_ins += kset_insert(tab, mask, canon);
+                int ins = kset_insert(tab, mask, canon);
+                if (ins < 0) return -2;
+                n_ins += ins;
+                if (n_ins >= max_ins) return -2;
             }
         }
     }

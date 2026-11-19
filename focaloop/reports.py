@@ -202,6 +202,7 @@ def render_panexpr_report(
     catalog_summary: dict[str, Any],
     loop_summary: dict[str, Any],
     de_df: pd.DataFrame,
+    brand: str = "Focaloop ExpressionLoop",
 ) -> Path:
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -276,11 +277,11 @@ def render_panexpr_report(
 
     doc = f"""<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Focaloop PanExpr Report — {_esc(contrast_str)}</title>{_BASE_CSS}</head>
+<head><meta charset="utf-8"><title>{_esc(brand)} Report — {_esc(contrast_str)}</title>{_BASE_CSS}</head>
 <body>
 <div class="wrap">
   <div class="hero">
-    <h1>Focaloop PanExpr — Adaptive RNA-seq Differential Expression Report</h1>
+    <h1>{_esc(brand)} — Adaptive RNA-seq Differential Expression Report</h1>
     <p>Primary Contrast: <strong>{_esc(contrast_str)}</strong> &nbsp;·&nbsp; Source Mode: <code>{_esc(loop_summary.get('source_mode'))}</code> &nbsp;·&nbsp; Strandedness: <code>{_esc(loop_summary.get('strand_mode'))}</code></p>
   </div>
   <div class="kpis">
@@ -463,17 +464,17 @@ def render_query_report(
 
     doc = f"""<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Focaloop Warm Query — {_esc(contrast_str)}</title>{_BASE_CSS}</head>
+<head><meta charset="utf-8"><title>Focaloop Query — {_esc(contrast_str)}</title>{_BASE_CSS}</head>
 <body>
 <div class="wrap">
   <div class="hero">
-    <h1>Focaloop Query — Warm-State Instant Contrast / Sub-Cohort Comparison</h1>
-    <p>Engine: <code>{_esc(engine)}</code> &nbsp;·&nbsp; Contrast / Query: <strong>{_esc(contrast_str)}</strong> &nbsp;·&nbsp; Network Sockets: <span class="badge b-green">BLOCKED (0 bytes downloaded)</span></p>
+    <h1>Focaloop Query — Instant Follow-Up Comparison</h1>
+    <p>Source: <code>{_esc(engine)}</code> &nbsp;·&nbsp; Comparison: <strong>{_esc(contrast_str)}</strong> &nbsp;·&nbsp; Network Access: <span class="badge b-green">OFFLINE (0 bytes downloaded)</span></p>
   </div>
   <div class="kpis">
-    <div class="kpi"><div class="label">Network Bytes</div><div class="val">0 B</div><div class="sub">Pure warm-state execution</div></div>
-    <div class="kpi"><div class="label">Query Runtime</div><div class="val">{float(verdict.get('wall_seconds', 0.0)):.2f}s</div><div class="sub">Zero FASTQ/CRAM re-streaming</div></div>
-    <div class="kpi"><div class="label">Hypothesis Ledger</div><div class="val">{_fmt_num(verdict.get('wealth_after'), 4)}</div><div class="sub">α-wealth remaining (spent {_fmt_num(verdict.get('alpha_spent'), 4)})</div></div>
+    <div class="kpi"><div class="label">Network Bytes</div><div class="val">0 B</div><div class="sub">Computed from saved state bundle</div></div>
+    <div class="kpi"><div class="label">Query Runtime</div><div class="val">{float(verdict.get('wall_seconds', 0.0)):.2f}s</div><div class="sub">Zero FASTQ or CRAM re-reading</div></div>
+    <div class="kpi"><div class="label">Error Budget Remaining</div><div class="val">{_fmt_num(verdict.get('wealth_after'), 4)}</div><div class="sub">Allocated {_fmt_num(verdict.get('alpha_spent'), 4)} for this test</div></div>
     <div class="kpi"><div class="label">Summary Metric</div><div class="val">{_esc(verdict.get('headline_metric', 'ok'))}</div><div class="sub">{_esc(verdict.get('headline_detail', ''))}</div></div>
   </div>
   <div class="section">

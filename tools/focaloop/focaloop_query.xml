@@ -1,64 +1,136 @@
-<tool id="focaloop_query" name="Focaloop Query warm-state instant contrast and sub-cohort comparison" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
-    <description>zero-network-byte follow-up contrast or sub-cohort F_ST guarded by HypothesisLedger</description>
+<tool id="focaloop_query" name="Focaloop Query" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>run instant follow-up comparisons on saved Focaloop results without re-downloading reads</description>
     <macros>
         <import>macros.xml</import>
     </macros>
     <expand macro="edam_topics"/>
+    <edam_operations>
+        <edam_operation>operation_3223</edam_operation>
+        <edam_operation>operation_3197</edam_operation>
+        <edam_operation>operation_2238</edam_operation>
+    </edam_operations>
+    <expand macro="creator"/>
     <expand macro="requirements"/>
     <version_command>focaloop --version</version_command>
     <command detect_errors="aggressive"><![CDATA[
 focaloop query
-    --state-dir '$state'
-    --contrast '$contrast'
-    --actor '$actor'
-    #if str($hypothesis).strip()
-        --hypothesis '$hypothesis'
+    --state '$state'
+    #if str($query_type.mode) == "contrast"
+        --mode contrast
+        --contrast '${query_type.factor_name}:${query_type.group_a}:${query_type.group_b}'
+        #if str($query_type.hypothesis).strip()
+            --hypothesis '$query_type.hypothesis'
+        #end if
+        #if str($query_type.design).strip()
+            --design '$query_type.design'
+        #end if
+    #elif str($query_type.mode) == "fst"
+        --mode fst
+        --contrast '${query_type.group_column}=${query_type.group_a}:${query_type.group_b}'
+        #if str($query_type.hypothesis).strip()
+            --hypothesis '$query_type.hypothesis'
+        #end if
+    #else
+        --mode auto
+        --contrast '$query_type.contrast'
+        #if str($query_type.hypothesis).strip()
+            --hypothesis '$query_type.hypothesis'
+        #end if
+        #if str($query_type.design).strip()
+            --design '$query_type.design'
+        #end if
     #end if
-    #if str($design).strip()
-        --design '$design'
-    #end if
-    --mode '$mode'
+    --actor 'human'
+    --alpha-budget $validation_options.alpha_budget
+    --n-perm $validation_options.n_perm
     --out-table '$query_table'
     --out-verdict '$verdict'
     --out-report '$query_report'
     --out-state-archive '$state_out'
     ]]></command>
     <inputs>
-        <param argument="--state-dir" name="state" type="data" format="data" label="Saved Focaloop state (.focaloop.tar.zst)" help="Warm state bundle produced by ExpressionLoop or VariationLoop."/>
-        <param argument="--contrast" type="text" value="condition:treated:control" label="Contrast or sub-cohort comparison" help="Contrast specification, e.g. condition:AR0387:AR0382 or Population:AS-SE-E:AF-W.">
-            <validator type="regex" message="Use A:B, factor:A:B, or factor=A:B">([A-Za-z0-9_]+[:=])?[A-Za-z0-9_,.-]+:[A-Za-z0-9_,.-]+</validator>
-        </param>
-        <param argument="--actor" type="text" value="human" label="Actor recorded in HypothesisLedger" help="Identifier for alpha-wealth accounting, e.g. 'human' or 'agent:name'.">
-            <validator type="regex" message="Use 'human' or 'agent:name'">(human|agent:[A-Za-z0-9_.-]+)</validator>
-        </param>
-        <param argument="--hypothesis" type="text" value="" label="Specific gene or group to test (optional)" help="Leave blank to test the top discovery hit automatically.">
-            <validator type="regex" message="Letters, digits, '_', ':', '.', '-', '=' only">[A-Za-z0-9_:.=-]*</validator>
-        </param>
-        <param argument="--design" type="text" value="" label="Optional Wilkinson formula override (ExpressionLoop)" help="Optional formula such as '~ batch + condition' when querying an expression state.">
-            <sanitizer>
-                <valid initial="default">
-                    <add value="~"/>
-                </valid>
-            </sanitizer>
-            <validator type="regex" message="Formula characters only">[A-Za-z0-9_ +~:*()-]*</validator>
-        </param>
-        <param argument="--mode" type="select" label="Query mode" help="Choose auto-detection or force expression contrast vs. variant F_ST mode.">
-            <option value="auto" selected="true">Auto-detect from saved state</option>
-            <option value="contrast">Differential expression contrast</option>
-            <option value="fst">Sub-cohort F_ST and prevalence</option>
-        </param>
+        <param argument="--state" type="data" format="data" label="Saved Focaloop state bundle (.focaloop.tar.zst)" help="State archive produced by Focaloop ExpressionLoop, Focaloop VariationLoop (multi-group cohort), or a previous Focaloop Query run. GeneLoop state bundles cannot be queried here."/>
+
+        <conditional name="query_type">
+            <param argument="--mode" type="select" label="Comparison type" help="Choose differential expression testing for an ExpressionLoop state, population allele-frequency and Fst comparison for a VariationLoop cohort state, or auto-detect.">
+                <option value="contrast" selected="true">Differential expression contrast (ExpressionLoop state)</option>
+                <option value="fst">Population allele-frequency and Fst comparison (VariationLoop state)</option>
+                <option value="auto">Auto-detect from saved state (free-form contrast string)</option>
+            </param>
+            <when value="contrast">
+                <param name="factor_name" type="text" value="condition" label="Grouping column in original sample sheet" help="Name of the metadata column containing the groups you want to compare (for example, condition or treatment).">
+                    <validator type="regex" message="Use letters, digits, or underscores only">^[A-Za-z0-9_]+$</validator>
+                </param>
+                <param name="group_a" type="text" value="treated" label="Test group (numerator)" help="Group level for the numerator. Positive log2 fold changes mean higher expression in this group.">
+                    <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
+                </param>
+                <param name="group_b" type="text" value="control" label="Reference group (denominator)" help="Baseline group level for the denominator.">
+                    <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
+                </param>
+                <param argument="--hypothesis" type="text" value="" label="Specific gene ID to validate on held-out reads (optional)" help="Leave blank to validate the top-ranked gene automatically. Results for all genes are always written to the output table.">
+                    <validator type="regex" message="Use letters, digits, underscores, colons, dots, hyphens, or equals signs only">^[A-Za-z0-9_:.=-]*$</validator>
+                </param>
+                <param argument="--design" type="text" value="" label="Override statistical model formula (optional)" help="Leave blank to reuse the original model formula, or supply a new formula such as ~batch + condition.">
+                    <sanitizer>
+                        <valid initial="default">
+                            <add value="~"/>
+                        </valid>
+                    </sanitizer>
+                    <validator type="regex" message="Formula must start with ~ followed by valid column names">^($|~\s*[A-Za-z0-9_]+(\s*[+*:]\s*[A-Za-z0-9_]+)*)$</validator>
+                </param>
+            </when>
+            <when value="fst">
+                <param name="group_column" type="text" value="group" label="Grouping column in original sample manifest" help="Metadata column defining the sub-cohorts to compare (for example, group, site, or population).">
+                    <validator type="regex" message="Use letters, digits, or underscores only">^[A-Za-z0-9_]+$</validator>
+                </param>
+                <param name="group_a" type="text" value="group_a" label="First group (Group A)" help="One group label (or comma-separated labels) for the first population.">
+                    <validator type="regex" message="Use letters, digits, underscores, dots, commas, or hyphens only">^[A-Za-z0-9_,.-]+$</validator>
+                </param>
+                <param name="group_b" type="text" value="group_b" label="Second group (Group B)" help="One group label (or comma-separated labels) for the second population.">
+                    <validator type="regex" message="Use letters, digits, underscores, dots, commas, or hyphens only">^[A-Za-z0-9_,.-]+$</validator>
+                </param>
+                <param argument="--hypothesis" type="text" value="" label="Specific chromosome or genomic interval to focus on (optional)" help="Optional chromosome name (for example, chr1) or interval (chr1:1000-5000) to restrict the comparison. Leave blank for all called sites.">
+                    <validator type="regex" message="Use letters, digits, underscores, colons, dots, hyphens, or equals signs only">^[A-Za-z0-9_:.=-]*$</validator>
+                </param>
+            </when>
+            <when value="auto">
+                <param argument="--contrast" type="text" value="condition:treated:control" label="Comparison specification" help="Written as groupA:groupB or factor:groupA:groupB for expression states, or column=groupA:groupB for variant cohorts.">
+                    <validator type="regex" message="Use groupA:groupB, factor:groupA:groupB, or column=groupA:groupB">^([A-Za-z0-9_]+[:=])?[A-Za-z0-9_,.-]+:[A-Za-z0-9_,.-]+$</validator>
+                </param>
+                <param argument="--hypothesis" type="text" value="" label="Specific gene ID or genomic region to test (optional)" help="Leave blank to test the top discovery hit or genome-wide comparison automatically.">
+                    <validator type="regex" message="Use letters, digits, underscores, colons, dots, hyphens, or equals signs only">^[A-Za-z0-9_:.=-]*$</validator>
+                </param>
+                <param argument="--design" type="text" value="" label="Override statistical model formula (ExpressionLoop only, optional)" help="Optional formula such as ~batch + condition when querying an ExpressionLoop state.">
+                    <sanitizer>
+                        <valid initial="default">
+                            <add value="~"/>
+                        </valid>
+                    </sanitizer>
+                    <validator type="regex" message="Formula must start with ~ followed by valid column names">^($|~\s*[A-Za-z0-9_]+(\s*[+*:]\s*[A-Za-z0-9_]+)*)$</validator>
+                </param>
+            </when>
+        </conditional>
+
+        <section name="validation_options" title="Statistical validation options" expanded="false">
+            <param argument="--alpha-budget" type="float" min="0.001" max="0.50" value="0.05" label="Cumulative significance error budget (alpha)" help="Total false-discovery budget shared across repeated follow-up queries on the same saved state bundle. Only used when initializing a fresh ledger."/>
+            <param argument="--n-perm" type="integer" min="19" max="9999" value="199" label="Permutation replicates (population Fst p-value)" help="Number of random group-label permutations used to estimate the permutation p-value in population Fst comparisons (minimum p-value is 1 / (replicates + 1))."/>
+        </section>
     </inputs>
     <outputs>
-        <data name="query_table" format="tabular" label="${tool.name} on ${on_string}: query_table.tsv"/>
-        <data name="verdict" format="json" label="${tool.name} on ${on_string}: verdict.json"/>
-        <data name="query_report" format="html" label="${tool.name} on ${on_string}: query_report.html"/>
-        <data name="state_out" format="data" label="${tool.name} on ${on_string}: updated state (.focaloop.tar.zst)"/>
+        <data name="query_table" format="tabular" label="${tool.name} on ${on_string}: Query results (TSV)"/>
+        <data name="verdict" format="json" label="${tool.name} on ${on_string}: Validation summary (JSON)"/>
+        <data name="query_report" format="html" label="${tool.name} on ${on_string}: HTML report"/>
+        <data name="state_out" format="data" label="${tool.name} on ${on_string}: Updated state bundle (.focaloop.tar.zst)"/>
     </outputs>
     <tests>
         <test expect_num_outputs="4">
             <param name="state" value="panexpr_state.tar.zst" ftype="data"/>
-            <param name="contrast" value="treated:control"/>
-            <param name="actor" value="agent:planemo"/>
+            <conditional name="query_type">
+                <param name="mode" value="contrast"/>
+                <param name="factor_name" value="condition"/>
+                <param name="group_a" value="treated"/>
+                <param name="group_b" value="control"/>
+            </conditional>
             <output name="query_table">
                 <assert_contents>
                     <has_text text="g2"/>
@@ -82,9 +154,12 @@ focaloop query
         </test>
         <test expect_num_outputs="4">
             <param name="state" value="malariavar_state.tar.zst" ftype="data"/>
-            <param name="contrast" value="site=Ghana:Mali"/>
-            <param name="actor" value="human"/>
-            <param name="mode" value="fst"/>
+            <conditional name="query_type">
+                <param name="mode" value="fst"/>
+                <param name="group_column" value="site"/>
+                <param name="group_a" value="Ghana"/>
+                <param name="group_b" value="Mali"/>
+            </conditional>
             <output name="query_table">
                 <assert_contents>
                     <has_text text="hudson_fst"/>
@@ -108,27 +183,78 @@ focaloop query
         </test>
     </tests>
     <help format="markdown"><![CDATA[
-**What it does**
+**What this tool does**
 
-Executes a zero-network-byte follow-up contrast (`ExpressionLoop`) or sub-cohort resistance and Hudson *F_ST*
-comparison (`VariationLoop`) against a saved `.focaloop.tar.zst` warm state bundle, charging alpha-wealth in
-the persisted `HypothesisLedger`.
+**Focaloop Query** runs new differential expression contrasts or population allele-frequency comparisons directly against a saved `.focaloop.tar.zst` state bundle from **Focaloop ExpressionLoop** or **Focaloop VariationLoop**. It finishes in seconds and downloads zero new sequencing bytes.
+
+-----
+
+**How it works**
+
+1. **Offline recomputation:** Focaloop Query opens your saved state bundle (which already contains per-sample counts, variant calls, and sample group metadata) and disables network access completely while running your requested comparison.
+2. **Full-table computation:** For an **ExpressionLoop** state, it refits the differential expression model across every gene for your new group comparison (and optional updated design formula). For a multi-group **VariationLoop** state, it computes per-site alternate allele frequencies, allele-frequency differences, and Hudson Fst across your two selected sub-cohorts plus a permutation p-value.
+3. **Holdout check and cumulative error budget:** Running many follow-up tests on the same dataset increases the risk of false positives. Focaloop guards against repeated-testing bias by checking the focal hit against an independent held-out slice of reads (when stored in the bundle) and debiting a small share of a cumulative significance error budget (default `0.05`) recorded in the state bundle's ledger.
+4. **Updated state export:** Every query outputs an **Updated state bundle** with the new test recorded in its ledger. Pass that updated bundle into your next **Focaloop Query** call so your cumulative error budget stays properly tracked across a sequence of follow-up questions.
+
+**Compatible vs. incompatible state bundles**
+
+- **Compatible:** State bundles produced by **Focaloop ExpressionLoop**, multi-group cohort runs of **Focaloop VariationLoop**, or earlier **Focaloop Query** runs.
+- **Not compatible:** State bundles from **Focaloop GeneLoop** (genome annotation telemetry archives) or single-sample **Focaloop VariationLoop** runs that contain only one group label.
+
+-----
+
+**Choosing a comparison type**
+
+| State bundle source | Comparison type to choose | Example comparison |
+|---|---|---|
+| **Focaloop ExpressionLoop** | **Differential expression contrast** | Column `condition`, Test group `dose_high`, Reference group `control` |
+| **Focaloop VariationLoop** (multi-group cohort) | **Population allele-frequency and Fst comparison** | Column `site`, First group `north`, Second group `south` |
+| Either (or scripted workflows) | **Auto-detect from saved state** | `condition:treated:control` or `site=north:south` |
 
 -----
 
 **Inputs**
 
-- **Saved Focaloop state:** The `.focaloop.tar.zst` archive emitted by a prior ExpressionLoop or VariationLoop run.
-- **Contrast:** Either `treated:control` / `factor:treated:control` (expression) or `group_field=PopA:PopB` (variation).
+- **Saved Focaloop state bundle:** Select the `.focaloop.tar.zst` archive emitted by **Focaloop ExpressionLoop**, **Focaloop VariationLoop**, or a prior **Focaloop Query** run.
+- **Grouping column and group labels:** Must match column names and group labels from the sample sheet or manifest used in the original run. In population Fst mode, you may combine multiple labels into one group with commas (for example, `site_a,site_b` vs. `site_c`).
+- **Specific gene ID or genomic region (optional):** In ExpressionLoop mode, names one specific gene whose discovery and held-out estimates are checked by the validation ledger (the full genome-wide table is still output). In VariationLoop mode, optionally limits the Fst calculation to one chromosome (`chr1`) or interval (`chr1:1000-5000`).
+
+-----
+
+**Key parameters**
+
+- **Override statistical model formula (ExpressionLoop only):** Leave blank to keep the model formula from the original run, or enter a new formula (for example, `~batch + condition`) referencing columns from the original sample sheet.
+- **Cumulative significance error budget (`--alpha-budget`):** Default `0.05`. Controls the total false-positive budget tracked across sequential follow-up queries on the same state bundle.
+- **Permutation replicates (`--n-perm`):** Default `199`. Increases resolution of the permutation p-value in population Fst queries (with 199 replicates, the smallest possible p-value is `0.005`).
 
 -----
 
 **Outputs**
 
-- `query_table.tsv`: Per-feature test statistics or per-locus allele frequency and *F_ST* table.
-- `verdict.json`: Machine-readable hypothesis test summary and remaining alpha-wealth (`new_bytes = 0`).
-- `query_report.html`: Interactive HTML report summarizing the query.
-- `updated state (.focaloop.tar.zst)`: State archive with the new `HypothesisLedger` entry appended.
+1. **Query results (`query_table.tsv`):** Full gene-level differential expression table (ExpressionLoop state) or per-variant allele-frequency and Hudson Fst table (VariationLoop state).
+2. **Validation summary (`verdict.json`):** Machine-readable summary confirming zero network bytes transferred (`new_bytes: 0`), headline effect size, whether the focal test was confirmed (`confirmed`), and remaining statistical error budget (`wealth_after`).
+3. **HTML report:** Self-contained visual summary showing `0 B` transferred, headline statistics, remaining significance budget, and top rows of the results table.
+4. **Updated state bundle (`updated_state.focaloop.tar.zst`):** Copy of the input state archive with this query appended to the statistical test ledger. Use this output as the input to your next **Focaloop Query** run.
+
+Key columns in `query_table.tsv` (**VariationLoop** population comparison):
+
+| Column | Meaning |
+|---|---|
+| `chrom`, `pos`, `ref`, `alt` | Variant genomic coordinate and alleles |
+| `af_group_a`, `af_group_b` | Alternate allele frequency in Group A and Group B (0 to 1) |
+| `delta_af` | Difference in alternate allele frequency (`af_group_a - af_group_b`) |
+| `hudson_fst` | Per-site Hudson Fst population differentiation statistic (0 = identical allele frequencies, 1 = completely fixed difference) |
+| `n_group_a`, `n_group_b` | Number of samples in Group A and Group B |
+
+Key columns in `query_table.tsv` (**ExpressionLoop** contrast): match `de_results.tsv` from **Focaloop ExpressionLoop** (`gene_id`, `gene_name`, `baseMean`, `log2FoldChange`, `lfcSE_total`, `pvalue`, `padj`).
+
+-----
+
+**Tips and troubleshooting**
+
+- **Always chain the updated state bundle:** If you run three follow-up comparisons in a row, feed Query 1's **Updated state bundle** into Query 2, and Query 2's into Query 3 so the cumulative error budget accounts for all three tests.
+- **Group label not found error:** Check exact spelling and capitalization against the original sample sheet or manifest columns.
+- **Requested gene ID not found:** In ExpressionLoop mode, make sure your optional hypothesis gene ID matches the `gene_id` column in `de_results.tsv` (or leave blank to test the top-ranked gene automatically).
     ]]></help>
     <expand macro="citations">
         <citation type="doi">10.1126/science.aaa9375</citation>

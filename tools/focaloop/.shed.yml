@@ -2,12 +2,14 @@ categories:
 - Sequence Analysis
 - RNA
 - Variant Analysis
-description: Adaptive byte-budgeted streaming loops for RNA-seq expression, genomic variation, and genome annotation.
+- Genome annotation
+description: Adaptive streaming genomics tools for RNA-seq differential expression, genomic variant calling, eukaryotic genome annotation, and follow-up result queries.
 long_description: |
-  Focaloop provides adaptive, byte-budgeted genomics pipelines that stream only the
-  reads required to reach statistical convergence across RNA-seq differential expression
-  (ExpressionLoop), variant and drug-resistance calling (VariationLoop), eukaryotic
-  genome annotation (GeneLoop), and zero-new-byte warm-state hypothesis querying
+  Focaloop provides adaptive genomics tools that analyze only the sequencing data
+  needed to reach stable biological conclusions across RNA-seq differential
+  expression (Focaloop ExpressionLoop), genomic variant calling (Focaloop
+  VariationLoop), eukaryotic structural genome annotation (Focaloop GeneLoop),
+  and instant follow-up comparisons on saved results without re-downloading reads
   (Focaloop Query).
 name: focaloop
 owner: iuc
@@ -16,8 +18,8 @@ remote_repository_url: https://github.com/galaxyproject/tools-iuc/tree/main/tool
 type: unrestricted
 auto_tool_repositories:
   name_template: "{{ tool_id }}"
-  description_template: "Wrapper for Focaloop tool: {{ tool_name }}."
+  description_template: "Wrapper for {{ tool_name }}."
 suite:
   name: "suite_focaloop"
-  description: "A suite of Galaxy tools for Focaloop adaptive streaming genomics (ExpressionLoop, VariationLoop, GeneLoop, Focaloop Query)."
+  description: "Focaloop suite for adaptive RNA-seq differential expression, genomic variant calling, eukaryotic genome annotation, and follow-up queries."
   type: repository_suite_definition

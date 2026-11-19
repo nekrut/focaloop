@@ -1793,7 +1793,7 @@ class GateRun:
             t0, c0 = time.time(), self_cpu()
             res = synthesize(
                 self.genome, s["tiberius"], s["hits"], s["loci"], params=self.sp, prefix="GLA",
-                organelle_contigs=org_set, raw_ncrna_candidates=raw_ncrna,
+                organelle_contigs=org_set, raw_ncrna_candidates=raw_ncrna, zoom=self._enable_zoom,
             )
             write_gff3(res.models, out)
             write_gff3(_tiberius_models(s["tiberius"]), ad / "tiberius_standalone.gff3")

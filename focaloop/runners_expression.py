@@ -40,6 +40,35 @@ def _log(msg: str) -> None:
     print(f"[focaloop-expressionloop] {safe_msg}", file=sys.stderr, flush=True)
 
 
+def _sniff_annotation_ext(path: Path) -> str:
+    """Detect GFF3 vs GTF by content (works even when Galaxy stages files as dataset_*.dat)."""
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(2)
+        opener = gzip.open if magic == b"\x1f\x8b" else open
+        with opener(path, "rt", encoding="utf-8", errors="replace") as tf:
+            for _ in range(200):
+                ln = tf.readline()
+                if not ln:
+                    break
+                s = ln.strip()
+                if not s:
+                    continue
+                if s.startswith("##gff-version 3"):
+                    return ".gff3"
+                if s.startswith("#"):
+                    continue
+                parts = s.split("\t")
+                if len(parts) >= 9:
+                    attr = parts[8]
+                    if ("ID=" in attr or "Parent=" in attr) and 'gene_id "' not in attr:
+                        return ".gff3"
+                    return ".gtf"
+    except OSError:
+        pass
+    return ".gff3" if str(path).endswith((".gff", ".gff3", ".gff.gz", ".gff3.gz")) else ".gtf"
+
+
 def _gunzip_if_needed(src: str | Path, dst_dir: Path, out_name: str) -> Path:
     src_p = Path(src)
     dst = dst_dir / out_name
@@ -514,7 +543,7 @@ def run_expressionloop_galaxy(
 
         refs_dir = work_dir / "refs"
         p_fna = _gunzip_if_needed(ref_fasta, refs_dir, f"{primary_label}.fna")
-        gtf_ext = ".gff3" if str(ref_gtf).endswith((".gff", ".gff3", ".gff.gz", ".gff3.gz")) else ".gtf"
+        gtf_ext = _sniff_annotation_ext(Path(ref_gtf))
         p_gtf = _gunzip_if_needed(ref_gtf, refs_dir, f"{primary_label}{gtf_ext}")
         org_mode = _detect_organism_mode(p_gtf, organism_mode)
 
@@ -523,7 +552,7 @@ def run_expressionloop_galaxy(
             raise ValueError("Both --secondary-fasta and --secondary-gtf must be provided together.")
         if secondary_fasta and secondary_gtf:
             s_fna = _gunzip_if_needed(secondary_fasta, refs_dir, f"{secondary_label}.fna")
-            s_ext = ".gff3" if str(secondary_gtf).endswith((".gff", ".gff3", ".gff.gz", ".gff3.gz")) else ".gtf"
+            s_ext = _sniff_annotation_ext(Path(secondary_gtf))
             s_gtf = _gunzip_if_needed(secondary_gtf, refs_dir, f"{secondary_label}{s_ext}")
             specs.append(AssemblySpec(secondary_label, s_fna, s_gtf))
 

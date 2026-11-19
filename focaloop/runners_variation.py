@@ -101,7 +101,7 @@ def _fmt_num(v: Any, digits: int = 3) -> str:
 
 
 def _gunzip_if_needed(src: str | Path, dst_dir: Path, out_name: str) -> Path:
-    src_p = Path(src)
+    src_p = Path(src).resolve()
     dst = dst_dir / out_name
     dst_dir.mkdir(parents=True, exist_ok=True)
     with open(src_p, "rb") as fh:
@@ -110,7 +110,10 @@ def _gunzip_if_needed(src: str | Path, dst_dir: Path, out_name: str) -> Path:
         with gzip.open(src_p, "rb") as fi, open(dst, "wb") as fo:
             shutil.copyfileobj(fi, fo)
         return dst
-    return src_p.resolve()
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    os.symlink(src_p, dst)
+    return dst
 
 
 def _is_gzip_file(path: Path) -> bool:
@@ -1172,9 +1175,11 @@ def run_variationloop_galaxy(
     min_bq: int = 13,
     snv_min_qual: float = 20.0,
     indel_min_qual: float = 15.0,
-    dedup_bits: int = 20,
+    dedup_bits: int | None = None,
+    reference_label: str | None = None,
+    surveillance_panel: str = "none",
 ) -> dict[str, Any]:
-    """Execute Focaloop VariationLoop across focused CRAM, pathogen WGS stream, or diploid human WGS."""
+    """Execute Focaloop VariationLoop across diploid WGS/targeted, CRAM range slicing, or target-filtered FASTQ calling."""
     if analysis_mode not in ("focused_cram", "wgs_stream", "diploid_wgs"):
         raise ValueError(f"Unsupported analysis_mode {analysis_mode!r}")
 
@@ -1194,8 +1199,13 @@ def run_variationloop_galaxy(
         local_map[sample_name] = pair
 
     try:
-        # Pathogen Pf3D7 surveillance path when in Mode A/B and Pf3D7 assets match & are present
-        if analysis_mode in ("focused_cram", "wgs_stream") and _pf3d7_assets_ready(ref_fasta):
+        # Specialized P. falciparum surveillance branch only when explicitly opted in (or legacy call with no ref_fasta)
+        use_pf3d7 = (
+            analysis_mode in ("focused_cram", "wgs_stream")
+            and (surveillance_panel == "pf3d7" or ref_fasta is None)
+            and _pf3d7_assets_ready(ref_fasta)
+        )
+        if use_pf3d7:
             if manifest_path:
                 rows_raw = _read_manifest_table(manifest_path)
             elif bam_path and analysis_mode == "focused_cram":
@@ -1307,13 +1317,26 @@ def run_variationloop_galaxy(
         else:
             raise ValueError("Provide a sample manifest, History paired FASTQ files, or a History BAM/CRAM file")
 
+        total_genome_bp = sum(ctg_lens.values())
+        if dedup_bits is None:
+            if total_genome_bp < 1_000_000:
+                eff_dedup_bits = 18
+            elif total_genome_bp < 100_000_000:
+                eff_dedup_bits = 20
+            elif total_genome_bp < 1_000_000_000:
+                eff_dedup_bits = 22
+            else:
+                eff_dedup_bits = 24
+        else:
+            eff_dedup_bits = int(dedup_bits)
+
         dp_params = VG.DiploidParams(
             min_mapq=int(min_mapq),
             min_bq=int(min_bq),
             snv_min_qual=float(snv_min_qual),
             indel_min_qual=float(indel_min_qual),
             enable_reassembly=bool(enable_reassembly),
-            dedup_bits=int(dedup_bits),
+            dedup_bits=eff_dedup_bits,
         )
         chosen_mapper: str | None = None
         sample_tels: list[dict[str, Any]] = []
@@ -1321,13 +1344,24 @@ def run_variationloop_galaxy(
         per_sample_vcfs: list[Path] = []
         p_frac = float(np.clip(subsample_fraction, 1e-4, 1.0))
 
-        # Optional host/off-target 31-mer depletion filter for Mode B custom reference
+        # Optional host/off-target 31-mer retention filter for target-filtered FASTQ calling
         kset_tab = None
         if analysis_mode == "wgs_stream" and use_host_depletion:
             regs_k = bed_regions or [(cn, 0, ln) for cn, ln in ctg_lens.items()]
-            bits_k = 20 if sum(e - s for _, s, e in regs_k) < 500_000 else 26
+            target_span = sum(max(0, e - s) for _, s, e in regs_k)
+            if target_span > 45_000_000:
+                raise ValueError(
+                    f"Target 31-mer read filter span ({target_span / 1e6:.1f} Mb) exceeds the 45 Mb in-memory limit. "
+                    "Provide a target BED file covering your regions of interest or disable the 31-mer pre-filter."
+                )
+            if target_span < 500_000:
+                bits_k = 20
+            elif target_span < 8_000_000:
+                bits_k = 24
+            else:
+                bits_k = 26
             kset_tab, kmeta = VG.build_target_kset(g, regs_k, bits=bits_k)
-            _log(f"Built custom target 31-mer depletion table ({kmeta['inserted_kmers']:,} k-mers)")
+            _log(f"Built target 31-mer pre-filter table ({kmeta['inserted_kmers']:,} k-mers across {target_span / 1e6:.2f} Mb)")
 
         for idx_j, job in enumerate(jobs, 1):
             sid = job["sample"]
@@ -1452,9 +1486,14 @@ def run_variationloop_galaxy(
                 ]
             ).to_csv(out_drm_p, sep="\t", index=False)
 
+        ref_lbl = (reference_label or "").strip()
+        if not ref_lbl:
+            raw_ref_name = Path(ref_fasta).name
+            ref_lbl = "reference_genome" if raw_ref_name.endswith(".dat") else raw_ref_name
+
         summary_stats = {
             "mode": analysis_mode,
-            "reference_label": Path(ref_fasta).name,
+            "reference_label": ref_lbl,
             "n_samples": len(jobs),
             "n_variants": len(variants_df),
             "wall_s": round(time.time() - t_start, 2),
@@ -1471,13 +1510,20 @@ def run_variationloop_galaxy(
         HypothesisLedger.from_store(store, alpha_budget=0.05)
         variants_df.to_parquet(state_root / "variants.parquet", index=False)
         pd.DataFrame(sample_tels).to_parquet(state_root / "sample_telemetry.parquet", index=False)
+        sample_records = []
+        for j in jobs:
+            rec = {"sample": j["sample"], "group": j["group"], "condition": j["group"]}
+            for k, v in (j.get("row") or {}).items():
+                if k and k not in rec and v:
+                    rec[k] = v
+            sample_records.append(rec)
         state_meta = {
             "engine": "variationloop",
             "version": "0.3.0",
-            "blueprint_id": "malariavar",
+            "blueprint_id": "variationloop",
             "mode": analysis_mode,
             "summary": summary_stats,
-            "samples": [{"sample": j["sample"], "condition": j["group"]} for j in jobs],
+            "samples": sample_records,
         }
         write_json(state_root / STATE_META, state_meta)
         if state_archive:

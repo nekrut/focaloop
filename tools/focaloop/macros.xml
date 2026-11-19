@@ -2,12 +2,20 @@
     <token name="@TOOL_VERSION@">0.3.0</token>
     <token name="@VERSION_SUFFIX@">0</token>
     <token name="@PROFILE@">25.0</token>
-    <token name="@THREADS@">--threads \${GALAXY_SLOTS:-8}</token>
+    <token name="@THREADS@">--threads \${GALAXY_SLOTS:-1}</token>
+
+    <xml name="creator">
+        <creator>
+            <person givenName="Anton" familyName="Nekrutenko" url="https://github.com/nekrut"/>
+            <organization name="Galaxy Project" url="https://galaxyproject.org"/>
+        </creator>
+    </xml>
 
     <xml name="requirements">
         <requirements>
             <requirement type="package" version="@TOOL_VERSION@">focaloop</requirement>
             <yield/>
+            <!-- Drop explicit container tag in tools-iuc PR once Bioconda BioContainer is live -->
             <container type="docker">ghcr.io/nekrut/focaloop:@TOOL_VERSION@</container>
         </requirements>
     </xml>
@@ -24,7 +32,7 @@
         <citations>
             <citation type="bibtex">@misc{focaloop2026,
   author = {Nekrutenko, Anton and Galaxy Project},
-  title = {Focaloop: Adaptive Byte-Budgeted Streaming Loops for Genomics},
+  title = {Focaloop: Adaptive Streaming Genomics Tools for Expression, Variation, and Genome Annotation},
   year = {2026},
   url = {https://github.com/nekrut/focaloop}
 }</citation>

@@ -47,7 +47,14 @@ def run_query(state_ref: str | Path, contrast: str, actor: str, out_table: str |
     state_dir, tmp = materialize_state(state_ref)
     try:
         meta = _meta(state_dir)
-        if meta.get("engine") in ("panexpr", "malariavar"):
+        eng = meta.get("engine")
+        if eng == "geneloop":
+            raise ValueError(
+                "Saved GeneLoop state bundles store genome annotation telemetry and cannot be queried for "
+                "differential expression contrasts or population allele-frequency comparisons. "
+                "Provide a state bundle from Focaloop ExpressionLoop or Focaloop VariationLoop."
+            )
+        if eng in ("panexpr", "expressionloop", "malariavar", "variationloop"):
             from .galaxy_runners import run_warm_engine_query
 
             return run_warm_engine_query(
@@ -59,6 +66,8 @@ def run_query(state_ref: str | Path, contrast: str, actor: str, out_table: str |
                 out_verdict=out_verdict,
                 hypothesis=hypothesis,
                 design_override=design,
+                mode=mode,
+                n_perm=n_perm,
                 out_report=out_report,
                 out_state_archive=out_state_archive,
                 alpha_budget=alpha_budget,
@@ -121,15 +130,24 @@ def run_query(state_ref: str | Path, contrast: str, actor: str, out_table: str |
         if out_report:
             from .reports import render_query_report
 
+            raw_eng = str(meta.get("blueprint_id") or meta.get("engine") or mode)
+            disp_eng = {
+                "panexpr": "ExpressionLoop",
+                "expressionloop": "ExpressionLoop",
+                "malariavar": "VariationLoop",
+                "variationloop": "VariationLoop",
+            }.get(raw_eng, raw_eng)
             vdict = {
                 **verdict.__dict__,
+                "wealth_after": verdict.alpha_wealth_after,
+                "alpha_spent": verdict.alpha_allocated,
                 "wall_seconds": out["wall_seconds"],
                 "headline_metric": f"{mode}: {clean(d_est):.4g}",
                 "headline_detail": spec,
             }
             render_query_report(
                 out_report,
-                engine=str(meta.get("blueprint_id") or meta.get("engine") or mode),
+                engine=disp_eng,
                 contrast_str=contrast,
                 verdict=vdict,
                 table_df=table,

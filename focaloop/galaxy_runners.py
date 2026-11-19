@@ -589,6 +589,7 @@ def run_panexpr_galaxy(
             catalog_summary=cat_summary,
             loop_summary=loop_summary,
             de_df=de_df,
+            brand="Focaloop PanExpr",
         )
 
         # Persist warm metadata + HypothesisLedger inside state_root
@@ -1207,11 +1208,13 @@ def run_warm_engine_query(
     out_verdict: str | Path,
     hypothesis: str | None = None,
     design_override: str | None = None,
+    mode: str = "auto",
+    n_perm: int = 199,
     out_report: str | Path | None = None,
     out_state_archive: str | Path | None = None,
     alpha_budget: float = 0.05,
 ) -> dict[str, Any]:
-    """Execute 0-network-byte warm query on a PanExpr or MalariaVar state directory."""
+    """Execute 0-network-byte warm query on an ExpressionLoop or VariationLoop state directory."""
     t0 = time.time()
     engine = meta["engine"]
     store = FocaloopStateStore(state_dir)
@@ -1219,7 +1222,9 @@ def run_warm_engine_query(
 
     sock_guard = _block_all_network_sockets()
     try:
-        if engine == "panexpr":
+        if engine in ("panexpr", "expressionloop"):
+            if mode == "fst":
+                raise ValueError("Mode 'fst' is only valid for VariationLoop states, not ExpressionLoop states.")
             from .panexpr.catalog import Catalog
             from .panexpr.solver import de_with_uncertainty, gene_level_tables
 
@@ -1265,7 +1270,9 @@ def run_warm_engine_query(
                 if hypothesis:
                     key = hypothesis.split("=", 1)[-1].strip()
                     hit = de_df[(de_df["gene_id"] == key) | (de_df["ortholog_bridge"].str.contains(key, na=False))]
-                    row0 = hit.iloc[0] if not hit.empty else de_df.iloc[0]
+                    if hit.empty:
+                        raise ValueError(f"Requested hypothesis gene {key!r} was not found in the differential expression table.")
+                    row0 = hit.iloc[0]
                 else:
                     row0 = de_df.iloc[0]
                 target_gene = str(row0["gene_id"])
@@ -1322,12 +1329,14 @@ def run_warm_engine_query(
             if out_report:
                 render_query_report(
                     out_report,
-                    engine="panexpr",
+                    engine="ExpressionLoop",
                     contrast_str=f"{fac}: {lvl_a} vs {lvl_b}",
                     verdict=out_doc,
                     table_df=de_df,
                 )
         elif engine == "malariavar":
+            if mode == "contrast":
+                raise ValueError("Mode 'contrast' is only valid for ExpressionLoop states, not VariationLoop states.")
             from .malariavar import query as MQ
 
             cohort_dir = state_dir / "cohort"
@@ -1547,7 +1556,174 @@ def run_warm_engine_query(
             if out_report:
                 render_query_report(
                     out_report,
-                    engine="malariavar",
+                    engine="VariationLoop",
+                    contrast_str=f"{chosen_col}: {','.join(vals_a)} vs {','.join(vals_b)}",
+                    verdict=out_doc,
+                    table_df=table_df,
+                )
+        elif engine == "variationloop":
+            if mode == "contrast":
+                raise ValueError("Mode 'contrast' is only valid for ExpressionLoop states, not VariationLoop states.")
+            vpath = state_dir / "variants.parquet"
+            if not vpath.exists():
+                raise FileNotFoundError(f"Saved VariationLoop state is missing variants.parquet: {state_dir}")
+            vdf = pd.read_parquet(vpath)
+            s_rows = meta.get("samples") or []
+            if not s_rows:
+                raise ValueError("Saved VariationLoop state contains no sample metadata for group comparisons.")
+            s_df = pd.DataFrame(s_rows)
+
+            raw_c = contrast.strip()
+            if "=" in raw_c and ":" in raw_c:
+                col_hint, rest = raw_c.split("=", 1)
+                grp_a_s, grp_b_s = rest.split(":", 1)
+            elif raw_c.count(":") >= 2:
+                col_hint, grp_a_s, grp_b_s = raw_c.split(":", 2)
+            elif ":" in raw_c:
+                col_hint = "auto"
+                grp_a_s, grp_b_s = raw_c.split(":", 1)
+            elif "_vs_" in raw_c:
+                col_hint = "auto"
+                grp_a_s, grp_b_s = raw_c.split("_vs_", 1)
+            else:
+                raise ValueError(f"Invalid contrast {contrast!r}; expected field=GroupA:GroupB or GroupA:GroupB")
+
+            vals_a = [x.strip() for x in grp_a_s.split(",") if x.strip()]
+            vals_b = [x.strip() for x in grp_b_s.split(",") if x.strip()]
+            cand_cols = [c for c in s_df.columns if c != "sample"]
+            chosen_col = None
+            if col_hint != "auto":
+                for c in cand_cols:
+                    if c.lower() == col_hint.strip().lower():
+                        chosen_col = c
+                        break
+            if chosen_col is None:
+                for c in cand_cols:
+                    vals = set(s_df[c].astype(str))
+                    if any(x in vals for x in vals_a) and any(x in vals for x in vals_b):
+                        chosen_col = c
+                        break
+            if chosen_col is None:
+                raise ValueError(
+                    f"Contrast groups {vals_a} vs {vals_b} were not found in VariationLoop sample columns {cand_cols}. "
+                    "Multi-group cohort states with at least two labeled groups are required for population comparisons."
+                )
+
+            set_a = set(s_df.loc[s_df[chosen_col].astype(str).isin(vals_a), "sample"].astype(str))
+            set_b = set(s_df.loc[s_df[chosen_col].astype(str).isin(vals_b), "sample"].astype(str))
+            if not set_a or not set_b:
+                raise ValueError(f"Both comparison groups must contain at least one sample (got {len(set_a)} vs {len(set_b)}).")
+
+            def _gt_dosage(gt: Any) -> float:
+                s = str(gt or "").replace("|", "/")
+                if s in ("1/1", "1"):
+                    return 1.0
+                if s in ("0/1", "1/0", "1/2", "2/1"):
+                    return 0.5
+                return 0.0
+
+            n_a, n_b = len(set_a), len(set_b)
+            rows_out: list[dict[str, Any]] = []
+            num_sum = 0.0
+            den_sum = 0.0
+            if not vdf.empty:
+                vsub = vdf[vdf["sample_id"].astype(str).isin(set_a | set_b)].copy()
+                if hypothesis:
+                    key = hypothesis.split("=", 1)[-1].strip()
+                    if ":" in key and "-" in key.split(":", 1)[1]:
+                        ch_h, span_h = key.split(":", 1)
+                        s_h, e_h = [int(x) for x in span_h.split("-", 1)]
+                        vsub = vsub[(vsub["chrom"].astype(str) == ch_h) & (vsub["pos"] >= s_h) & (vsub["pos"] <= e_h)]
+                    else:
+                        vsub = vsub[vsub["chrom"].astype(str) == key]
+                vsub["dosage"] = vsub["gt"].map(_gt_dosage)
+                for (ch, pos, ref, alt), grp_df in vsub.groupby(["chrom", "pos", "ref", "alt"], sort=True):
+                    da = grp_df.loc[grp_df["sample_id"].astype(str).isin(set_a), "dosage"].sum()
+                    db = grp_df.loc[grp_df["sample_id"].astype(str).isin(set_b), "dosage"].sum()
+                    pa = float(da) / float(n_a)
+                    pb = float(db) / float(n_b)
+                    c_a = (pa * (1.0 - pa) / (n_a - 1)) if n_a > 1 else 0.0
+                    c_b = (pb * (1.0 - pb) / (n_b - 1)) if n_b > 1 else 0.0
+                    num = (pa - pb) ** 2 - c_a - c_b
+                    den = pa * (1.0 - pb) + pb * (1.0 - pa)
+                    fst_val = float(num / den) if den > 1e-12 else 0.0
+                    num_sum += num
+                    den_sum += den
+                    rows_out.append(
+                        {
+                            "chrom": str(ch),
+                            "pos": int(pos),
+                            "ref": str(ref),
+                            "alt": str(alt),
+                            "af_group_a": round(pa, 4),
+                            "af_group_b": round(pb, 4),
+                            "delta_af": round(pa - pb, 4),
+                            "hudson_fst": round(fst_val, 4),
+                            "n_group_a": n_a,
+                            "n_group_b": n_b,
+                        }
+                    )
+
+            table_df = pd.DataFrame(rows_out)
+            if not table_df.empty:
+                table_df = table_df.sort_values(by=["hudson_fst", "delta_af"], ascending=[False, False]).reset_index(drop=True)
+            genome_fst = float(num_sum / den_sum) if den_sum > 1e-12 else 0.0
+
+            # Permutation p-value over group labels
+            rng = np.random.default_rng(42)
+            all_samps = sorted(set_a | set_b)
+            n_ge = 0
+            n_perm_eff = max(1, int(n_perm))
+            if rows_out and len(all_samps) >= 2 and not vdf.empty:
+                sites_list = list(vsub.groupby(["chrom", "pos", "ref", "alt"], sort=False))
+                samp_to_idx = {s: i for i, s in enumerate(all_samps)}
+                mat = np.zeros((len(sites_list), len(all_samps)), dtype=np.float64)
+                for si, (_, gdf) in enumerate(sites_list):
+                    for sid_v, dos_v in zip(gdf["sample_id"].astype(str), gdf["dosage"].values):
+                        j = samp_to_idx.get(sid_v)
+                        if j is not None:
+                            mat[si, j] = float(dos_v)
+                for _ in range(n_perm_eff):
+                    perm = rng.permutation(len(all_samps))
+                    pa_v = mat[:, perm[:n_a]].mean(axis=1)
+                    pb_v = mat[:, perm[n_a:]].mean(axis=1)
+                    ca_v = (pa_v * (1.0 - pa_v) / (n_a - 1)) if n_a > 1 else 0.0
+                    cb_v = (pb_v * (1.0 - pb_v) / (n_b - 1)) if n_b > 1 else 0.0
+                    p_den = float(np.sum(pa_v * (1.0 - pb_v) + pb_v * (1.0 - pa_v)))
+                    p_fst = float(np.sum((pa_v - pb_v) ** 2 - ca_v - cb_v) / p_den) if p_den > 1e-12 else 0.0
+                    if p_fst >= genome_fst - 1e-12:
+                        n_ge += 1
+            perm_p = float((n_ge + 1) / (n_perm_eff + 1))
+
+            qid = f"q{(ledger._query_index + 1):04d}"
+            spec = f"F_ST({chosen_col}: {','.join(vals_a)} vs {','.join(vals_b)})"
+            qv = ledger.evaluate_query(qid, actor, spec, genome_fst, perm_p, genome_fst, perm_p, store=store)
+            Path(out_table).parent.mkdir(parents=True, exist_ok=True)
+            table_df.to_csv(out_table, sep="\t", index=False, float_format="%.6g")
+            wall_s = round(time.time() - t0, 3)
+            out_doc = {
+                "tool": "focaloop",
+                "command": "query",
+                "engine": "variationloop",
+                "mode": "fst",
+                "contrast": {"field": chosen_col, "a": vals_a, "b": vals_b},
+                "new_bytes": 0,
+                "network_sockets_blocked": True,
+                "wall_seconds": wall_s,
+                "genome_fst": round(genome_fst, 4),
+                "informative_sites": len(rows_out),
+                "pvalue": round(perm_p, 6),
+                "verdict": qv.__dict__,
+                "wealth_after": qv.alpha_wealth_after,
+                "alpha_spent": qv.alpha_allocated,
+                "headline_metric": f"F_ST = {genome_fst:.3f}",
+                "headline_detail": f"{len(rows_out):,} variant sites compared (p = {perm_p:.3g})",
+            }
+            write_json(out_verdict, out_doc)
+            if out_report:
+                render_query_report(
+                    out_report,
+                    engine="VariationLoop",
                     contrast_str=f"{chosen_col}: {','.join(vals_a)} vs {','.join(vals_b)}",
                     verdict=out_doc,
                     table_df=table_df,

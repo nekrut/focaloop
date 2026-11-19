@@ -252,6 +252,20 @@ def build_target_kset(g: G.Genome, regions: Sequence[tuple[str, int, int]], bits
     return tab, meta
 
 
+def _fastq_decomp_cmd(path: str | Path, threads: int = 4) -> list[str]:
+    """Return decompression command for gzipped FASTQ or plain cat for uncompressed FASTQ."""
+    is_gz = False
+    try:
+        with open(path, "rb") as fh:
+            is_gz = fh.read(2) == b"\x1f\x8b"
+    except OSError:
+        is_gz = str(path).endswith(".gz")
+    if not is_gz:
+        return ["cat", str(path)]
+    bgzip = shutil.which("bgzip") or "gzip"
+    return [bgzip, "-dc", "-@", str(threads), str(path)] if "bgzip" in bgzip else ["gzip", "-dc", str(path)]
+
+
 def extract_sieved_fastq_pair(
     r1_gz: str | Path,
     r2_gz: str | Path,
@@ -264,11 +278,11 @@ def extract_sieved_fastq_pair(
     decomp_threads: int = 8,
     comp_threads: int = 8,
 ) -> dict:
-    """Stream paired `.fastq.gz` through C lockstep verifier + 31-mer bait sieve into bgzf R1/R2."""
+    """Stream paired FASTQ(.gz) through C lockstep verifier and 31-mer target filter into bgzf R1/R2."""
     lib = _lib()
     bgzip = shutil.which("bgzip") or "gzip"
-    dec_cmd1 = [bgzip, "-dc", "-@", str(decomp_threads), str(r1_gz)] if "bgzip" in bgzip else ["gzip", "-dc", str(r1_gz)]
-    dec_cmd2 = [bgzip, "-dc", "-@", str(decomp_threads), str(r2_gz)] if "bgzip" in bgzip else ["gzip", "-dc", str(r2_gz)]
+    dec_cmd1 = _fastq_decomp_cmd(r1_gz, decomp_threads)
+    dec_cmd2 = _fastq_decomp_cmd(r2_gz, decomp_threads)
     enc_cmd1 = [bgzip, "-c", "-l", "3", "-@", str(comp_threads)] if "bgzip" in bgzip else ["gzip", "-1", "-c"]
     enc_cmd2 = [bgzip, "-c", "-l", "3", "-@", str(comp_threads)] if "bgzip" in bgzip else ["gzip", "-1", "-c"]
 
@@ -1704,9 +1718,8 @@ def run_varloop_fastq(
             r_fd, w_fd = os.pipe()
             mapper = subprocess.Popen(cmd, stdin=r_fd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             os.close(r_fd)
-            bgzip = shutil.which("bgzip") or "gzip"
-            dec1 = [bgzip, "-dc", "-@", "6", str(r1_gz)] if "bgzip" in bgzip else ["gzip", "-dc", str(r1_gz)]
-            dec2 = [bgzip, "-dc", "-@", "6", str(r2_gz)] if "bgzip" in bgzip else ["gzip", "-dc", str(r2_gz)]
+            dec1 = _fastq_decomp_cmd(r1_gz, 6)
+            dec2 = _fastq_decomp_cmd(r2_gz, 6)
             p_in1 = subprocess.Popen(dec1, stdout=subprocess.PIPE)
             p_in2 = subprocess.Popen(dec2, stdout=subprocess.PIPE)
 
@@ -1900,8 +1913,18 @@ def run_varloop_crai_focused(
         for cn, s0, e0 in regions_bed if cn in cidx
     ]
     crai_arr = FC.parse_crai(crai_path)
-    # Include the final CRAM container offset -> file end if local file
-    cram_size = Path(cram_path_or_url).stat().st_size if Path(str(cram_path_or_url)).exists() else None
+    # Include the final CRAM container offset -> file end for both local and remote files
+    if Path(str(cram_path_or_url)).exists():
+        cram_size = Path(cram_path_or_url).stat().st_size
+    else:
+        cram_size = None
+        try:
+            from . import streamer as ST
+            _rh = ST._session().head(str(cram_path_or_url), allow_redirects=True, timeout=30)
+            if _rh.status_code < 400 and _rh.headers.get("Content-Length"):
+                cram_size = int(_rh.headers["Content-Length"])
+        except Exception:
+            cram_size = None
     hdr_end, byte_ranges, n_cont, _ = FC.plan_ranges(crai_arr, regs_fc, read_pad=200)
     # Handle last container in CRAM if selected (plan_ranges leaves out last offset when nxt is None)
     offs = np.unique(crai_arr[:, 3])
@@ -2017,6 +2040,15 @@ def run_varloop_crai_focused(
         shutil.rmtree(tmp_coll_dir, ignore_errors=True)
 
     n_vcf = write_diploid_vcf(g, calls_by_ctg, out_vcf_gz, sample=sample, contig_ids=want_cids)
+    n_snv = sum(
+        1 for calls in calls_by_ctg.values() for c in calls if len(str(c["ref"])) == 1 and len(str(c["alt"])) == 1
+    )
+    n_indel = sum(
+        1 for calls in calls_by_ctg.values() for c in calls if len(str(c["ref"])) != 1 or len(str(c["alt"])) != 1
+    )
+    n_omnitig = sum(
+        1 for calls in calls_by_ctg.values() for c in calls if str(c.get("source", "")) == "omnitig"
+    )
     cpu1 = _cpu_times()
     peak_tree_rss, _ = rss_mon.stop()
     return {
@@ -2029,9 +2061,15 @@ def run_varloop_crai_focused(
         "crai_wire_fraction": round(sliced_bytes / cram_size, 6) if cram_size else None,
         "n_containers": int(n_cont),
         "n_coalesced_ranges": len(byte_ranges),
+        "sam_records": int(summ.get("sam_records", 0)),
+        "reads_counted": int(summ.get("reads_counted", 0)),
+        "pcr_dups_skipped": int(summ.get("pcr_dups_skipped", 0)),
         "acc_total_bytes": summ["total_acc_bytes"],
         "peak_proctree_rss_bytes": peak_tree_rss,
         "n_variants": n_vcf,
+        "n_snv": n_snv,
+        "n_indel": n_indel,
+        "n_omnitig_assembled": n_omnitig,
         "wall_s": round(time.time() - t0, 3),
         "total_cpu_s": round((cpu1[0] - cpu0[0]) + (cpu1[1] - cpu0[1]), 3),
         "vcf_path": str(out_vcf_gz),

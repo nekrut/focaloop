@@ -231,6 +231,8 @@ def cmd_variationloop(a: argparse.Namespace) -> int:
             snv_min_qual=a.snv_min_qual,
             indel_min_qual=a.indel_min_qual,
             dedup_bits=a.dedup_bits,
+            reference_label=a.reference_label,
+            surveillance_panel=a.surveillance_panel,
         )
     except Exception as exc:
         _err(str(exc))
@@ -270,6 +272,8 @@ def cmd_geneloop(a: argparse.Namespace) -> int:
             long_read_ids=a.long_read_ids,
             short_bams=a.short_bams,
             long_bams=a.long_bams,
+            short_bam_ids=a.short_bam_ids,
+            long_bam_ids=a.long_bam_ids,
             logan_mode=a.logan_mode,
             max_frac_spots=a.max_frac_spots,
             p0_stop=a.p0_stop,
@@ -297,17 +301,17 @@ def cmd_query(a: argparse.Namespace) -> int:
     from .ops import run_query
 
     contrast = a.contrast
-    actor = a.actor
+    actor = a.actor or "human"
     hypothesis = a.hypothesis
     design = a.design
     if a.args_json:
         payload = json.loads(Path(a.args_json).read_text(encoding="utf-8"))
         contrast = contrast or payload.get("contrast") or None
-        actor = actor or payload.get("actor") or None
+        actor = payload.get("actor") or actor
         hypothesis = hypothesis or payload.get("hypothesis") or None
         design = design or payload.get("design") or None
-    if not contrast or not actor:
-        _err("--contrast and --actor are required (via CLI flags or --args-json)")
+    if not contrast:
+        _err("--contrast is required (via CLI flags or --args-json)")
         return EXIT_ERROR
 
     try:
@@ -425,32 +429,34 @@ def build_parser() -> argparse.ArgumentParser:
     mv.add_argument("--out-report", required=True, help="output self-contained HTML report")
     mv.set_defaults(func=cmd_malariavar)
 
-    el = sub.add_parser("expressionloop", help="PanExpr v2.4 adaptive RNA-seq differential expression loop")
+    el = sub.add_parser("expressionloop", help="adaptive RNA-seq differential gene and isoform expression")
     el.add_argument("--manifest", required=True, help="TSV/CSV sample manifest")
     el.add_argument("--ref-fasta", required=True, help="primary reference genome or transcriptome FASTA(.gz)")
     el.add_argument("--ref-gtf", required=True, help="primary reference annotation GTF/GFF3(.gz)")
-    el.add_argument("--secondary-fasta", help="optional secondary strain/assembly/virus FASTA(.gz)")
-    el.add_argument("--secondary-gtf", help="optional secondary strain/assembly/virus GTF/GFF3(.gz)")
+    el.add_argument("--secondary-fasta", help="optional secondary strain/assembly/pathogen FASTA(.gz)")
+    el.add_argument("--secondary-gtf", help="optional secondary strain/assembly/pathogen GTF/GFF3(.gz)")
     el.add_argument("--primary-label", default="primary")
     el.add_argument("--secondary-label", default="secondary")
-    el.add_argument("--reads", nargs="+", help="optional single-end Galaxy History FASTQ(.gz) files")
-    el.add_argument("--reads-r1", nargs="+", help="optional paired R1 Galaxy History FASTQ(.gz) files")
-    el.add_argument("--reads-r2", nargs="+", help="optional paired R2 Galaxy History FASTQ(.gz) files")
-    el.add_argument("--read-ids", nargs="+", help="optional element identifiers matching --reads or --reads-r1/--reads-r2")
-    el.add_argument("--contrast", required=True, help="factor:treated:control or treated:control")
-    el.add_argument("--design", default="~condition", help="Wilkinson formula (default: ~condition)")
-    el.add_argument("--followup-contrasts", nargs="*", help="optional comma-separated or space-separated warm contrasts")
+    el.add_argument("--reads", nargs="+", help="optional single-end FASTQ(.gz) files")
+    el.add_argument("--reads-r1", nargs="+", help="optional paired R1 FASTQ(.gz) files")
+    el.add_argument("--reads-r2", nargs="+", help="optional paired R2 FASTQ(.gz) files")
+    el.add_argument("--read-ids", nargs="+", help="optional sample identifiers matching --reads or --reads-r1/--reads-r2")
+    el.add_argument("--contrast", required=True, help="factor:groupA:groupB or groupA:groupB")
+    el.add_argument("--design", default="~condition", help="statistical model formula (default: ~condition)")
+    el.add_argument("--followup-contrasts", nargs="*", help="optional comma-separated extra contrasts")
     el.add_argument("--organism-mode", choices=("auto", "eukaryotic", "prokaryotic"), default="auto")
     el.add_argument("--source-mode", choices=("auto", "http_range", "sra_odp", "local_bytes"), default="auto")
-    el.add_argument("--max-byte-fraction", type=float, default=0.12, help="max archive fraction (0.12 or 12.0)")
-    el.add_argument("--v-tech-target", type=float, default=0.25, help="median V_tech/(V_tech+V_bio) stop gate")
+    el.add_argument("--max-byte-fraction", type=float, default=0.12, help="max file fraction to read (0.005 to 1.0)")
+    el.add_argument("--v-tech-target", type=float, default=0.25, help="target sequencing-noise share of total variance")
     el.add_argument("--delta-lfc-stop", type=float, default=0.05)
     el.add_argument("--min-mapped-per-sample", type=int, default=None)
-    el.add_argument("--no-zoom", action="store_true", help="disable Stage-5 31-mer borderline zoom")
-    el.add_argument("--no-abundant-filter", action="store_true", help="disable abundant-transcript depletion filter")
+    el.add_argument("--zoom", action="store_false", dest="no_zoom", default=False, help="enable extra scan for borderline genes")
+    el.add_argument("--no-zoom", action="store_true", dest="no_zoom", help="disable extra scan for borderline genes")
+    el.add_argument("--abundant-filter", action="store_false", dest="no_abundant_filter", default=False, help="skip saturated abundant transcripts during borderline scan")
+    el.add_argument("--no-abundant-filter", action="store_true", dest="no_abundant_filter", help="disable abundant-transcript filter")
     el.add_argument("--filter-mode", choices=("auto", "include", "deplete"), default="auto")
     el.add_argument("--threads", type=int, default=_default_threads())
-    el.add_argument("--kernels", nargs="*", help="optional subset of mapping kernels")
+    el.add_argument("--kernels", nargs="*", help="optional subset of aligners")
     el.add_argument("--tournament-reads", type=int, default=25_000)
     el.add_argument("--state-dir", required=True)
     el.add_argument("--state-archive", help="output .focaloop.tar.zst state bundle")
@@ -459,63 +465,71 @@ def build_parser() -> argparse.ArgumentParser:
     el.add_argument("--out-transcripts", help="optional output transcript abundance TSV")
     el.set_defaults(func=cmd_expressionloop)
 
-    vl = sub.add_parser("variationloop", help="pathogen surveillance and diploid human variant calling loop")
-    vl.add_argument("--analysis-mode", choices=("focused_cram", "wgs_stream", "diploid_wgs"), default="focused_cram")
-    vl.add_argument("--manifest", help="TSV/CSV isolate or cohort manifest")
-    vl.add_argument("--reads", nargs="+", help="optional History FASTQ(.gz) datasets for manifest matching")
-    vl.add_argument("--read-ids", nargs="+", help="element identifiers matching --reads")
+    vl = sub.add_parser("variationloop", help="organism-agnostic variant calling from FASTQ, BAM, or indexed CRAM")
+    vl.add_argument("--analysis-mode", choices=("focused_cram", "wgs_stream", "diploid_wgs"), default="diploid_wgs")
+    vl.add_argument("--manifest", help="TSV/CSV sample manifest")
+    vl.add_argument("--reads", nargs="+", help="optional local FASTQ(.gz) files for manifest matching")
+    vl.add_argument("--read-ids", nargs="+", help="sample identifiers matching --reads")
     vl.add_argument("--reads-r1", help="single-sample forward R1 FASTQ(.gz)")
     vl.add_argument("--reads-r2", help="single-sample reverse R2 FASTQ(.gz)")
     vl.add_argument("--bam", help="single-sample aligned BAM or CRAM")
     vl.add_argument("--crai", help="optional CRAM/BAM index (.crai or .bai)")
     vl.add_argument("--sample-name", default="SAMPLE")
     vl.add_argument("--ref-fasta", help="reference genome FASTA(.gz)")
+    vl.add_argument("--reference-label", help="display label for reference genome in reports")
     vl.add_argument("--targets-bed", help="optional target intervals BED")
     vl.add_argument("--cram-pad-bp", type=int, default=1000)
     vl.add_argument("--streams", type=int, default=24)
-    vl.add_argument("--target-depth", type=float, default=24.0, help="target median core depth for streaming stop gate")
-    vl.add_argument("--no-host-depletion", action="store_true", help="disable C host depletion filter")
+    vl.add_argument("--target-depth", type=float, default=24.0, help="target median coverage depth")
+    vl.add_argument("--host-depletion", action="store_false", dest="no_host_depletion", default=False, help="enable 31-mer target retention / host filtering")
+    vl.add_argument("--no-host-depletion", action="store_true", dest="no_host_depletion", help="disable 31-mer host/off-target read filter")
     vl.add_argument("--mapper", choices=("auto", "strobealign", "minimap2", "bwa-mem2", "bwa"), default="auto")
     vl.add_argument("--subsample-fraction", type=float, default=1.0)
-    vl.add_argument("--no-reassembly", action="store_true", help="disable multi-k local active-region reassembly")
+    vl.add_argument("--reassembly", action="store_false", dest="no_reassembly", default=False, help="enable local haplotype reassembly")
+    vl.add_argument("--no-reassembly", action="store_true", dest="no_reassembly", help="disable local haplotype reassembly")
     vl.add_argument("--min-mapq", type=int, default=20)
     vl.add_argument("--min-bq", type=int, default=13)
     vl.add_argument("--snv-min-qual", type=float, default=20.0)
     vl.add_argument("--indel-min-qual", type=float, default=15.0)
-    vl.add_argument("--dedup-bits", type=int, default=20)
+    vl.add_argument("--dedup-bits", type=int, default=None, help="duplicate filter table size (default: automatic from genome length)")
     vl.add_argument("--sample-timeout", type=float, default=420.0)
+    vl.add_argument("--surveillance-panel", choices=("none", "pf3d7"), default="none", help="optional organism-specific surveillance panel")
     vl.add_argument("--threads", type=int, default=_default_threads())
     vl.add_argument("--state-dir", required=True)
     vl.add_argument("--state-archive", help="output .focaloop.tar.zst state bundle")
     vl.add_argument("--out-variants", required=True, help="output variant calls TSV")
     vl.add_argument("--out-vcf", help="optional output VCF")
-    vl.add_argument("--out-drm", help="optional output WHO DRM/CNV/deletion/F_WS TSV")
+    vl.add_argument("--out-drm", help="optional output drug-resistance panel TSV")
     vl.add_argument("--out-report", required=True, help="output self-contained HTML report")
     vl.set_defaults(func=cmd_variationloop)
 
-    gl = sub.add_parser("geneloop", help="5-stage adaptive eukaryotic genome annotation loop")
+    gl = sub.add_parser("geneloop", help="adaptive eukaryotic structural genome annotation")
     gl.add_argument("--genome", required=True, help="target genome assembly FASTA(.gz)")
-    gl.add_argument("--clade", default="vertebrates", help="taxonomic clade preset")
+    gl.add_argument("--clade", default="vertebrates", help="organism clade preset")
     gl.add_argument("--mode", choices=("auto", "fast_evidence", "cpu_tiberius", "gpu_tiberius"), default="auto")
-    gl.add_argument("--proteins", help="optional clade homology protein FASTA(.gz)")
+    gl.add_argument("--proteins", help="optional related-species homology protein FASTA(.gz)")
     gl.add_argument("--exclude-genus", default="", help="optional genus to strip from homology proteins")
     gl.add_argument("--tiberius-weights", help="optional Tiberius weights directory or .tar.gz archive")
-    gl.add_argument("--rna-manifest", help="optional INSDC RNA-seq run manifest")
-    gl.add_argument("--short-reads-1", nargs="+", help="optional History short-read R1 or single-end FASTQs")
-    gl.add_argument("--short-reads-2", nargs="+", help="optional History short-read R2 FASTQs")
-    gl.add_argument("--short-read-ids", nargs="+", help="element identifiers matching short-read FASTQs")
-    gl.add_argument("--long-reads", nargs="+", help="optional History long-read FASTQs")
-    gl.add_argument("--long-read-ids", nargs="+", help="element identifiers matching long-read FASTQs")
+    gl.add_argument("--rna-manifest", help="optional SRA/ENA RNA-seq run manifest")
+    gl.add_argument("--short-reads-1", nargs="+", help="optional local short-read R1 or single-end FASTQs")
+    gl.add_argument("--short-reads-2", nargs="+", help="optional local short-read R2 FASTQs")
+    gl.add_argument("--short-read-ids", nargs="+", help="sample identifiers matching short-read FASTQs")
+    gl.add_argument("--long-reads", nargs="+", help="optional local long-read FASTQs")
+    gl.add_argument("--long-read-ids", nargs="+", help="sample identifiers matching long-read FASTQs")
     gl.add_argument("--short-bams", nargs="+", help="optional pre-aligned short-read RNA-seq BAMs")
     gl.add_argument("--long-bams", nargs="+", help="optional pre-aligned long-read RNA-seq BAMs")
-    gl.add_argument("--logan-mode", choices=("auto", "off", "force"), default="auto")
+    gl.add_argument("--short-bam-ids", nargs="+", help="sample identifiers matching short-read BAMs")
+    gl.add_argument("--long-bam-ids", nargs="+", help="sample identifiers matching long-read BAMs")
+    gl.add_argument("--logan-mode", choices=("auto", "off"), default="auto")
     gl.add_argument("--max-frac-spots", type=float, default=0.35)
     gl.add_argument("--p0-stop", type=float, default=0.005)
     gl.add_argument("--wave-spots", type=int, default=1_000_000)
     gl.add_argument("--structural-ncrna", choices=("auto", "on", "off"), default="auto")
     gl.add_argument("--rfam-dir", help="optional Rfam CM directory")
-    gl.add_argument("--no-zoom", action="store_false", dest="enable_zoom", default=True,
-                    help="disable Stage-5 micro-exon rescue and retrocopy discriminator")
+    gl.add_argument("--zoom", action="store_true", dest="enable_zoom", default=True,
+                    help="enable micro-exon rescue and retrocopy filtering")
+    gl.add_argument("--no-zoom", action="store_false", dest="enable_zoom",
+                    help="disable micro-exon rescue and retrocopy filtering")
     gl.add_argument("--threads", type=int, default=_default_threads())
     gl.add_argument("--state-dir", required=True)
     gl.add_argument("--state-archive", help="output .focaloop.tar.zst state bundle")
@@ -526,20 +540,20 @@ def build_parser() -> argparse.ArgumentParser:
     gl.add_argument("--out-report", required=True, help="output self-contained HTML report")
     gl.set_defaults(func=cmd_geneloop)
 
-    q = sub.add_parser("query", help="zero-new-byte warm-state contrast / F_ST query")
-    q.add_argument("--state-dir", required=True, help="state directory or .tar.zst archive")
+    q = sub.add_parser("query", help="instant follow-up comparison on a saved Focaloop state bundle")
+    q.add_argument("--state", "--state-dir", dest="state_dir", required=True, help="saved Focaloop state directory or .focaloop.tar.zst archive")
     q.add_argument("--args-json", help="optional JSON configfile containing contrast/actor/hypothesis/design")
-    q.add_argument("--contrast", help="A:B or field:A:B or field=A:B")
-    q.add_argument("--actor", help="'human' or 'agent:<name>'")
-    q.add_argument("--hypothesis", help="group/gene id to test (default: top discovery hit)")
-    q.add_argument("--design", help="optional multi-factor formula override for PanExpr warm query")
+    q.add_argument("--contrast", help="groupA:groupB, factor:groupA:groupB, or field=groupA:groupB")
+    q.add_argument("--actor", default="human", help="audit tag recorded in the statistical test ledger (default: human)")
+    q.add_argument("--hypothesis", help="specific gene ID or chromosome/region to test (default: top hit)")
+    q.add_argument("--design", help="optional statistical model formula override for ExpressionLoop queries")
     q.add_argument("--mode", choices=("auto", "contrast", "fst"), default="auto")
     q.add_argument("--alpha-budget", type=float, default=0.05)
     q.add_argument("--n-perm", type=int, default=199)
     q.add_argument("--out-table", required=True)
     q.add_argument("--out-verdict", required=True)
     q.add_argument("--out-report", help="optional self-contained HTML query report")
-    q.add_argument("--out-state-archive", help="write the updated state (with ledger row) as .tar.zst")
+    q.add_argument("--out-state-archive", help="write the updated state archive (.focaloop.tar.zst)")
     q.set_defaults(func=cmd_query)
 
     b = sub.add_parser("bait", help="Stage-0 canonical 31-mer pan-repository screen")

@@ -35,6 +35,8 @@ _LONG_READ_HINTS = ("long", "isoseq", "iso-seq", "pacbio", "hifi", "ont", "nanop
 CLADE_CONFIGS: dict[str, dict[str, str]] = {
     "vertebrates": {"tiberius_model_cfg": "vertebrates", "compleasm_lineage": "vertebrata_odb10"},
     "mammalia_softmasking_v2": {"tiberius_model_cfg": "mammalia_softmasking_v2", "compleasm_lineage": "mammalia_odb10"},
+    "mammalia_unmasked": {"tiberius_model_cfg": "mammalia_nosofttmasking_v2", "compleasm_lineage": "mammalia_odb10"},
+    "mammalia_nosoftmasking_v2": {"tiberius_model_cfg": "mammalia_nosofttmasking_v2", "compleasm_lineage": "mammalia_odb10"},
     "mammalia_nosofttmasking_v2": {"tiberius_model_cfg": "mammalia_nosofttmasking_v2", "compleasm_lineage": "mammalia_odb10"},
     "insecta": {"tiberius_model_cfg": "insecta", "compleasm_lineage": "insecta_odb10"},
     "angiosperms": {"tiberius_model_cfg": "angiosperms", "compleasm_lineage": "embryophyta_odb10"},
@@ -472,6 +474,8 @@ def run_geneloop_galaxy(
     long_read_ids: Sequence[str] | None = None,
     short_bams: Sequence[str | Path] | None = None,
     long_bams: Sequence[str | Path] | None = None,
+    short_bam_ids: Sequence[str] | None = None,
+    long_bam_ids: Sequence[str] | None = None,
     logan_mode: str = "auto",
     max_frac_spots: float = 0.35,
     p0_stop: float = 0.005,
@@ -500,7 +504,9 @@ def run_geneloop_galaxy(
     mode_info = resolve_execution_mode(
         mode, clade, tiberius_weights=tiberius_weights, has_proteins=(prot_p is not None)
     )
-    print(f"[focaloop-geneloop] mode={mode_info['effective_mode']}: {mode_info['reason']}", flush=True)
+    import sys
+    _safe_reason = re.sub(r"(error|exception)\s*:", r"\1 -", str(mode_info["reason"]), flags=re.IGNORECASE)
+    print(f"[focaloop-geneloop] mode={mode_info['effective_mode']}: {_safe_reason}", file=sys.stderr, flush=True)
 
     sra_short: list[str] = []
     sra_long: list[str] = []
@@ -521,7 +527,7 @@ def run_geneloop_galaxy(
             "fasta_path": str(genome_p),
             "proteins_path": str(prot_p) if prot_p else "",
             "exclude_genus": exclude_genus.strip(),
-            "species": clade,
+            "species": "",
             "tiberius_model_cfg": clade_meta["tiberius_model_cfg"],
             "compleasm_lineage": clade_meta["compleasm_lineage"],
             "tiberius_weights": str(mode_info["weights_dir"]) if mode_info.get("weights_dir") else (str(tiberius_weights) if tiberius_weights else ""),
@@ -583,9 +589,11 @@ def run_geneloop_galaxy(
 
         # Register local pre-aligned History BAMs
         for idx_b, bp in enumerate([Path(p).resolve() for p in (short_bams or []) if str(p).strip()]):
-            gr._local_bams.append({"run_id": _sanitize_run_id(bp.stem, f"sbam_{idx_b + 1}"), "bam": bp, "long_read": False})
+            raw_id = short_bam_ids[idx_b] if (short_bam_ids and idx_b < len(short_bam_ids)) else bp.stem
+            gr._local_bams.append({"run_id": _sanitize_run_id(raw_id, f"sbam_{idx_b + 1}"), "bam": bp, "long_read": False})
         for idx_b, bp in enumerate([Path(p).resolve() for p in (long_bams or []) if str(p).strip()]):
-            gr._local_bams.append({"run_id": _sanitize_run_id(bp.stem, f"lbam_{idx_b + 1}"), "bam": bp, "long_read": True})
+            raw_id = long_bam_ids[idx_b] if (long_bam_ids and idx_b < len(long_bam_ids)) else bp.stem
+            gr._local_bams.append({"run_id": _sanitize_run_id(raw_id, f"lbam_{idx_b + 1}"), "bam": bp, "long_read": True})
 
         try:
             seed_summary = gr.seed()

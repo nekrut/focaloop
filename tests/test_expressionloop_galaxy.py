@@ -104,7 +104,7 @@ def test_expressionloop_se_dual_assembly_and_warm_query(tmp_path: Path) -> None:
     assert "v2:LEGACY_001458" in str(g0["ortholog_bridge"])
 
     html = out_report.read_text(encoding="utf-8")
-    assert "Focaloop PanExpr" in html
+    assert "Focaloop ExpressionLoop" in html
     assert "sieve" not in html.lower()
 
     # Warm query compatibility with Focaloop Query (zero new bytes, sockets blocked)
@@ -291,12 +291,13 @@ def test_expressionloop_xml_structure_help_testdata_and_no_sieve_wording() -> No
     assert help_el is not None and help_el.get("format") == "markdown"
     help_txt = help_el.text or ""
     for required_heading in (
-        "What It Does",
-        "Adaptive Stopping & Filter Overview",
-        "Step-by-Step Inputs",
-        "Parameter Guide",
+        "What this tool does",
+        "How it works",
+        "Choosing an input mode",
+        "Inputs and manifest format",
+        "Key parameters",
         "Outputs",
-        "Troubleshooting",
+        "Tips and troubleshooting",
     ):
         assert required_heading in help_txt
 
