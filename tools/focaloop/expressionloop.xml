@@ -267,16 +267,16 @@ ${a}	${gname}	${a}
             </when>
         </conditional>
 
-        <param argument="--contrast" type="text" value="condition:treated:control" label="Primary differential expression contrast" help="Groups to compare written as factor:groupA:groupB (for example, condition:treated:control) or groupA:groupB. Positive fold changes indicate higher expression in groupA.">
-            <validator type="regex" message="Use factor:groupA:groupB or groupA:groupB">^([A-Za-z0-9_]+[:=])?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$</validator>
+        <param argument="--contrast" type="text" value="condition:treated:control" label="Primary differential expression contrast" help="Which two groups to compare, written as column:test_group:reference_group (for example, condition:treated:control or genotype:KO:WT). You may omit the column name (treated:control) when comparing groups in the condition column (always condition when using the inline builder). Positive log2FoldChange means higher expression in test_group relative to reference_group. Names are case-sensitive and must match your sample sheet or inline group names exactly.">
+            <validator type="regex" message="Use column:test_group:reference_group (for example, condition:treated:control) or test_group:reference_group">^([A-Za-z0-9_]+[:=])?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$</validator>
         </param>
-        <param argument="--design" type="text" value="~condition" label="Statistical model formula" help="Model formula referencing columns in your sample sheet (for example, ~condition or ~batch + condition to adjust for batch effects).">
+        <param argument="--design" type="text" value="~condition" label="Statistical model formula" help="DESeq2 model formula starting with ~ followed by one or more column names from your sample sheet joined with + (for example, ~condition for a simple comparison, ~batch + condition to adjust for sequencing batch, or ~donor + condition for paired samples). Leave as ~condition when using the inline builder. The factor column named in your contrast must appear in this formula (put covariates first and your main group column last).">
             <sanitizer>
                 <valid initial="default">
                     <add value="~"/>
                 </valid>
             </sanitizer>
-            <validator type="regex" message="Formula must start with ~ followed by valid column names">^~\s*[A-Za-z0-9_]+(\s*[+*:]\s*[A-Za-z0-9_]+)*$</validator>
+            <validator type="regex" message="Formula must start with ~ followed by valid sample sheet column names joined by + (for example, ~condition or ~batch + condition)">^~\s*[A-Za-z0-9_]+(\s*[+*:]\s*[A-Za-z0-9_]+)*$</validator>
         </param>
 
         <section name="secondary_reference" title="Additional reference genomes and multi-strain pan-transcriptome (optional)" expanded="false">
@@ -694,8 +694,44 @@ trt_2	treated	batch_2	https://example.org/reads/trt_2.fastq.gz
 
 **Key parameters**
 
-- **Primary differential expression contrast (`--contrast`):** Written as `factor:groupA:groupB` (for example, `condition:treated:control`). Positive `log2FoldChange` means higher expression in `groupA`.
-- **Statistical model formula (`--design`):** Default `~condition`. Add covariates from your sample sheet to control for batch or donor effects (for example, `~batch + condition`).
+**How to write the Primary differential expression contrast (`--contrast`)**
+
+Write the comparison as three colon-separated parts:
+
+```
+column_name:test_group:reference_group
+```
+
+- **`column_name`** is the exact header name of the grouping column in your sample sheet (most commonly `condition`, or a custom column such as `treatment` or `genotype`). When using the **inline condition-group builder**, the column name is always `condition`.
+- **`test_group`** (numerator) is the experimental group of interest (for example, `treated`, `glucose`, or `mutant`).
+- **`reference_group`** (denominator / baseline) is the control group (for example, `control`, `DMSO`, or `wildtype`).
+- **Direction of fold change:** `log2FoldChange` is computed as `log2(test_group / reference_group)`. Positive values mean higher expression in `test_group` and negative values mean lower expression in `test_group` (higher in `reference_group`).
+- **Shorthand:** If your grouping column is named `condition`, you can also write just `test_group:reference_group` (for example, `treated:control` is equivalent to `condition:treated:control`).
+- **Exact matching:** Column and group names are case-sensitive and must match your sample sheet or inline group labels character for character (`Treated` will not match `treated`).
+
+**How to write the Statistical model formula (`--design`)**
+
+ExpressionLoop fits a DESeq2 negative-binomial model specified with an R-style formula that always begins with a tilde (`~`) followed by one or more column names from your sample sheet joined by `+`:
+
+- **Simple comparison (`~condition`):** Default. Use this whenever you are comparing groups in one factor without extra covariates, including all runs built with the **inline condition-group builder**.
+- **Controlling for batch, donor, or paired samples (`~batch + condition`, `~donor + condition`):** Put nuisance or blocking covariates first and your main experimental factor last. Every column named in the formula must exist in your TSV/CSV sample sheet, and covariates must not be completely confounded with your experimental group (for example, every treated sample in batch 1 and every control sample in batch 2 cannot be separated statistically).
+- **Multiple covariates (`~batch + sex + condition`):** Add additional sample-sheet columns with `+` as long as you have enough replicates to estimate all terms.
+- **Multi-group studies (3 or more groups):** Keep `~condition` (or `~batch + condition`) and enter your primary comparison in `--contrast` (for example, `condition:high_dose:control`). Once the run completes, pass the saved `.focaloop.tar.zst` state bundle to **Focaloop Query** to test any other pair (such as `condition:low_dose:control` or `condition:high_dose:low_dose`) in seconds without streaming reads again.
+- **Two-factor (2x2) experiments (for example, genotype x treatment):** The clearest way to compare specific combinations (such as mutant treated vs. wildtype untreated) is to add a single combined column (for example, `group` with values `WT_ctrl`, `WT_drug`, `KO_ctrl`, `KO_drug`), set `--design` to `~group` (or `~batch + group`), and set `--contrast` to `group:KO_drug:WT_ctrl`.
+
+**Quick reference examples**
+
+| Experimental design | Sample sheet columns | Statistical model formula (`--design`) | Primary contrast (`--contrast`) |
+|---|---|---|---|
+| Two groups (History files or inline builder) | `sample_id`, `condition` | `~condition` | `condition:treated:control` |
+| Inline builder comparing glucose vs. control | *(created automatically as `condition`)* | `~condition` | `condition:glucose:control` |
+| Two groups across two sequencing batches | `sample_id`, `condition`, `batch` | `~batch + condition` | `condition:treated:control` |
+| Paired patient biopsies (before vs. after) | `sample_id`, `patient`, `timepoint` | `~patient + timepoint` | `timepoint:post:pre` |
+| Multi-group dose response (3+ levels) | `sample_id`, `condition` | `~condition` | `condition:high_dose:vehicle` |
+| 2x2 factorial via combined group column | `sample_id`, `group`, `batch` | `~batch + group` | `group:KO_drug:WT_ctrl` |
+
+**Other key parameters**
+
 - **Data reading budget:** Leave on **Automatic** for routine work. Choose **Adaptive high-precision (30%)** or **Uncapped adaptive (up to 100%)** when you want higher depth for rare isoforms or low-abundance transcripts on remote archives.
 - **Extra pass for borderline and low-count genes:** Enabled by default. Gathers extra counts for genes near the significance boundary without spending alignment time on saturated housekeeping genes.
 
@@ -715,7 +751,7 @@ Key columns in `de_results.tsv`:
 | `gene_id`, `gene_name` | Gene identifier and symbol from your primary annotation |
 | `ortholog_bridge` | Linked gene ID(s) in the secondary assembly when dual-reference mode is enabled |
 | `baseMean` | Mean normalized count across all samples |
-| `log2FoldChange` | Estimated log2 fold change (`groupA` relative to `groupB`) |
+| `log2FoldChange` | Estimated log2 fold change (`test_group` relative to `reference_group`) |
 | `lfcSE_deseq2`, `lfcSE_total` | Standard error from replicate counts alone, and total standard error including multi-mapping uncertainty |
 | `ci95_low`, `ci95_high` | 95% confidence interval for `log2FoldChange` |
 | `pvalue`, `padj` | Raw p-value and Benjamini-Hochberg adjusted p-value (FDR) |
