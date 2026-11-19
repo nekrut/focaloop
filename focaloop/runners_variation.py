@@ -28,8 +28,111 @@ from .hooks import HypothesisLedger
 from .state import FocaloopStateStore
 
 _INSDC_RUN_RE = re.compile(r"^[SED]RR\d+$", re.IGNORECASE)
-_READ_EXT_RE = re.compile(r"(\.f(ast)?qsanger(\.gz|\.bz2)?|\.f(ast)?q(\.gz|\.bz2)?|\.gz|\.bz2)+$", re.IGNORECASE)
+_READ_EXT_RE = re.compile(r"(\.f(ast)?qsanger(\.gz|\.bz2)?|\.f(ast)?q(\.gz|\.bz2)?|\.bam|\.cram|\.sam|\.gz|\.bz2)+$", re.IGNORECASE)
 _MATE_SUFFIX_RE = re.compile(r"(_R?[12]|_[12])$", re.IGNORECASE)
+
+
+def _as_str_list(val: str | Path | Sequence[str | Path] | None, *, keep_empty: bool = False) -> list[str]:
+    if val is None:
+        return []
+    if isinstance(val, (str, Path)):
+        s = str(val).strip()
+        return [s] if (keep_empty or s) else []
+    out: list[str] = []
+    for item in val:
+        s = str(item or "").strip()
+        if keep_empty or s:
+            out.append(s)
+    return out
+
+
+def _clean_sample_name(raw: str | Path | None, fallback: str = "sample_1") -> str:
+    txt = str(raw or "").strip()
+    if not txt:
+        return fallback
+    base = Path(txt).name if ("/" in txt or "\\" in txt) else txt
+    if base.lower().endswith(".dat") and base.lower().startswith("dataset_"):
+        return fallback
+    stem = _READ_EXT_RE.sub("", base)
+    stem = _MATE_SUFFIX_RE.sub("", stem)
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("_.")
+    return cleaned or fallback
+
+
+def _dedup_sample_names(names: Sequence[str]) -> list[str]:
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for raw in names:
+        n = raw or "sample"
+        cnt = seen.get(n, 0) + 1
+        seen[n] = cnt
+        out.append(n if cnt == 1 else f"{n}_{cnt}")
+    return out
+
+
+def _merge_vcfs_pure_python(vcf_paths: Sequence[Path], out_vcf: Path) -> None:
+    """Merge per-sample VCF(.gz) files into one multi-sample VCF when bcftools/tabix are absent."""
+    meta_lines: list[str] = []
+    seen_meta: set[str] = set()
+    sample_names: list[str] = []
+    # key = (chrom_ord, chrom, pos, ref, alt) -> {sample_idx: sample_col_str, qual, filt, info, fmt}
+    contig_order: dict[str, int] = {}
+    records: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+
+    for s_idx, vp in enumerate(vcf_paths):
+        opener = gzip.open if str(vp).endswith(".gz") else open
+        with opener(vp, "rt", encoding="utf-8") as fh:
+            sname = f"sample_{s_idx + 1}"
+            for ln in fh:
+                if ln.startswith("##"):
+                    if ln not in seen_meta:
+                        seen_meta.add(ln)
+                        meta_lines.append(ln)
+                        m_ctg = re.match(r"##contig=<ID=([^,>]+)", ln)
+                        if m_ctg and m_ctg.group(1) not in contig_order:
+                            contig_order[m_ctg.group(1)] = len(contig_order)
+                    continue
+                if ln.startswith("#CHROM"):
+                    hdr = ln.rstrip("\n").split("\t")
+                    if len(hdr) > 9 and hdr[9].strip():
+                        sname = hdr[9].strip()
+                    sample_names.append(sname)
+                    continue
+                parts = ln.rstrip("\n").split("\t")
+                if len(parts) < 10:
+                    continue
+                chrom, pos_s, vid, ref, alt, qual, flt, info, fmt, scol = parts[:10]
+                if chrom not in contig_order:
+                    contig_order[chrom] = len(contig_order)
+                key = (chrom, int(pos_s), ref, alt)
+                rec = records.get(key)
+                if rec is None:
+                    rec = {"id": vid, "qual": qual, "flt": flt, "info": info, "fmt": fmt, "samples": {}}
+                    records[key] = rec
+                else:
+                    try:
+                        if float(qual) > float(rec["qual"]):
+                            rec["qual"] = qual
+                    except Exception:
+                        pass
+                rec["samples"][s_idx] = scol
+
+    sample_names = _dedup_sample_names(sample_names)
+    out_vcf.parent.mkdir(parents=True, exist_ok=True)
+    out_opener = gzip.open if str(out_vcf).endswith(".gz") else open
+    with out_opener(out_vcf, "wt", encoding="utf-8") as fo:
+        for ml in meta_lines:
+            fo.write(ml)
+        fo.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + "\t".join(sample_names) + "\n")
+        for key in sorted(records, key=lambda k: (contig_order.get(k[0], 10**9), k[1], k[2], k[3])):
+            chrom, pos, ref, alt = key
+            rec = records[key]
+            scols = [rec["samples"].get(i, "./.:.:.:.") for i in range(len(sample_names))]
+            fo.write(
+                f"{chrom}\t{pos}\t{rec['id']}\t{ref}\t{alt}\t{rec['qual']}\t{rec['flt']}\t{rec['info']}\t{rec['fmt']}\t"
+                + "\t".join(scols)
+                + "\n"
+            )
 
 _BASE_CSS = """
 <style>
@@ -47,11 +150,12 @@ _BASE_CSS = """
           border-radius: 12px; padding: 22px 26px; margin-bottom: 18px; }
   .hero h1 { margin: 0 0 6px 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
   .hero p { margin: 0; color: #cbd5e1; font-size: 13.5px; }
+  .hero code { background: rgba(255, 255, 255, 0.16); color: #f8fafc; padding: 2px 6px; border-radius: 4px; }
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
-  .kpi { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .kpi { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
   .kpi .label { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
-  .kpi .val { font-size: 22px; font-weight: 700; margin-top: 4px; color: var(--ink); }
-  .kpi .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .kpi .val { font-size: 20px; font-weight: 700; margin-top: 4px; color: var(--ink); overflow-wrap: anywhere; word-break: break-word; line-height: 1.25; }
+  .kpi .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
   .section { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
              padding: 18px 20px; margin-bottom: 16px; }
   .section h2 { margin: 0 0 10px 0; font-size: 16px; font-weight: 650;
@@ -1145,7 +1249,7 @@ def _run_pf3d7_surveillance(
 
 def run_variationloop_galaxy(
     *,
-    analysis_mode: str = "focused_cram",
+    analysis_mode: str = "auto",
     out_variants: str | Path,
     out_report: str | Path,
     state_dir: str | Path,
@@ -1162,11 +1266,12 @@ def run_variationloop_galaxy(
     cram_pad_bp: int = 1000,
     reads: Sequence[str] | None = None,
     read_ids: Sequence[str] | None = None,
-    reads_r1: str | Path | None = None,
-    reads_r2: str | Path | None = None,
-    bam_path: str | Path | None = None,
-    crai_path: str | Path | None = None,
-    sample_name: str = "SAMPLE",
+    reads_r1: str | Path | Sequence[str | Path] | None = None,
+    reads_r2: str | Path | Sequence[str | Path] | None = None,
+    bam_path: str | Path | Sequence[str | Path] | None = None,
+    bam_ids: Sequence[str] | None = None,
+    crai_path: str | Path | Sequence[str | Path] | None = None,
+    sample_name: str | None = None,
     target_depth: float = 24.0,
     subsample_fraction: float = 1.0,
     mapper: str = "auto",
@@ -1174,6 +1279,7 @@ def run_variationloop_galaxy(
     streams: int = 24,
     sample_timeout_s: float = 420.0,
     use_host_depletion: bool = True,
+    host_depletion_mode: str | None = None,
     enable_reassembly: bool = True,
     min_mapq: int = 20,
     min_bq: int = 13,
@@ -1183,12 +1289,21 @@ def run_variationloop_galaxy(
     reference_label: str | None = None,
     surveillance_panel: str = "none",
 ) -> dict[str, Any]:
-    """Execute Focaloop VariationLoop across diploid WGS/targeted, CRAM range slicing, target-filtered FASTQ, or Logan unitig calling."""
-    if analysis_mode not in ("focused_cram", "wgs_stream", "diploid_wgs", "logan_unitigs"):
+    """Execute Focaloop VariationLoop across paired collections, BAM/CRAM, indexed CRAM slicing, target-filtered FASTQ, or Logan unitigs."""
+    if analysis_mode not in ("auto", "focused_cram", "wgs_stream", "diploid_wgs", "logan_unitigs"):
         raise ValueError(f"Unsupported analysis_mode {analysis_mode!r}")
     eff_logan_mode = str(logan_mode or "auto").strip().lower()
     if eff_logan_mode not in ("auto", "logan_only", "off"):
         raise ValueError(f"Unsupported logan_mode {logan_mode!r}; expected 'auto', 'logan_only', or 'off'")
+
+    if host_depletion_mode is not None:
+        eff_dep_mode = str(host_depletion_mode).strip().lower()
+        if eff_dep_mode not in ("auto", "on", "off"):
+            raise ValueError(f"Unsupported host_depletion_mode {host_depletion_mode!r}; expected 'auto', 'on', or 'off'")
+    elif analysis_mode in ("wgs_stream", "logan_unitigs"):
+        eff_dep_mode = "on" if use_host_depletion else "off"
+    else:
+        eff_dep_mode = "off"
 
     t_start = time.time()
     work_dir = Path(tempfile.mkdtemp(prefix="focaloop_varloop_"))
@@ -1199,11 +1314,39 @@ def run_variationloop_galaxy(
     out_vcf_p = Path(out_vcf) if out_vcf else None
     out_drm_p = Path(out_drm) if out_drm else None
 
+    r1_list = _as_str_list(reads_r1)
+    r2_list = _as_str_list(reads_r2)
+    bam_list = _as_str_list(bam_path)
+    crai_list = _as_str_list(crai_path, keep_empty=True)
+    read_id_list = _as_str_list(read_ids)
+    bam_id_list = _as_str_list(bam_ids)
+
+    if r1_list and r2_list and len(r1_list) != len(r2_list):
+        raise ValueError(f"Mismatched paired FASTQ counts: {len(r1_list)} R1 files vs {len(r2_list)} R2 files")
+
+    eff_single_sample = _clean_sample_name(
+        sample_name
+        or (read_id_list[0] if read_id_list else None)
+        or (bam_id_list[0] if bam_id_list else None)
+        or (r1_list[0] if r1_list else None)
+        or (bam_list[0] if bam_list else None),
+        fallback="sample_1",
+    )
+
     local_map = _build_local_reads_map(reads, read_ids)
-    if reads_r1:
-        r1_p = Path(reads_r1).resolve()
-        pair = [r1_p] + ([Path(reads_r2).resolve()] if reads_r2 else [])
-        local_map[sample_name] = pair
+    if r1_list:
+        for i, r1_s in enumerate(r1_list):
+            r1_p = Path(r1_s).resolve()
+            pair = [r1_p] + ([Path(r2_list[i]).resolve()] if i < len(r2_list) else [])
+            raw_id = (
+                sample_name
+                if (len(r1_list) == 1 and sample_name)
+                else (read_id_list[i] if i < len(read_id_list) else r1_s)
+            )
+            sid_clean = _clean_sample_name(raw_id, fallback=f"sample_{i + 1}")
+            local_map[sid_clean] = pair
+            if i < len(read_id_list) and read_id_list[i]:
+                local_map[read_id_list[i]] = pair
 
     try:
         if ncbi_accession and str(ncbi_accession).strip():
@@ -1223,21 +1366,34 @@ def run_variationloop_galaxy(
             and _pf3d7_assets_ready(ref_fasta)
         )
         if use_pf3d7:
-            if manifest_path:
+            if manifest_path and not (r1_list or bam_list):
                 rows_raw = _read_manifest_table(manifest_path)
-            elif bam_path and analysis_mode == "focused_cram":
+            elif bam_list and analysis_mode == "focused_cram":
                 rows_raw = [
                     {
-                        "sample_id": sample_name,
+                        "sample_id": _clean_sample_name(
+                            sample_name if (len(bam_list) == 1 and sample_name) else (bam_id_list[i] if i < len(bam_id_list) else bp),
+                            fallback=f"sample_{i + 1}",
+                        ),
                         "country_or_group": "cohort",
-                        "source_uri_or_srr": str(Path(bam_path).resolve()),
-                        "crai_uri": str(Path(crai_path).resolve()) if crai_path else "",
+                        "source_uri_or_srr": str(Path(bp).resolve()),
+                        "crai_uri": str(Path(crai_list[i]).resolve()) if (i < len(crai_list) and crai_list[i]) else "",
                     }
+                    for i, bp in enumerate(bam_list)
                 ]
-            elif reads_r1 or (reads and len(reads) >= 1):
-                pair_paths = [Path(reads_r1).resolve()] + ([Path(reads_r2).resolve()] if reads_r2 else []) if reads_r1 else [Path(p).resolve() for p in reads[:2]]
-                local_map[sample_name] = pair_paths
-                rows_raw = [{"sample_id": sample_name, "country_or_group": "cohort", "source_uri_or_srr": sample_name}]
+            elif r1_list or (reads and len(reads) >= 1):
+                if r1_list:
+                    rows_raw = []
+                    for i, r1_s in enumerate(r1_list):
+                        sid = _clean_sample_name(
+                            sample_name if (len(r1_list) == 1 and sample_name) else (read_id_list[i] if i < len(read_id_list) else r1_s),
+                            fallback=f"sample_{i + 1}",
+                        )
+                        rows_raw.append({"sample_id": sid, "country_or_group": "cohort", "source_uri_or_srr": sid})
+                else:
+                    pair_paths = [Path(p).resolve() for p in reads[:2]]
+                    local_map[eff_single_sample] = pair_paths
+                    rows_raw = [{"sample_id": eff_single_sample, "country_or_group": "cohort", "source_uri_or_srr": eff_single_sample}]
             else:
                 raise ValueError(f"Mode {analysis_mode!r} requires a sample manifest or History reads/CRAM input")
 
@@ -1258,7 +1414,7 @@ def run_variationloop_galaxy(
                 threads=threads,
                 streams=streams,
                 sample_timeout_s=sample_timeout_s,
-                use_host_depletion=use_host_depletion,
+                use_host_depletion=(eff_dep_mode != "off"),
                 state_archive=state_archive,
                 t_start=t_start,
             )
@@ -1279,11 +1435,50 @@ def run_variationloop_galaxy(
         ctg_lens = dict(zip(g.names, [int(x) for x in g.lengths]))
         bed_regions = _parse_bed_regions(targets_bed, ctg_lens) if targets_bed else []
 
-        # Build sample jobs uniformly from manifest, History BAM/CRAM, or History FASTQs
+        # Optional group/metadata table when paired collections or BAM/CRAM lists also pass --manifest
+        group_lookup: dict[str, tuple[str, dict[str, str]]] = {}
+        if manifest_path and (r1_list or bam_list):
+            for row in _read_manifest_table(manifest_path):
+                raw_sid = _pick_col(row, ("sample_id", "Sample", "sample"), "")
+                grp = _pick_col(row, ("country_or_group", "population", "group", "condition"), "cohort")
+                if raw_sid:
+                    group_lookup[raw_sid] = (grp, row)
+                    group_lookup[_clean_sample_name(raw_sid, fallback=raw_sid)] = (grp, row)
+
+        # Build sample jobs uniformly from paired collections, BAM/CRAM lists, manifest, or SRA accessions
         jobs: list[dict[str, Any]] = []
-        if manifest_path:
-            for idx_r, row in enumerate( _read_manifest_table(manifest_path)):
-                sid = _pick_col(row, ("sample_id", "Sample", "sample"), f"sample_{idx_r + 1}")
+        if r1_list:
+            raw_sids = [
+                _clean_sample_name(
+                    sample_name if (len(r1_list) == 1 and sample_name) else (read_id_list[i] if i < len(read_id_list) else r1_s),
+                    fallback=f"sample_{i + 1}",
+                )
+                for i, r1_s in enumerate(r1_list)
+            ]
+            sids = _dedup_sample_names(raw_sids)
+            for i, (sid, r1_s) in enumerate(zip(sids, r1_list)):
+                raw_key = read_id_list[i] if i < len(read_id_list) else sid
+                grp, extra_row = group_lookup.get(raw_key) or group_lookup.get(sid) or ("cohort", {})
+                r2_s = str(Path(r2_list[i]).resolve()) if i < len(r2_list) else ""
+                row_meta = {**extra_row, "source": str(Path(r1_s).resolve()), "mate2_url": r2_s}
+                jobs.append({"sample": sid, "group": grp, "src": str(Path(r1_s).resolve()), "mate2": r2_s, "crai": "", "row": row_meta})
+        elif bam_list:
+            raw_sids = [
+                _clean_sample_name(
+                    sample_name if (len(bam_list) == 1 and sample_name) else (bam_id_list[i] if i < len(bam_id_list) else bp),
+                    fallback=f"sample_{i + 1}",
+                )
+                for i, bp in enumerate(bam_list)
+            ]
+            sids = _dedup_sample_names(raw_sids)
+            for i, (sid, bp) in enumerate(zip(sids, bam_list)):
+                raw_key = bam_id_list[i] if i < len(bam_id_list) else sid
+                grp, extra_row = group_lookup.get(raw_key) or group_lookup.get(sid) or ("cohort", {})
+                crai_s = str(Path(crai_list[i]).resolve()) if (i < len(crai_list) and crai_list[i]) else ""
+                jobs.append({"sample": sid, "group": grp, "src": str(Path(bp).resolve()), "mate2": "", "crai": crai_s, "row": extra_row})
+        elif manifest_path:
+            for idx_r, row in enumerate(_read_manifest_table(manifest_path)):
+                sid = _clean_sample_name(_pick_col(row, ("sample_id", "Sample", "sample"), f"sample_{idx_r + 1}"), fallback=f"sample_{idx_r + 1}")
                 grp = _pick_col(row, ("country_or_group", "population", "group", "condition"), "cohort")
                 src = _pick_col(row, ("source_uri_or_srr", "cram_url", "bam_url", "run_or_url", "fastq_1", "accession", "source", "url"))
                 crai_u = _pick_col(row, ("crai_uri", "crai_uri_optional", "crai_url", "crai"))
@@ -1294,36 +1489,19 @@ def run_variationloop_galaxy(
                     raise ValueError(f"Sample {sid!r}: missing input source column in manifest")
                 jobs.append({"sample": sid, "group": grp, "src": src, "mate2": mate2, "crai": crai_u, "row": row})
         elif sra_accessions and str(sra_accessions).strip():
-            tokens = [t.strip() for t in re.split(r"[\s,;]+", str(sra_accessions).strip()) if t.strip()]
+            raw_txt = str(sra_accessions).replace("__cn__", " ").replace("__cr__", " ").replace("__tt__", " ")
+            tokens = [t.strip().upper() for t in re.split(r"[\s,;]+", raw_txt.strip()) if t.strip()]
+            seen_toks: set[str] = set()
             for tok in tokens:
+                if tok in seen_toks:
+                    continue
+                seen_toks.add(tok)
                 jobs.append({"sample": tok, "group": "cohort", "src": tok, "mate2": "", "crai": "", "row": {"source": tok}})
-        elif bam_path:
-            jobs.append(
-                {
-                    "sample": sample_name,
-                    "group": "cohort",
-                    "src": str(Path(bam_path).resolve()),
-                    "mate2": "",
-                    "crai": str(Path(crai_path).resolve()) if crai_path else "",
-                    "row": {},
-                }
-            )
-        elif reads_r1:
-            jobs.append(
-                {
-                    "sample": sample_name,
-                    "group": "cohort",
-                    "src": str(Path(reads_r1).resolve()),
-                    "mate2": str(Path(reads_r2).resolve()) if reads_r2 else "",
-                    "crai": "",
-                    "row": {},
-                }
-            )
         elif reads:
             if len(reads) == 2 and Path(reads[0]).exists() and Path(reads[1]).exists():
                 jobs.append(
                     {
-                        "sample": sample_name,
+                        "sample": eff_single_sample,
                         "group": "cohort",
                         "src": str(Path(reads[0]).resolve()),
                         "mate2": str(Path(reads[1]).resolve()),
@@ -1333,10 +1511,10 @@ def run_variationloop_galaxy(
                 )
             else:
                 for idx_r, rp in enumerate(reads):
-                    sid = (read_ids[idx_r] if read_ids and idx_r < len(read_ids) else Path(rp).stem)
+                    sid = _clean_sample_name(read_ids[idx_r] if read_ids and idx_r < len(read_ids) else Path(rp).stem, fallback=f"sample_{idx_r + 1}")
                     jobs.append({"sample": sid, "group": "cohort", "src": str(Path(rp).resolve()), "mate2": "", "crai": "", "row": {}})
         else:
-            raise ValueError("Provide a sample manifest, History paired FASTQ files, or a History BAM/CRAM file")
+            raise ValueError("Provide a paired FASTQ collection, paired R1/R2 FASTQ files, BAM/CRAM file(s), public SRA accessions, or a cohort manifest")
 
         total_genome_bp = sum(ctg_lens.values())
         if dedup_bits is None:
@@ -1363,6 +1541,7 @@ def run_variationloop_galaxy(
         sample_tels: list[dict[str, Any]] = []
         var_frames: list[pd.DataFrame] = []
         per_sample_vcfs: list[Path] = []
+        used_engines: set[str] = set()
         p_frac = float(np.clip(subsample_fraction, 1e-4, 1.0))
 
         # 0.4.0 Logan unitig probe & optional k=15 host/off-target bitset
@@ -1370,7 +1549,7 @@ def run_variationloop_galaxy(
         k15_bit_path: Path | None = None
         if analysis_mode == "logan_unitigs" or eff_logan_mode in ("auto", "logan_only"):
             from .logan import is_insdc_run, probe_logan_runs
-            from .malariavar.logan_var import build_k15_reference_bitset, ensure_var_logan_bins, run_varloop_logan_unitigs
+            from .malariavar.logan_var import build_k15_reference_bitset, ensure_var_logan_bins
 
             cand_accs = [
                 j["src"].strip().upper()
@@ -1388,11 +1567,13 @@ def run_variationloop_galaxy(
                     missing = ", ".join(lprobe["fallback_runs"])
                     raise ValueError(
                         f"Logan unitigs are not available for accession(s): {missing}. "
-                        "Use Whole-genome or Target-filtered FASTQ calling with Logan mode set to Automatic for fallback."
+                        "Switch Logan mode to Automatic to fall back to raw read streaming."
                     )
             if logan_avail or analysis_mode == "logan_unitigs":
                 prep_bin, _ = ensure_var_logan_bins()
-                if use_host_depletion:
+                logan_span = sum(max(0, e - s) for _, s, e in bed_regions) if bed_regions else total_genome_bp
+                want_k15 = (eff_dep_mode == "on") or (eff_dep_mode == "auto" and logan_span <= 50_000_000)
+                if want_k15:
                     k15_bit_path = build_k15_reference_bitset(
                         eff_ref,
                         work_dir / "logan_k15.bit",
@@ -1401,28 +1582,34 @@ def run_variationloop_galaxy(
                         log=_log,
                     )
 
-        # Optional host/off-target 31-mer retention filter for target-filtered raw FASTQ calling
+        # Optional host/off-target 31-mer retention filter for raw FASTQ calling
         kset_tab = None
         has_raw_fq_jobs = any(
             not (j["src"].strip().upper() in logan_avail and j["src"] not in local_map and j["sample"] not in local_map)
+            and not (
+                j["src"].split("?", 1)[0].lower().endswith((".bam", ".cram"))
+                or (not j["src"].startswith(("http://", "https://")) and Path(j["src"]).is_file() and _detect_aln_format(Path(j["src"])) in ("bam", "cram"))
+            )
             for j in jobs
         )
-        if analysis_mode == "wgs_stream" and use_host_depletion and has_raw_fq_jobs:
+        if has_raw_fq_jobs and eff_dep_mode != "off":
             regs_k = bed_regions or [(cn, 0, ln) for cn, ln in ctg_lens.items()]
             target_span = sum(max(0, e - s) for _, s, e in regs_k)
-            if target_span > 45_000_000:
-                raise ValueError(
-                    f"Target 31-mer read filter span ({target_span / 1e6:.1f} Mb) exceeds the 45 Mb in-memory limit. "
-                    "Provide a target BED file covering your regions of interest or disable the 31-mer pre-filter."
-                )
-            if target_span < 500_000:
-                bits_k = 20
-            elif target_span < 8_000_000:
-                bits_k = 24
-            else:
-                bits_k = 26
-            kset_tab, kmeta = VG.build_target_kset(g, regs_k, bits=bits_k)
-            _log(f"Built target 31-mer pre-filter table ({kmeta['inserted_kmers']:,} k-mers across {target_span / 1e6:.2f} Mb)")
+            want_fq_kset = (eff_dep_mode == "on") or (eff_dep_mode == "auto" and bool(bed_regions) and target_span <= 45_000_000)
+            if want_fq_kset:
+                if target_span > 45_000_000:
+                    raise ValueError(
+                        f"Target 31-mer read filter span ({target_span / 1e6:.1f} Mb) exceeds the 45 Mb in-memory limit. "
+                        "Provide a target BED file covering your regions of interest or set Host/off-target pre-filtering to Off."
+                    )
+                if target_span < 500_000:
+                    bits_k = 20
+                elif target_span < 8_000_000:
+                    bits_k = 24
+                else:
+                    bits_k = 26
+                kset_tab, kmeta = VG.build_target_kset(g, regs_k, bits=bits_k)
+                _log(f"Built target 31-mer pre-filter table ({kmeta['inserted_kmers']:,} k-mers across {target_span / 1e6:.2f} Mb)")
 
         for idx_j, job in enumerate(jobs, 1):
             sid = job["sample"]
@@ -1455,6 +1642,7 @@ def run_variationloop_galaxy(
                     local_unitigs_path=local_u,
                     log=_log,
                 )
+                used_engines.add("logan_unitigs")
                 sample_tels.append(tel)
                 per_sample_vcfs.append(s_vcf_gz)
                 var_frames.append(_vcf_to_dataframe(s_vcf_gz, sample_override=sid))
@@ -1474,8 +1662,9 @@ def run_variationloop_galaxy(
                 aln_fmt = _detect_aln_format(Path(src))
 
             if aln_fmt in ("cram", "bam"):
-                crai_src = job["crai"] or (src + ".crai" if aln_fmt == "cram" else "")
-                if analysis_mode == "focused_cram" and aln_fmt == "cram" and crai_src:
+                crai_src = job["crai"] or (src + ".crai" if (aln_fmt == "cram" and (src.startswith(("http://", "https://")) or Path(src + ".crai").is_file())) else "")
+                use_cram_slicing = analysis_mode in ("auto", "focused_cram") and aln_fmt == "cram" and bool(crai_src)
+                if use_cram_slicing:
                     if src.startswith(("http://", "https://")):
                         cram_ref = src
                     else:
@@ -1487,6 +1676,7 @@ def run_variationloop_galaxy(
                         params=dp_params, sample=sid, pad_bp=int(cram_pad_bp), zoom_assisted=bool(enable_reassembly),
                     )
                     tel["sample"] = sid
+                    used_engines.add("focused_cram")
                 else:
                     if src.startswith(("http://", "https://")):
                         local_aln = _materialize_remote_input(src, work_dir / "aln" / f"{sid}.{aln_fmt}", "remote_aln", threads=threads)
@@ -1504,6 +1694,7 @@ def run_variationloop_galaxy(
                         sample=sid, threads=threads, call_workers=min(4, max(1, threads // 2)),
                         targets_bed=targets_bed,
                     )
+                    used_engines.add("diploid_wgs")
             else:
                 if chosen_mapper is None:
                     chosen_mapper = _select_mapper(mapper)
@@ -1525,7 +1716,7 @@ def run_variationloop_galaxy(
                     r2_local = _stage_local_fastq(Path(r2_ref), work_dir / "fq_links", f"{sid}_R2") if r2_ref else None
 
                 if r2_local is None:
-                    raise ValueError(f"Sample {sid!r}: paired-end R1 and R2 FASTQ inputs are required for {analysis_mode!r}")
+                    raise ValueError(f"Sample {sid!r}: paired-end R1 and R2 FASTQ inputs are required for variant calling")
 
                 if kset_tab is not None:
                     filt_r1 = work_dir / "fq_filt" / f"{sid}_R1.fq.gz"
@@ -1537,8 +1728,10 @@ def run_variationloop_galaxy(
                     )
                     _log(f"  Depletion filter {sid}: kept {fstats['spots_emitted']}/{fstats['spots_seen']} spots")
                     r1_use, r2_use, p_run = filt_r1, filt_r2, 1.0
+                    used_engines.add("wgs_stream")
                 else:
                     r1_use, r2_use, p_run = r1_local, r2_local, p_frac
+                    used_engines.add("diploid_wgs")
 
                 tel = VG.run_varloop_fastq(
                     g, eff_ref, r1_use, r2_use, s_vcf_gz,
@@ -1553,6 +1746,12 @@ def run_variationloop_galaxy(
             var_frames.append(_vcf_to_dataframe(s_vcf_gz, sample_override=sid))
             _log(f"  [{idx_j}/{len(jobs)}] {sid}: {tel.get('n_variants', 0)} variants ({tel.get('total_wall_s', tel.get('wall_s', 0)):.2f}s)")
 
+        eff_mode = (
+            analysis_mode
+            if analysis_mode != "auto"
+            else (next(iter(used_engines)) if len(used_engines) == 1 else ("hybrid_cohort" if used_engines else "diploid_wgs"))
+        )
+
         variants_df = pd.concat(var_frames, ignore_index=True) if var_frames else _vcf_to_dataframe(per_sample_vcfs[0])
         out_variants_p.parent.mkdir(parents=True, exist_ok=True)
         variants_df.to_csv(out_variants_p, sep="\t", index=False, float_format="%.6g")
@@ -1560,12 +1759,12 @@ def run_variationloop_galaxy(
         if out_vcf_p:
             if len(per_sample_vcfs) == 1:
                 _materialize_vcf_output(per_sample_vcfs[0], out_vcf_p)
-            elif shutil.which("bcftools"):
+            elif shutil.which("bcftools") and all(Path(str(p) + ".tbi").is_file() for p in per_sample_vcfs):
                 merged_gz = work_dir / "merged.vcf.gz"
                 subprocess.run(["bcftools", "merge", "-Oz", "-o", str(merged_gz), *[str(p) for p in per_sample_vcfs]], check=True)
                 _materialize_vcf_output(merged_gz, out_vcf_p)
             else:
-                _materialize_vcf_output(per_sample_vcfs[0], out_vcf_p)
+                _merge_vcfs_pure_python(per_sample_vcfs, out_vcf_p)
 
         if out_drm_p:
             out_drm_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1573,7 +1772,7 @@ def run_variationloop_galaxy(
                 [
                     {
                         "sample_id": t.get("sample"),
-                        "analysis_mode": analysis_mode,
+                        "analysis_mode": eff_mode,
                         "n_variants": t.get("n_variants", 0),
                         "n_snv": t.get("n_snv", 0),
                         "n_indel": t.get("n_indel", 0),
@@ -1589,7 +1788,7 @@ def run_variationloop_galaxy(
             ref_lbl = "reference_genome" if raw_ref_name.endswith(".dat") else raw_ref_name
 
         summary_stats = {
-            "mode": analysis_mode,
+            "mode": eff_mode,
             "reference_label": ref_lbl,
             "n_samples": len(jobs),
             "n_variants": len(variants_df),
@@ -1597,7 +1796,7 @@ def run_variationloop_galaxy(
         }
         render_variationloop_report(
             out_report_p,
-            analysis_mode=analysis_mode,
+            analysis_mode=eff_mode,
             summary_stats=summary_stats,
             variants_df=variants_df,
             sample_telemetry=sample_tels,
@@ -1618,7 +1817,7 @@ def run_variationloop_galaxy(
             "engine": "variationloop",
             "version": "0.4.0",
             "blueprint_id": "variationloop",
-            "mode": analysis_mode,
+            "mode": eff_mode,
             "summary": summary_stats,
             "samples": sample_records,
         }

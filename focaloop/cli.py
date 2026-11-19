@@ -240,6 +240,7 @@ def cmd_variationloop(a: argparse.Namespace) -> int:
             reads_r1=a.reads_r1,
             reads_r2=a.reads_r2,
             bam_path=a.bam,
+            bam_ids=a.bam_ids,
             crai_path=a.crai,
             sample_name=a.sample_name,
             target_depth=a.target_depth,
@@ -249,6 +250,7 @@ def cmd_variationloop(a: argparse.Namespace) -> int:
             streams=a.streams,
             sample_timeout_s=a.sample_timeout,
             use_host_depletion=not a.no_host_depletion,
+            host_depletion_mode=a.host_depletion_mode,
             enable_reassembly=not a.no_reassembly,
             min_mapq=a.min_mapq,
             min_bq=a.min_bq,
@@ -503,18 +505,19 @@ def build_parser() -> argparse.ArgumentParser:
     el.set_defaults(func=cmd_expressionloop)
 
     vl = sub.add_parser("variationloop", help="organism-agnostic variant calling from FASTQ, BAM, indexed CRAM, or Logan unitigs")
-    vl.add_argument("--analysis-mode", choices=("focused_cram", "wgs_stream", "diploid_wgs", "logan_unitigs"), default="diploid_wgs")
-    vl.add_argument("--manifest", help="TSV/CSV sample manifest")
-    vl.add_argument("--sra-accessions", help="optional comma/space-separated public SRA/ENA run accessions for direct Logan/streaming calling")
+    vl.add_argument("--analysis-mode", choices=("auto", "focused_cram", "wgs_stream", "diploid_wgs", "logan_unitigs"), default="auto")
+    vl.add_argument("--manifest", help="TSV/CSV sample manifest or optional group metadata sheet")
+    vl.add_argument("--sra-accessions", help="optional newline/comma/space-separated public SRA/ENA run accessions for direct Logan/streaming calling")
     vl.add_argument("--logan-mode", choices=("auto", "logan_only", "off"), default="auto", help="use pre-assembled Logan unitigs for public SRA/ENA runs when available")
     vl.add_argument("--logan-min-ka", default="adapt", help="Logan unitig k-mer abundance floor ('adapt' or numeric threshold)")
     vl.add_argument("--reads", nargs="+", help="optional local FASTQ(.gz) files for manifest matching")
-    vl.add_argument("--read-ids", nargs="+", help="sample identifiers matching --reads")
-    vl.add_argument("--reads-r1", help="single-sample forward R1 FASTQ(.gz)")
-    vl.add_argument("--reads-r2", help="single-sample reverse R2 FASTQ(.gz)")
-    vl.add_argument("--bam", help="single-sample aligned BAM or CRAM")
-    vl.add_argument("--crai", help="optional CRAM/BAM index (.crai or .bai)")
-    vl.add_argument("--sample-name", default="SAMPLE")
+    vl.add_argument("--read-ids", nargs="+", help="sample identifiers matching --reads or --reads-r1/--reads-r2")
+    vl.add_argument("--reads-r1", nargs="+", help="one or more forward R1 FASTQ(.gz) files")
+    vl.add_argument("--reads-r2", nargs="+", help="one or more reverse R2 FASTQ(.gz) files")
+    vl.add_argument("--bam", nargs="+", help="one or more aligned BAM or CRAM files")
+    vl.add_argument("--bam-ids", nargs="+", help="sample identifiers matching --bam")
+    vl.add_argument("--crai", nargs="*", help="optional CRAM/BAM index (.crai or .bai) paths matching --bam")
+    vl.add_argument("--sample-name", default=None, help="optional explicit sample name (auto-derived from input identifier when omitted)")
     vl.add_argument("--ref-fasta", help="reference genome FASTA(.gz)")
     vl.add_argument("--ncbi-accession", help="optional NCBI assembly accession (GCF_.../GCA_...) to fetch reference genome FASTA")
     vl.add_argument("--reference-label", help="display label for reference genome in reports")
@@ -522,6 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
     vl.add_argument("--cram-pad-bp", type=int, default=1000)
     vl.add_argument("--streams", type=int, default=24)
     vl.add_argument("--target-depth", type=float, default=24.0, help="target median coverage depth")
+    vl.add_argument("--host-depletion-mode", choices=("auto", "on", "off"), default=None, help="host/off-target read or unitig pre-filtering policy")
     vl.add_argument("--host-depletion", action="store_false", dest="no_host_depletion", default=False, help="enable 31-mer target retention / host filtering")
     vl.add_argument("--no-host-depletion", action="store_true", dest="no_host_depletion", help="disable 31-mer host/off-target read filter")
     vl.add_argument("--mapper", choices=("auto", "strobealign", "minimap2", "bwa-mem2", "bwa"), default="auto")

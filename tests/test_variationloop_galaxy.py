@@ -297,19 +297,29 @@ def test_variationloop_xml_iuc_standards_and_no_sieve() -> None:
 
     cmd_text = root.find("command").text or ""
     assert "@THREADS@" in cmd_text
+    cf_text = "\n".join(cf.text or "" for cf in root.findall("configfiles/configfile"))
+    template_text = cmd_text + "\n" + cf_text
 
-    # Parameter parity: every param in <inputs> appears in <command>
+    # Parameter parity: every param in <inputs> appears in <command> or <configfiles>, and no manual sample_name param
+    param_names = set()
     for p in root.findall(".//inputs//param"):
         pname = p.attrib.get("name")
         if not pname and "argument" in p.attrib:
             pname = p.attrib["argument"].lstrip("-").replace("-", "_")
         assert pname, f"Param missing name/argument: {ET.tostring(p)}"
-        assert pname in cmd_text, f"Orphaned param {pname!r} not referenced in <command>"
+        param_names.add(pname)
+        assert pname in template_text, f"Orphaned param {pname!r} not referenced in <command> or <configfiles>"
+    assert "sample_name" not in param_names, "Manual sample_name box should not appear in unified variationloop.xml"
+
+    # Zero semicolons in user-facing XML text
+    for el in root.iter():
+        for attr in ("label", "help", "title", "message"):
+            assert ";" not in el.attrib.get(attr, ""), f"Semicolon in {el.tag}@{attr}"
 
     # Test-data files exist and < 1 MB; every <test> has expect_num_outputs and no pipe syntax
     tests_el = root.find("tests")
     test_els = tests_el.findall("test")
-    assert len(test_els) == 3
+    assert len(test_els) >= 4
     total_td_bytes = 0
     for t in test_els:
         assert "expect_num_outputs" in t.attrib
@@ -324,14 +334,15 @@ def test_variationloop_xml_iuc_standards_and_no_sieve() -> None:
                     total_td_bytes += f.stat().st_size
     assert total_td_bytes < 1_000_000
 
-    # Help markdown sections present
+    # Help markdown sections present and zero semicolons
     help_el = root.find("help")
     assert help_el.attrib.get("format") == "markdown"
     help_txt = help_el.text or ""
+    assert ";" not in help_txt, "Semicolon found in variationloop.xml help"
     for heading in (
         "**What this tool does**",
         "**How it works**",
-        "**Choosing a workflow**",
+        "**Choosing an input source**",
         "**Inputs and manifest format**",
         "**Key parameters**",
         "**Outputs**",
@@ -339,3 +350,66 @@ def test_variationloop_xml_iuc_standards_and_no_sieve() -> None:
     ):
         assert heading in help_txt, f"Missing help section {heading}"
     assert re.search(r"-----\n", help_txt)
+
+
+def test_variationloop_multisample_paired_collection_auto_names_and_unified_mode(tmp_path: Path) -> None:
+    """Verify multi-sample list:paired cohort calling, merged VCF, optional group sheet, and unified auto mode."""
+    group_sheet = tmp_path / "groups.tsv"
+    group_sheet.write_text("sample_id\tgroup\nisolate_A\tresistant\nisolate_B\tsensitive\n", encoding="utf-8")
+
+    out_vcf = tmp_path / "cohort.vcf"
+    out_var = tmp_path / "cohort.tsv"
+    out_rep = tmp_path / "cohort.html"
+    out_arc = tmp_path / "cohort.tar.zst"
+
+    meta = run_variationloop_galaxy(
+        analysis_mode="auto",
+        reads_r1=[TEST_DATA_DIR / "sample_R1.fastq.gz", TEST_DATA_DIR / "sample_R1.fastq.gz"],
+        reads_r2=[TEST_DATA_DIR / "sample_R2.fastq.gz", TEST_DATA_DIR / "sample_R2.fastq.gz"],
+        read_ids=["isolate_A", "isolate_B"],
+        manifest_path=group_sheet,
+        ref_fasta=TEST_DATA_DIR / "ref_chr20_mini.fa",
+        targets_bed=TEST_DATA_DIR / "targets.bed",
+        host_depletion_mode="auto",
+        threads=2,
+        state_dir=tmp_path / "state_cohort",
+        state_archive=out_arc,
+        out_variants=out_var,
+        out_vcf=out_vcf,
+        out_report=out_rep,
+    )
+    assert meta["summary"]["n_samples"] == 2
+    assert meta["summary"]["mode"] == "wgs_stream"
+    assert {s["sample"]: s["group"] for s in meta["samples"]} == {
+        "isolate_A": "resistant",
+        "isolate_B": "sensitive",
+    }
+    vcf_txt = out_vcf.read_text(encoding="utf-8")
+    chrom_line = [ln for ln in vcf_txt.splitlines() if ln.startswith("#CHROM")][0]
+    assert "isolate_A" in chrom_line and "isolate_B" in chrom_line
+    df = pd.read_csv(out_var, sep="\t")
+    assert set(df["sample_id"]) == {"isolate_A", "isolate_B"}
+    rep_txt = out_rep.read_text(encoding="utf-8")
+    assert ".hero code {" in rep_txt
+    assert "isolate_A" in rep_txt and "isolate_B" in rep_txt
+
+    # Auto mode on CRAM + CRAI automatically selects focused_cram and derives clean sample name from bam_ids
+    out_vcf_cram = tmp_path / "auto_cram.vcf"
+    out_var_cram = tmp_path / "auto_cram.tsv"
+    out_rep_cram = tmp_path / "auto_cram.html"
+    meta_cram = run_variationloop_galaxy(
+        analysis_mode="auto",
+        bam_path=[TEST_DATA_DIR / "sample.cram"],
+        bam_ids=["patient_01.cram"],
+        crai_path=[TEST_DATA_DIR / "sample.cram.crai"],
+        ref_fasta=TEST_DATA_DIR / "ref_chr20_mini.fa",
+        targets_bed=TEST_DATA_DIR / "targets.bed",
+        threads=2,
+        state_dir=tmp_path / "state_cram",
+        out_variants=out_var_cram,
+        out_vcf=out_vcf_cram,
+        out_report=out_rep_cram,
+    )
+    assert meta_cram["summary"]["mode"] == "focused_cram"
+    assert meta_cram["samples"][0]["sample"] == "patient_01"
+    assert "patient_01" in out_vcf_cram.read_text(encoding="utf-8")
