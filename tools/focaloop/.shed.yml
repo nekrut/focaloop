@@ -11,7 +11,7 @@ long_description: |
   (Focaloop Query).
 name: focaloop
 owner: iuc
-homepage_url: https://github.com/galaxyproject/focaloop
+homepage_url: https://github.com/nekrut/focaloop
 remote_repository_url: https://github.com/galaxyproject/tools-iuc/tree/main/tools/focaloop
 type: unrestricted
 auto_tool_repositories:

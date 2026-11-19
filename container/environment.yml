@@ -1,4 +1,4 @@
-# Pinned conda environment for ghcr.io/galaxyproject/focaloop:0.3.0
+# Pinned conda environment for ghcr.io/nekrut/focaloop:0.3.0
 name: focaloop
 channels:
   - conda-forge

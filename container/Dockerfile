@@ -1,19 +1,22 @@
-# ghcr.io/galaxyproject/focaloop:0.3.0
+# ghcr.io/nekrut/focaloop:0.3.0
 #
 # Build from the repository root:
-#   docker build -f container/Dockerfile -t ghcr.io/galaxyproject/focaloop:0.3.0 .
+#   docker build -f container/Dockerfile -t ghcr.io/nekrut/focaloop:0.3.0 .
 # Apptainer (Galaxy job runners on cluster):
-#   apptainer build focaloop_proto_0.3.0.sif docker-daemon://ghcr.io/galaxyproject/focaloop:0.3.0
+#   apptainer build focaloop_proto_0.3.0.sif docker-daemon://ghcr.io/nekrut/focaloop:0.3.0
 FROM mambaorg/micromamba:2.0.5-ubuntu24.04
 
 LABEL org.opencontainers.image.title="focaloop" \
       org.opencontainers.image.version="0.3.0" \
       org.opencontainers.image.description="Adaptive RNA-seq (ExpressionLoop), variation (VariationLoop), and eukaryotic annotation (GeneLoop) focal loops for Galaxy" \
-      org.opencontainers.image.source="https://github.com/galaxyproject/focaloop" \
+      org.opencontainers.image.source="https://github.com/nekrut/focaloop" \
       org.opencontainers.image.licenses="MIT"
 
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 ca-certificates git gcc libc6-dev libgomp1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 ca-certificates git gcc libc6-dev libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/Tiberius /opt/focaloop /data \
+    && chown -R $MAMBA_USER:$MAMBA_USER /opt/Tiberius /opt/focaloop /data
 USER $MAMBA_USER
 
 COPY --chown=$MAMBA_USER:$MAMBA_USER container/environment.yml /tmp/environment.yml
@@ -46,10 +49,6 @@ ENV FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints \
     FOCALOOP_NATIVE_DIR=/opt/focaloop/native_cache \
     FOCALOOP_NATIVE_CACHE=/opt/focaloop/native_cache \
     FOCALOOP_PORTABLE_ISA=1 \
-    S=/opt/focaloop/pf3d7_ref \
-    FOCALOOP_PF3D7_DIR=/opt/focaloop/pf3d7_ref/ref \
-    MALARIAVAR_PLA_SIEVE=/opt/focaloop/pf3d7_ref/ref/pf_pla_sieve.pla \
-    TIBERIUS_WEIGHTS_DIR=/data/galaxy_local/refdata/tiberius_weights \
     TF_USE_LEGACY_KERAS=0 \
     PANEXPR_DESEQ2_CPUS=1 \
     PYTHONDONTWRITEBYTECODE=1 \

@@ -10,6 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Anton Nekrutenko", email = "anton@nekrut.org" }]
+
+[project.urls]
+Homepage = "https://github.com/nekrut/focaloop"
+Repository = "https://github.com/nekrut/focaloop"
+Issues = "https://github.com/nekrut/focaloop/issues"
 dependencies = [
     "numpy>=1.24",
     "pandas>=2.0",
@@ -17,6 +22,7 @@ dependencies = [
     "scipy>=1.10",
     "pyyaml>=6",
     "requests>=2.28",
+    "zstandard>=0.21",
 ]
 
 [project.optional-dependencies]

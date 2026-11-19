@@ -8,7 +8,7 @@
         <requirements>
             <requirement type="package" version="@TOOL_VERSION@">focaloop</requirement>
             <yield/>
-            <container type="docker">ghcr.io/galaxyproject/focaloop:@TOOL_VERSION@</container>
+            <container type="docker">ghcr.io/nekrut/focaloop:@TOOL_VERSION@</container>
         </requirements>
     </xml>
 
@@ -26,7 +26,7 @@
   author = {Nekrutenko, Anton and Galaxy Project},
   title = {Focaloop: Adaptive Byte-Budgeted Streaming Loops for Genomics},
   year = {2026},
-  url = {https://github.com/galaxyproject/focaloop}
+  url = {https://github.com/nekrut/focaloop}
 }</citation>
             <yield/>
         </citations>
