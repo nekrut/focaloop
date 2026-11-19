@@ -1,5 +1,5 @@
 <tool id="focaloop_variationloop" name="Focaloop VariationLoop" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
-    <description>call genomic variants (SNVs and indels) from FASTQ, BAM, or indexed CRAM</description>
+    <description>call genomic variants (SNVs and indels) from FASTQ, BAM, indexed CRAM, or Logan unitigs</description>
     <macros>
         <import>macros.xml</import>
     </macros>
@@ -16,13 +16,22 @@
     <command detect_errors="aggressive"><![CDATA[
 focaloop variationloop
     --analysis-mode '$analysis_mode.mode'
-    --ref-fasta '$ref_fasta'
-    --reference-label '${str($ref_fasta.element_identifier).replace("'", "_")}'
+    #if str($ref_source.source) == "cached"
+        --ref-fasta '$ref_source.cached_fasta.fields.path'
+        --reference-label '${str($ref_source.cached_fasta.fields.name).replace("'", "_")}'
+    #elif str($ref_source.source) == "history"
+        --ref-fasta '$ref_source.ref_fasta'
+        --reference-label '${str($ref_source.ref_fasta.element_identifier).replace("'", "_")}'
+    #else
+        --ncbi-accession '${str($ref_source.ncbi_accession).strip()}'
+        --reference-label '${str($ref_source.ncbi_accession).strip()}'
+    #end if
     #if str($analysis_mode.mode) == "diploid_wgs"
         #if str($analysis_mode.input_source.source_type) == "history_fq"
             --reads-r1 '$analysis_mode.input_source.reads_r1'
             --reads-r2 '$analysis_mode.input_source.reads_r2'
             --sample-name '$analysis_mode.input_source.sample_name'
+            --logan-mode 'off'
         #elif str($analysis_mode.input_source.source_type) == "history_bam"
             --bam '$analysis_mode.input_source.bam'
             #if $analysis_mode.input_source.crai
@@ -33,8 +42,10 @@ focaloop variationloop
                 --crai '$analysis_mode.input_source.bam.metadata.bam_index'
             #end if
             --sample-name '$analysis_mode.input_source.sample_name'
+            --logan-mode 'off'
         #else
             --manifest '$analysis_mode.input_source.manifest'
+            --logan-mode '$analysis_mode.input_source.logan_mode'
             #if $analysis_mode.input_source.reads
                 --reads
                 #for $r in $analysis_mode.input_source.reads
@@ -51,7 +62,21 @@ focaloop variationloop
         #end if
         --mapper '$analysis_mode.mapper'
         --subsample-fraction $analysis_mode.subsample_fraction
+    #elif str($analysis_mode.mode) == "logan_unitigs"
+        --logan-mode 'logan_only'
+        #if str($analysis_mode.logan_input.input_type) == "accessions"
+            --sra-accessions '${str($analysis_mode.logan_input.sra_accessions).strip()}'
+        #else
+            --manifest '$analysis_mode.logan_input.manifest'
+        #end if
+        #if $analysis_mode.targets_bed
+            --targets-bed '$analysis_mode.targets_bed'
+        #end if
+        $analysis_mode.host_depletion
+        --logan-min-ka '$analysis_mode.logan_min_ka'
+        --mapper '$analysis_mode.mapper'
     #elif str($analysis_mode.mode) == "focused_cram"
+        --logan-mode 'off'
         #if str($analysis_mode.input_source.source_type) == "history_cram"
             --bam '$analysis_mode.input_source.bam'
             #if $analysis_mode.input_source.crai
@@ -74,8 +99,10 @@ focaloop variationloop
             --reads-r1 '$analysis_mode.input_source.reads_r1'
             --reads-r2 '$analysis_mode.input_source.reads_r2'
             --sample-name '$analysis_mode.input_source.sample_name'
+            --logan-mode 'off'
         #else
             --manifest '$analysis_mode.input_source.manifest'
+            --logan-mode '$analysis_mode.input_source.logan_mode'
             #if $analysis_mode.input_source.reads
                 --reads
                 #for $r in $analysis_mode.input_source.reads
@@ -106,11 +133,35 @@ focaloop variationloop
     --out-report '$variationloop_report'
     ]]></command>
     <inputs>
-        <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" label="Reference genome (FASTA)" help="Reference genome assembly matching your reads or alignment files (uncompressed or gzip-compressed)."/>
+        <conditional name="ref_source">
+            <param name="source" type="select" label="Reference genome source" help="Choose a reference genome pre-cached on this Galaxy server, a FASTA dataset from your History, or an NCBI assembly accession to download automatically.">
+                <option value="cached" selected="true">Built-in Galaxy genome (CVMFS cache)</option>
+                <option value="history">Reference genome from your Galaxy History (FASTA)</option>
+                <option value="ncbi">Fetch automatically by NCBI assembly accession</option>
+            </param>
+            <when value="cached">
+                <param name="cached_fasta" type="select" label="Built-in reference genome" help="Select a reference genome pre-cached on this Galaxy server.">
+                    <options from_data_table="all_fasta">
+                        <filter type="sort_by" column="2"/>
+                        <validator type="no_options" message="No built-in genomes are cached on this Galaxy server. Switch Reference genome source to History or NCBI accession."/>
+                    </options>
+                </param>
+            </when>
+            <when value="history">
+                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" label="Reference genome (FASTA)" help="Reference genome assembly matching your reads or alignment files (uncompressed or gzip-compressed)."/>
+            </when>
+            <when value="ncbi">
+                <param argument="--ncbi-accession" type="text" value="" label="NCBI assembly accession" help="RefSeq (GCF_ prefix) or GenBank (GCA_ prefix) assembly accession. The genomic FASTA is downloaded automatically.">
+                    <validator type="empty_field" message="Enter an NCBI assembly accession starting with GCF_ or GCA_."/>
+                    <validator type="regex" message="Enter a valid NCBI RefSeq (GCF_) or GenBank (GCA_) assembly accession with 9 digits and optional version.">^ *GC[AF]_[0-9]{9}(\.[0-9]+)? *$</validator>
+                </param>
+            </when>
+        </conditional>
 
         <conditional name="analysis_mode">
-            <param argument="--analysis-mode" name="mode" type="select" label="Variant calling workflow" help="Choose standard whole-genome or targeted variant calling, indexed CRAM region slicing, or target-filtered FASTQ calling for samples containing host or off-target DNA.">
+            <param argument="--analysis-mode" name="mode" type="select" label="Variant calling workflow" help="Choose standard whole-genome or targeted variant calling, pre-assembled Logan unitig calling for public SRA accessions, indexed CRAM region slicing, or target-filtered FASTQ calling.">
                 <option value="diploid_wgs" selected="true">Whole-genome or targeted variant calling (FASTQ, BAM, or CRAM)</option>
+                <option value="logan_unitigs">Public SRA Logan unitigs (pre-assembled k-mer graphs, 10-20x less data)</option>
                 <option value="focused_cram">Indexed CRAM region slicing (fetch only target windows)</option>
                 <option value="wgs_stream">Target-filtered FASTQ calling (remove host or off-target reads before alignment)</option>
             </param>
@@ -136,7 +187,12 @@ focaloop variationloop
                         </param>
                     </when>
                     <when value="manifest">
-                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Cohort manifest (TSV or CSV)" help="Table listing sample_id, group, and source (plus mate2_url for paired remote FASTQs or crai_uri for remote CRAMs). Paired-end reads are required for FASTQ rows."/>
+                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Cohort manifest (TSV or CSV)" help="Table listing sample_id, group, and source (plus mate2_url for paired remote FASTQs or crai_uri for remote CRAMs). Paired-end reads are required for raw FASTQ rows."/>
+                        <param argument="--logan-mode" type="select" label="Pre-assembled Logan unitigs for public SRA accessions" help="When manifest rows specify public SRA/ENA run accessions, stream compact Logan unitig graphs automatically when available.">
+                            <option value="auto" selected="true">Automatic (use Logan unitigs when available, fall back to raw reads)</option>
+                            <option value="logan_only">Logan unitigs only</option>
+                            <option value="off">Off (always align raw reads)</option>
+                        </param>
                         <param argument="--reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Galaxy History FASTQ files (optional)" help="Optional local paired FASTQ datasets named sample_id_R1.fastq.gz and sample_id_R2.fastq.gz matching manifest rows."/>
                     </when>
                 </conditional>
@@ -148,7 +204,38 @@ focaloop variationloop
                     <option value="bwa-mem2">BWA-MEM2</option>
                     <option value="bwa">BWA</option>
                 </param>
-                <param argument="--subsample-fraction" type="float" min="0.01" max="1.0" value="1.0" label="Read subsampling fraction (for FASTQ inputs, 1.0 = use all reads)" help="Deterministically keeps this fraction of paired FASTQ reads before alignment (ignored for BAM/CRAM inputs). Leave at 1.0 to analyze every read."/>
+                <param argument="--subsample-fraction" type="float" min="0.01" max="1.0" value="1.0" label="Read subsampling fraction (for FASTQ inputs, 1.0 = use all reads)" help="Deterministically keeps this fraction of paired FASTQ reads before alignment (ignored for BAM/CRAM and Logan inputs). Leave at 1.0 to analyze every read."/>
+            </when>
+            <when value="logan_unitigs">
+                <conditional name="logan_input">
+                    <param name="input_type" type="select" label="Public SRA accession input" help="Enter one or more public SRA/ENA run accessions directly, or upload a cohort manifest TSV with sample groups for downstream Focaloop Query comparisons.">
+                        <option value="accessions" selected="true">Enter public SRA/ENA run accession(s)</option>
+                        <option value="manifest">Multi-sample cohort manifest (TSV or CSV)</option>
+                    </param>
+                    <when value="accessions">
+                        <param argument="--sra-accessions" type="text" value="" label="Public SRA/ENA run accession(s)" help="One or more public SRA/ENA run accessions (SRR, ERR, or DRR prefix) separated by commas or spaces. Compact pre-assembled unitigs are streamed directly from the public Logan archive.">
+                            <validator type="empty_field" message="Enter at least one public SRA/ENA run accession (SRR, ERR, or DRR prefix)."/>
+                            <validator type="regex" message="Enter valid SRR, ERR, or DRR accessions separated by commas or spaces.">^ *[SEDsed][Rr][Rr][0-9]+([, ]+[SEDsed][Rr][Rr][0-9]+)* *$</validator>
+                        </param>
+                    </when>
+                    <when value="manifest">
+                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Cohort manifest (TSV or CSV)" help="Table with required columns sample_id, group, and source (public SRR, ERR, or DRR run accession)."/>
+                    </when>
+                </conditional>
+                <param argument="--targets-bed" type="data" format="bed" optional="true" label="Target regions (BED, optional)" help="0-based BED intervals restricting unitig filtering and variant calling to specific chromosomes or genes. Required for genomes larger than 400 Mb."/>
+                <param argument="--host-depletion" type="boolean" truevalue="--host-depletion" falsevalue="--no-host-depletion" checked="true" label="Filter out host and off-target unitigs before alignment" help="Builds a fast 15-mer filter from your reference or BED target regions (up to 50 Mb) to drop host and non-target unitigs before mapping."/>
+                <param argument="--logan-min-ka" type="select" label="Unitig k-mer abundance cutoff" help="Depth-adaptive mode calibrates the minimum unitig k-mer abundance (ka) automatically from each sample's coverage depth to balance sensitivity and error rejection.">
+                    <option value="adapt" selected="true">Depth-adaptive automatic cutoff (recommended)</option>
+                    <option value="1.5">Fixed minimum ka = 1.5 (sensitive, low-coverage samples)</option>
+                    <option value="2.0">Fixed minimum ka = 2.0 (balanced)</option>
+                    <option value="3.0">Fixed minimum ka = 3.0 (high-depth samples)</option>
+                </param>
+                <param argument="--mapper" type="select" label="Unitig aligner" help="Auto selects BWA-MEM2 when installed, falling back to BWA or minimap2.">
+                    <option value="auto" selected="true">Auto (BWA-MEM2 preferred)</option>
+                    <option value="bwa-mem2">BWA-MEM2</option>
+                    <option value="bwa">BWA</option>
+                    <option value="minimap2">minimap2</option>
+                </param>
             </when>
             <when value="focused_cram">
                 <conditional name="input_source">
@@ -184,7 +271,12 @@ focaloop variationloop
                         </param>
                     </when>
                     <when value="manifest">
-                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Sample manifest (TSV or CSV)" help="Table with columns sample_id, group, and source (plus mate2_url for remote paired FASTQs). Paired-end reads are required for FASTQ rows."/>
+                        <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Sample manifest (TSV or CSV)" help="Table with columns sample_id, group, and source (plus mate2_url for remote paired FASTQs). Paired-end reads are required for raw FASTQ rows."/>
+                        <param argument="--logan-mode" type="select" label="Pre-assembled Logan unitigs for public SRA accessions" help="When manifest rows specify public SRA/ENA run accessions, stream compact Logan unitig graphs automatically when available.">
+                            <option value="auto" selected="true">Automatic (use Logan unitigs when available, fall back to raw reads)</option>
+                            <option value="logan_only">Logan unitigs only</option>
+                            <option value="off">Off (always align raw reads)</option>
+                        </param>
                         <param argument="--reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Galaxy History FASTQ files (optional)" help="Optional local paired FASTQ datasets named sample_id_R1.fastq.gz and sample_id_R2.fastq.gz matching manifest rows."/>
                     </when>
                 </conditional>
@@ -216,7 +308,10 @@ focaloop variationloop
     </outputs>
     <tests>
         <test expect_num_outputs="4">
-            <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
+            <conditional name="ref_source">
+                <param name="source" value="history"/>
+                <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
+            </conditional>
             <conditional name="analysis_mode">
                 <param name="mode" value="diploid_wgs"/>
                 <conditional name="input_source">
@@ -261,7 +356,10 @@ focaloop variationloop
             </output>
         </test>
         <test expect_num_outputs="4">
-            <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
+            <conditional name="ref_source">
+                <param name="source" value="history"/>
+                <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
+            </conditional>
             <conditional name="analysis_mode">
                 <param name="mode" value="focused_cram"/>
                 <conditional name="input_source">
@@ -298,7 +396,10 @@ focaloop variationloop
             </output>
         </test>
         <test expect_num_outputs="4">
-            <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
+            <conditional name="ref_source">
+                <param name="source" value="history"/>
+                <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
+            </conditional>
             <conditional name="analysis_mode">
                 <param name="mode" value="wgs_stream"/>
                 <conditional name="input_source">
@@ -364,6 +465,7 @@ The `.focaloop.tar.zst` archive stores per-sample variant calls, alignment run s
 | Your goal | Workflow to choose | Best inputs |
 |---|---|---|
 | Standard SNV and indel calling across a genome or gene panel | **Whole-genome or targeted variant calling** | Paired FASTQ files, aligned BAM/CRAM, or a multi-sample manifest |
+| Ultra-fast calling on public SRA runs without downloading raw FASTQs | **Public SRA Logan unitigs** | One or more public SRA/ENA accessions (or a cohort manifest) + reference genome |
 | Fast variant calling inside specific genes from large CRAM files | **Indexed CRAM region slicing** | CRAM file (History or HTTPS URL) + `.crai` index + BED target regions |
 | Call variants in microbial, viral, or targeted samples contaminated with host DNA | **Target-filtered FASTQ calling** | Paired FASTQ files or manifest + reference genome (or BED intervals under 45 Mb) |
 
@@ -371,7 +473,7 @@ The `.focaloop.tar.zst` archive stores per-sample variant calls, alignment run s
 
 **Inputs and manifest format**
 
-Always select the **Reference genome (FASTA)** matching your sequencing reads or alignment files. Note that FASTQ inputs must be paired-end (R1 and R2).
+Choose your **Reference genome source** from a built-in Galaxy genome (CVMFS cache, default), a FASTA dataset in your Galaxy History, or an NCBI assembly accession (`GCF_` or `GCA_` prefix) downloaded automatically. Note that raw FASTQ inputs must be paired-end (R1 and R2), whereas **Public SRA Logan unitigs** streams compact pre-assembled 31-mer unitigs directly from the public Logan archive with depth-adaptive abundance filtering and optional 15-mer host removal.
 
 For single-sample runs, select your paired FASTQ files or aligned BAM/CRAM directly from your Galaxy History. For multi-sample or remote cohorts, upload a tab-separated (TSV) or comma-separated (CSV) manifest with a header row:
 

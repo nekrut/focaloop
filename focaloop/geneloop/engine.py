@@ -706,8 +706,8 @@ class GateRun:
     def partition_short_runs(self) -> tuple[list[str], list[str], dict]:
         """Partition short runs into HTTP-200 ``logan_runs`` and ``fallback_short_runs`` (cached in ``seed/logan_probe.json``)."""
         mode = self.lp.logan_mode
-        if mode not in ("auto", "off"):
-            raise ValueError(f"Invalid logan_mode={mode!r}; expected 'auto' or 'off'")
+        if mode not in ("auto", "logan_only", "off"):
+            raise ValueError(f"Invalid logan_mode={mode!r}; expected 'auto', 'logan_only', or 'off'")
         sra_short = [str(r) for r in self.gate.get("sra_short_runs", [])]
         local_short = [rid for rid, info in self._local_streams.items() if not info.get("long_read", False)]
         ck = (tuple(sra_short), tuple(local_short), mode)
@@ -729,15 +729,23 @@ class GateRun:
         probe_p = self.dir / "seed" / "logan_probe.json"
         probe_res = probe_logan_runs(sra_short, cache_path=probe_p, timeout=8.0, retries=2)
         logan_runs = list(probe_res.get("logan_runs", []))
-        fb_runs = list(probe_res.get("fallback_short_runs", [])) + list(local_short)
-        info = {"logan_mode": mode, **probe_res, "local_short_runs": list(local_short)}
+        if mode == "logan_only":
+            if not logan_runs:
+                raise ValueError(
+                    "Logan-only mode found no pre-assembled Logan contig archives for the requested SRA accessions. "
+                    "Switch Logan mode to Automatic to fall back to raw SRA/ENA streaming."
+                )
+            fb_runs = list(local_short)
+        else:
+            fb_runs = list(probe_res.get("fallback_short_runs", [])) + list(local_short)
+        info = {"logan_mode": mode, **probe_res, "fallback_short_runs": fb_runs, "local_short_runs": list(local_short)}
         self._logan_partition_cache[ck] = (logan_runs, fb_runs, info)
         return list(logan_runs), list(fb_runs), dict(info)
 
     def _run_scout_rna(self, sd: Path, hits: list) -> dict:
         scout_json = sd / "scout_waves.json"
         logan_runs, fb_short_runs, _probe = self.partition_short_runs()
-        eligible_short = fb_short_runs if self.lp.logan_mode == "auto" else [r for r, lr in self.runs() if not lr]
+        eligible_short = fb_short_runs if self.lp.logan_mode in ("auto", "logan_only") else [r for r, lr in self.runs() if not lr]
         short_runs = eligible_short[:self.lp.scout_max_runs]
         if scout_json.exists():
             try:
@@ -760,7 +768,7 @@ class GateRun:
                 "bait_fa": str(bait_fa), "cap_state": "",
                 "scout_short_runs": list(short_runs),
                 "logan_mode": self.lp.logan_mode,
-                "logan_runs_excluded": len(logan_runs) if self.lp.logan_mode == "auto" else 0,
+                "logan_runs_excluded": len(logan_runs) if self.lp.logan_mode in ("auto", "logan_only") else 0,
             }
             _write_json_atomic(scout_json, data)
             return data
@@ -843,7 +851,7 @@ class GateRun:
             "cap_state": str(cap_state) if cap_state.exists() else "",
             "scout_short_runs": list(short_runs),
             "logan_mode": self.lp.logan_mode,
-            "logan_runs_excluded": len(logan_runs) if self.lp.logan_mode == "auto" else 0,
+            "logan_runs_excluded": len(logan_runs) if self.lp.logan_mode in ("auto", "logan_only") else 0,
         }
         _write_json_atomic(scout_json, data)
         return data
@@ -1217,7 +1225,7 @@ class GateRun:
                 sw_cached = json.loads((sd / "scout_waves.json").read_text())
                 exp_sr = (
                     seed_fb_short[:self.lp.scout_max_runs]
-                    if self.lp.logan_mode == "auto"
+                    if self.lp.logan_mode in ("auto", "logan_only")
                     else [r for r, lr in self.runs() if not lr][:self.lp.scout_max_runs]
                 )
                 if "scout_short_runs" in sw_cached and list(sw_cached["scout_short_runs"]) != exp_sr:
@@ -1706,7 +1714,7 @@ class GateRun:
         idx = self.dir / "genome" / "hisat2" / "genome"
         if self._done("hisat2_index").exists():
             return idx
-        if not force and self.lp.logan_mode == "auto":
+        if not force and self.lp.logan_mode in ("auto", "logan_only"):
             _logan_runs, fb_short_runs, _probe = self.partition_short_runs()
             if len(fb_short_runs) == 0:
                 return idx
@@ -2128,7 +2136,7 @@ class GateRun:
             fb_short_set = set(fallback_short_runs)
             scout_waves = [
                 w for w in scout_data.get("waves", [])
-                if (w.get("run_id") in fb_short_set if lp.logan_mode == "auto" else True)
+                if (w.get("run_id") in fb_short_set if lp.logan_mode in ("auto", "logan_only") else True)
             ]
             streams: dict[str, RunStream] = {}
             if sra_stream_runs:

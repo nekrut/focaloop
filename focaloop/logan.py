@@ -1,0 +1,182 @@
+"""Shared public Logan archive (unitigs & contigs) probing and ENA run-length metadata helpers."""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import re
+import socket
+import time
+from typing import Any, Sequence
+
+_INSDC_RUN_RE = re.compile(r"^[SED]RR\d+$", re.IGNORECASE)
+
+LOGAN_UNITIGS_URL_TEMPLATE = "https://s3.amazonaws.com/logan-pub/u/{acc}/{acc}.unitigs.fa.zst"
+LOGAN_CONTIGS_URL_TEMPLATE = "https://s3.amazonaws.com/logan-pub/c/{acc}/{acc}.contigs.fa.zst"
+
+
+def is_insdc_run(text: str) -> bool:
+    return bool(_INSDC_RUN_RE.match(str(text or "").strip()))
+
+
+def logan_unitigs_url(acc: str) -> str:
+    clean = acc.strip().upper()
+    return LOGAN_UNITIGS_URL_TEMPLATE.format(acc=clean)
+
+
+def logan_contigs_url(acc: str) -> str:
+    clean = acc.strip().upper()
+    return LOGAN_CONTIGS_URL_TEMPLATE.format(acc=clean)
+
+
+def _ipv4_session():
+    import requests
+    from urllib3.util import connection as _conn
+
+    _conn.allowed_gai_family = lambda: socket.AF_INET  # type: ignore[assignment]
+    sess = requests.Session()
+    sess.headers["User-Agent"] = "focaloop/0.4.0"
+    return sess
+
+
+def probe_logan_url(
+    acc: str,
+    *,
+    kind: str = "unitigs",
+    timeout: float = 8.0,
+    retries: int = 3,
+) -> dict[str, Any]:
+    """HTTP HEAD check against public Logan S3 bucket for unitigs (u/) or contigs (c/)."""
+    clean = acc.strip().upper()
+    if not is_insdc_run(clean):
+        return {
+            "accession": clean,
+            "kind": kind,
+            "available": False,
+            "content_length": 0,
+            "status": 0,
+            "url": "",
+        }
+    url = logan_unitigs_url(clean) if kind == "unitigs" else logan_contigs_url(clean)
+    sess = _ipv4_session()
+    last_status = 0
+    for attempt in range(max(1, retries)):
+        try:
+            r = sess.head(url, timeout=timeout, allow_redirects=True)
+            last_status = int(r.status_code)
+            if r.status_code == 200:
+                cl = int(r.headers.get("Content-Length") or 0)
+                return {
+                    "accession": clean,
+                    "kind": kind,
+                    "available": cl > 0,
+                    "content_length": cl,
+                    "status": 200,
+                    "url": url,
+                }
+            if r.status_code in (403, 404):
+                return {
+                    "accession": clean,
+                    "kind": kind,
+                    "available": False,
+                    "content_length": 0,
+                    "status": last_status,
+                    "url": url,
+                }
+        except Exception:
+            pass
+        if attempt + 1 < retries:
+            time.sleep(0.5 * (attempt + 1))
+    return {
+        "accession": clean,
+        "kind": kind,
+        "available": False,
+        "content_length": 0,
+        "status": last_status,
+        "url": url,
+    }
+
+
+def probe_logan_runs(
+    accessions: Sequence[str],
+    *,
+    kind: str = "unitigs",
+    max_workers: int = 8,
+    timeout: float = 8.0,
+    retries: int = 3,
+) -> dict[str, Any]:
+    """Partition run accessions into available Logan runs and fallback runs."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for a in accessions:
+        c = str(a or "").strip().upper()
+        if c and c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    probes: dict[str, dict[str, Any]] = {}
+    if ordered:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(ordered))) as ex:
+            for res in ex.map(
+                lambda x: probe_logan_url(x, kind=kind, timeout=timeout, retries=retries),
+                ordered,
+            ):
+                probes[res["accession"]] = res
+    logan_runs = [a for a in ordered if probes.get(a, {}).get("available")]
+    fallback_runs = [a for a in ordered if not probes.get(a, {}).get("available")]
+    total_logan_bytes = sum(int(probes[a].get("content_length", 0)) for a in logan_runs)
+    return {
+        "kind": kind,
+        "logan_runs": logan_runs,
+        "fallback_runs": fallback_runs,
+        "probes": probes,
+        "total_logan_bytes": total_logan_bytes,
+    }
+
+
+def fetch_ena_run_lengths(runs: Sequence[str], timeout: float = 30.0) -> dict[str, dict[str, Any]]:
+    """Query ENA filereport in chunks for read_count, base_count, library_layout, and fastq_bytes."""
+    clean_runs = [str(r).strip().upper() for r in runs if is_insdc_run(str(r))]
+    if not clean_runs:
+        return {}
+    sess = _ipv4_session()
+    out: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(clean_runs), 40):
+        chunk = ",".join(clean_runs[i : i + 40])
+        url = (
+            "https://www.ebi.ac.uk/ena/portal/api/filereport?"
+            f"accession={chunk}&result=read_run"
+            "&fields=run_accession,read_count,base_count,library_layout,fastq_bytes&format=tsv"
+        )
+        try:
+            r = sess.get(url, timeout=timeout)
+            r.raise_for_status()
+            lines = r.text.strip().splitlines()
+            if len(lines) < 2:
+                continue
+            hdr = lines[0].split("\t")
+            idx = {h: j for j, h in enumerate(hdr)}
+            for ln in lines[1:]:
+                p = ln.split("\t")
+                if len(p) < len(hdr):
+                    continue
+                acc = p[idx["run_accession"]].strip().upper()
+                rc = int(p[idx["read_count"]] or 0)
+                bc = int(p[idx["base_count"]] or 0)
+                lay = p[idx["library_layout"]].strip().upper()
+                fb_raw = p[idx.get("fastq_bytes", -1)] if "fastq_bytes" in idx else ""
+                fb = sum(int(x) for x in fb_raw.split(";") if x.strip().isdigit())
+                mates = 2 if lay == "PAIRED" else 1
+                read_len = (bc / (rc * mates)) if (rc > 0 and bc > 0) else 100.0
+                # Exact 31-mer occurrences emitted per sequenced fragment: mates * (read_len - 30)
+                kmers_per_frag = max(20.0, mates * max(10.0, read_len - 30.0))
+                out[acc] = {
+                    "read_count": rc,
+                    "base_count": bc,
+                    "fastq_bytes": fb,
+                    "layout": "PE" if mates == 2 else "SE",
+                    "mates": mates,
+                    "read_len": round(read_len, 2),
+                    "kmers_per_frag": round(kmers_per_frag, 2),
+                }
+        except Exception:
+            continue
+    return out

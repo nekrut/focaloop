@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "focaloop"
-version = "0.3.0"
+version = "0.4.0"
 description = "Byte-budgeted focal-loop analysis of INSDC reads: blueprints, 3-tier range streaming, kernel tournament, EM conditioning, stop gate, and Galaxy packaging."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,6 +42,7 @@ focaloop = "focaloop.cli:main"
 packages = [
     "focaloop",
     "focaloop.panexpr",
+    "focaloop.panexpr.csrc",
     "focaloop.malariavar",
     "focaloop.malariavar.native",
     "focaloop.geneloop",
@@ -52,6 +53,7 @@ packages = [
 
 [tool.setuptools.package-data]
 "focaloop.panexpr" = ["*.c", "*.h"]
+"focaloop.panexpr.csrc" = ["*.c", "*.h"]
 "focaloop.malariavar.native" = ["*.c", "*.h"]
 "focaloop.geneloop.glcore" = ["*.c", "*.h"]
 "focaloop.geneloop.csrc" = ["*.c", "*.h"]

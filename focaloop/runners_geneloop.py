@@ -453,7 +453,8 @@ def render_geneloop_report(
 
 def run_geneloop_galaxy(
     *,
-    genome_fasta: str | Path,
+    genome_fasta: str | Path | None = None,
+    ncbi_accession: str | None = None,
     out_gff3: str | Path,
     out_proteins: str | Path,
     out_gtf: str | Path,
@@ -467,6 +468,7 @@ def run_geneloop_galaxy(
     mode: str = "auto",
     tiberius_weights: str | Path | None = None,
     rna_manifest: str | Path | None = None,
+    sra_accessions: str | None = None,
     short_reads_1: Sequence[str | Path] | None = None,
     short_reads_2: Sequence[str | Path] | None = None,
     short_read_ids: Sequence[str] | None = None,
@@ -491,29 +493,6 @@ def run_geneloop_galaxy(
     if clade_meta is None:
         raise ValueError(f"Unsupported clade {clade!r}; expected one of {sorted(CLADE_CONFIGS)}")
 
-    genome_p = Path(genome_fasta).resolve()
-    if not genome_p.is_file():
-        raise FileNotFoundError(f"Target genome FASTA not found: {genome_fasta}")
-
-    prot_p: Path | None = None
-    if proteins_fasta:
-        prot_p = Path(proteins_fasta).resolve()
-        if not prot_p.is_file():
-            raise FileNotFoundError(f"Homology protein FASTA not found: {proteins_fasta}")
-
-    mode_info = resolve_execution_mode(
-        mode, clade, tiberius_weights=tiberius_weights, has_proteins=(prot_p is not None)
-    )
-    import sys
-    _safe_reason = re.sub(r"(error|exception)\s*:", r"\1 -", str(mode_info["reason"]), flags=re.IGNORECASE)
-    print(f"[focaloop-geneloop] mode={mode_info['effective_mode']}: {_safe_reason}", file=sys.stderr, flush=True)
-
-    sra_short: list[str] = []
-    sra_long: list[str] = []
-    run_orgs: dict[str, str] = {}
-    if rna_manifest:
-        sra_short, sra_long, run_orgs = _resolve_rna_manifest(rna_manifest)
-
     state_root = Path(state_dir).resolve()
     state_root.mkdir(parents=True, exist_ok=True)
     work_root = Path(tempfile.mkdtemp(prefix="focaloop_geneloop_"))
@@ -522,6 +501,45 @@ def run_geneloop_galaxy(
         os.environ["GENELOOP_RFAM_DIR"] = str(Path(rfam_dir).resolve())
 
     try:
+        if ncbi_accession and str(ncbi_accession).strip():
+            from .ncbi_ref import fetch_ncbi_assembly
+
+            acc_ref = str(ncbi_accession).strip()
+            import sys
+            print(f"[focaloop-geneloop] Fetching NCBI assembly {acc_ref}...", file=sys.stderr, flush=True)
+            fetched = fetch_ncbi_assembly(acc_ref, work_root / "ncbi_ref", need_annotation=False)
+            genome_fasta = fetched["fasta"]
+
+        if not genome_fasta:
+            raise ValueError("Provide a target genome FASTA (--genome) or an NCBI assembly accession (--ncbi-accession).")
+        genome_p = Path(genome_fasta).resolve()
+        if not genome_p.is_file():
+            raise FileNotFoundError(f"Target genome FASTA not found: {genome_fasta}")
+
+        prot_p: Path | None = None
+        if proteins_fasta:
+            prot_p = Path(proteins_fasta).resolve()
+            if not prot_p.is_file():
+                raise FileNotFoundError(f"Homology protein FASTA not found: {proteins_fasta}")
+
+        mode_info = resolve_execution_mode(
+            mode, clade, tiberius_weights=tiberius_weights, has_proteins=(prot_p is not None)
+        )
+        import sys
+        _safe_reason = re.sub(r"(error|exception)\s*:", r"\1 -", str(mode_info["reason"]), flags=re.IGNORECASE)
+        print(f"[focaloop-geneloop] mode={mode_info['effective_mode']}: {_safe_reason}", file=sys.stderr, flush=True)
+
+        sra_short: list[str] = []
+        sra_long: list[str] = []
+        run_orgs: dict[str, str] = {}
+        if rna_manifest:
+            sra_short, sra_long, run_orgs = _resolve_rna_manifest(rna_manifest)
+        if sra_accessions and str(sra_accessions).strip():
+            for tok in re.split(r"[\s,;]+", str(sra_accessions).strip()):
+                c = tok.strip().upper()
+                if c and c not in sra_short and c not in sra_long:
+                    sra_short.append(c)
+
         gate_dict: dict[str, Any] = {
             "gate_id": "galaxy_run",
             "fasta_path": str(genome_p),

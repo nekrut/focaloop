@@ -63,6 +63,11 @@ focaloop expressionloop
             '${str($r.element_identifier).replace("'", "_")}'
         #end for
     #end if
+    #if str($input_source.source_type) == "manifest_insdc"
+        --logan-mode '$input_source.logan_mode'
+    #else
+        --logan-mode 'off'
+    #end if
     --contrast '$contrast'
     --design '$design'
     #if str($stopping_options.budget_preset.preset) == "auto"
@@ -180,6 +185,11 @@ focaloop expressionloop
             </when>
             <when value="manifest_insdc">
                 <param argument="--manifest" type="data" format="tabular,tsv,csv" label="Sample manifest (TSV or CSV)" help="Table with required columns sample_id, condition, and run_or_url (public run accession or HTTPS FASTQ URL), plus optional mate2_url, layout, and covariates."/>
+                <param argument="--logan-mode" type="select" label="Pre-assembled Logan unitig streaming" help="When all runs in your manifest are public SRA/ENA accessions available in the public Logan archive, ExpressionLoop can stream compact pre-assembled unitig graphs (~15-35x smaller than raw FASTQ files) and quantify gene expression directly via operon-aware equivalence-class EM.">
+                    <option value="auto" selected="true">Automatic (use Logan unitigs when all runs are available, fall back to raw reads otherwise)</option>
+                    <option value="logan_only">Logan unitigs only (require pre-assembled Logan graphs for all runs)</option>
+                    <option value="off">Off (stream raw partial FASTQ/SRA slices only)</option>
+                </param>
             </when>
         </conditional>
 
@@ -498,10 +508,11 @@ focaloop expressionloop
 4. **Adaptive stopping:** After each wave, ExpressionLoop checks whether every sample has passed a safe minimum mapped depth, whether gene fold changes have stopped shifting between waves, and whether technical sequencing noise is small compared to biological variation across replicates. Once those criteria pass (or the reading budget cap is reached), streaming stops.
 5. **Borderline-gene refinement and state export:** Optionally scans one final slice of reads through a fast k-mer filter to add evidence for borderline or low-count genes while skipping already-saturated abundant transcripts. Results are exported alongside a compact `.focaloop.tar.zst` state bundle.
 
-**Local Galaxy History files vs. public SRA/ENA accessions**
+**Local Galaxy History files vs. Logan unitigs vs. raw SRA/ENA streaming**
 
 - **Galaxy History FASTQ files:** Under the default **Automatic** budget, ExpressionLoop processes up to 100% of your local files (stopping earlier only if fold-change and variance criteria already converged cleanly), so small local datasets are never truncated prematurely.
-- **Public SRA/ENA accessions or remote URLs:** Under the default **Automatic** budget, ExpressionLoop reads partial slices over the network and stops as soon as the contrast stabilizes (capped at 12% of each archive unless you pick a higher budget preset).
+- **Public SRA/ENA accessions with Logan unitigs (default for remote manifests):** When every run in your manifest is available in the public Logan archive, ExpressionLoop streams compact pre-assembled 31-mer unitigs (~15-35x smaller than raw FASTQ archives), resolves multi-mapping genes with operon-aware expectation-maximization, scales k-mer abundance to expected fragment counts using ENA read lengths, and runs differential expression directly.
+- **Raw public SRA/ENA partial-file streaming:** When Logan is turned off or any run is not yet in Logan, ExpressionLoop falls back uniformly across all samples to partial-file streaming over the network and stops as soon as the contrast stabilizes (capped at 12% of each archive unless you pick a higher budget preset).
 
 **What is saved in the state bundle**
 

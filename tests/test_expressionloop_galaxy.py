@@ -30,8 +30,9 @@ def test_panexpr_v24_c_accelerators_portable_isa_and_adapter_clip(tmp_path: Path
     monkeypatch.setenv("FOCALOOP_PORTABLE_ISA", "1")
     monkeypatch.setenv("FOCALOOP_BUILD_NATIVE_DIR", str(tmp_path / "native"))
     built = prebuild_expressionloop_native_libs()
-    assert len(built) == 5
+    assert len(built) == 7
     assert "panexpr_fast_c" in built
+    assert "panexpr_expr_sam_ec_v2" in built
 
     # Illumina TruSeq adapter read-through clipping: C99 fast path matches pure-Python reference
     adapter = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"

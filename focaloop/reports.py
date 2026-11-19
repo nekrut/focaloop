@@ -275,6 +275,12 @@ def render_panexpr_report(
     )
     volc_svg = _svg_volcano(de_df)
 
+    is_logan = str(loop_summary.get("source_mode") or "") == "logan_unitigs"
+    winner_sub = (
+        f"Logan unitig streaming ({float(loop_summary.get('wire_reduction_x', 1.0)):.1f}x wire reduction)"
+        if is_logan
+        else f"{len(scoreboard)} aligners benchmarked on {int(loop_summary.get('tournament_reads', 0)):,} reads"
+    )
     doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>{_esc(brand)} Report — {_esc(contrast_str)}</title>{_BASE_CSS}</head>
@@ -286,7 +292,7 @@ def render_panexpr_report(
   </div>
   <div class="kpis">
     <div class="kpi"><div class="label">Archive Streamed</div><div class="val">{pct_streamed:.2f}%</div><div class="sub">{streamed_mb:.1f} MB of {tot_arch_mb:.1f} MB ({100.0 - pct_streamed:.1f}% skipped)</div></div>
-    <div class="kpi"><div class="label">Tournament Winner</div><div class="val">{_esc(winner)}</div><div class="sub">{len(scoreboard)} aligners benchmarked on {int(loop_summary.get('tournament_reads', 0)):,} reads</div></div>
+    <div class="kpi"><div class="label">Aligner Engine</div><div class="val">{_esc(winner)}</div><div class="sub">{_esc(winner_sub)}</div></div>
     <div class="kpi"><div class="label">Significant DEGs</div><div class="val">{n_deg:,}</div><div class="sub">FDR &lt; 0.05 across {len(de_df):,} quantified genes</div></div>
     <div class="kpi"><div class="label">Ortholog Bridge</div><div class="val">{n_bridge:,}</div><div class="sub">Primary: {_esc(catalog_summary.get('primary_assembly'))} ({int(catalog_summary.get('n_targets', 0)):,} targets)</div></div>
     <div class="kpi"><div class="label">Loop Stopping</div><div class="val">{_esc(loop_summary.get('stop_reason'))}</div><div class="sub">{int(loop_summary.get('iterations', 0))} iterations · {float(loop_summary.get('wall_seconds', 0.0)):.1f}s</div></div>
@@ -296,12 +302,12 @@ def render_panexpr_report(
     <h2>Stage 1 — Regime Classifier &amp; Empirical Aligner Tournament</h2>
     <table>
       <thead><tr><th>Aligner Kernel</th><th class="num">Composite Score</th><th class="num">Synth Spearman</th><th class="num">Tie Symmetry</th><th class="num">Real Mapped Frac</th><th class="num">Reads / sec</th></tr></thead>
-      <tbody>{''.join(board_rows_html) or '<tr><td colspan="6">Single kernel selected directly.</td></tr>'}</tbody>
+      <tbody>{''.join(board_rows_html) or '<tr><td colspan="6">Logan unitig engine selected directly.</td></tr>'}</tbody>
     </table>
   </div>
 
   <div class="section">
-    <h2>Stage 2 — Per-Sample Inverse-Depth Range Streaming</h2>
+    <h2>Stage 2 — Per-Sample Streaming Summary</h2>
     <table>
       <thead><tr><th>Sample</th><th>Condition</th><th>Run / Layout</th><th class="num">Full Archive</th><th class="num">Streamed</th><th class="num">% Streamed</th><th class="num">% Skipped</th><th class="num">Mapped Reads</th></tr></thead>
       <tbody>{''.join(sample_rows_html)}</tbody>
@@ -310,7 +316,7 @@ def render_panexpr_report(
 
   <div class="section">
     <h2>Stage 3 &amp; 4 — EM Conditioning, Convergence &amp; Volcano</h2>
-    <p>Catalog conditioned across assemblies <code>{_esc(', '.join(catalog_summary.get('assemblies', [])))}</code> ({int(catalog_summary.get('n_groups', 0)):,} ortholog groups; assembly priors: <code>{_esc(loop_summary.get('assembly_prior'))}</code>).</p>
+    <p>Catalog conditioned across assemblies <code>{_esc(', '.join(catalog_summary.get('assemblies', [])))}</code> ({int(catalog_summary.get('n_groups', 0)):,} ortholog groups, assembly priors: <code>{_esc(loop_summary.get('assembly_prior'))}</code>).</p>
     <div class="grid2">
       <div>{conv_svg}</div>
       <div>{volc_svg}</div>

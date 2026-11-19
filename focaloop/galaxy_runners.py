@@ -1755,5 +1755,10 @@ def prebuild_all_native_libs() -> dict[str, str]:
     ):
         p = ensure_shared_lib(stem, srcs, headers=hdrs, use_openmp=omp)
         built[f"malariavar_{stem}"] = str(p)
+    from .malariavar.logan_var import ensure_var_logan_bins
+
+    v_prep, v_pile = ensure_var_logan_bins()
+    built["malariavar_prep_unitigs_filt_adapt"] = str(v_prep)
+    built["malariavar_logan_var_pileup"] = str(v_pile)
     built.update(prebuild_geneloop_native_libs())
     return built

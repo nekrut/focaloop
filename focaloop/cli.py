@@ -171,6 +171,8 @@ def cmd_expressionloop(a: argparse.Namespace) -> int:
             read_ids=a.read_ids,
             organism_mode=a.organism_mode,
             source_mode=a.source_mode,
+            logan_mode=a.logan_mode,
+            logan_min_ka=a.logan_min_ka,
             design=a.design,
             followup_contrasts=a.followup_contrasts,
             max_byte_fraction=a.max_byte_fraction,
@@ -210,6 +212,10 @@ def cmd_variationloop(a: argparse.Namespace) -> int:
             out_drm=a.out_drm,
             manifest_path=a.manifest,
             ref_fasta=a.ref_fasta,
+            ncbi_accession=a.ncbi_accession,
+            sra_accessions=a.sra_accessions,
+            logan_mode=a.logan_mode,
+            logan_min_ka=a.logan_min_ka,
             targets_bed=a.targets_bed,
             cram_pad_bp=a.cram_pad_bp,
             reads=a.reads,
@@ -253,6 +259,7 @@ def cmd_geneloop(a: argparse.Namespace) -> int:
     try:
         meta = run_geneloop_galaxy(
             genome_fasta=a.genome,
+            ncbi_accession=a.ncbi_accession,
             out_gff3=a.out_gff3,
             out_proteins=a.out_proteins,
             out_gtf=a.out_gtf,
@@ -266,6 +273,7 @@ def cmd_geneloop(a: argparse.Namespace) -> int:
             mode=a.mode,
             tiberius_weights=a.tiberius_weights,
             rna_manifest=a.rna_manifest,
+            sra_accessions=a.sra_accessions,
             short_reads_1=a.short_reads_1,
             short_reads_2=a.short_reads_2,
             short_read_ids=a.short_read_ids,
@@ -448,6 +456,8 @@ def build_parser() -> argparse.ArgumentParser:
     el.add_argument("--followup-contrasts", nargs="*", help="optional comma-separated extra contrasts")
     el.add_argument("--organism-mode", choices=("auto", "eukaryotic", "prokaryotic"), default="auto")
     el.add_argument("--source-mode", choices=("auto", "http_range", "sra_odp", "local_bytes"), default="auto")
+    el.add_argument("--logan-mode", choices=("auto", "logan_only", "off"), default="auto", help="stream pre-assembled Logan unitigs for public SRA/ENA runs when available")
+    el.add_argument("--logan-min-ka", type=float, default=0.0, help="minimum k-mer abundance (ka) cutoff for Logan unitigs (default: 0.0)")
     el.add_argument("--max-byte-fraction", type=float, default=0.12, help="max file fraction to read (0.005 to 1.0)")
     el.add_argument("--v-tech-target", type=float, default=0.25, help="target sequencing-noise share of total variance")
     el.add_argument("--delta-lfc-stop", type=float, default=0.05)
@@ -467,9 +477,12 @@ def build_parser() -> argparse.ArgumentParser:
     el.add_argument("--out-transcripts", help="optional output transcript abundance TSV")
     el.set_defaults(func=cmd_expressionloop)
 
-    vl = sub.add_parser("variationloop", help="organism-agnostic variant calling from FASTQ, BAM, or indexed CRAM")
-    vl.add_argument("--analysis-mode", choices=("focused_cram", "wgs_stream", "diploid_wgs"), default="diploid_wgs")
+    vl = sub.add_parser("variationloop", help="organism-agnostic variant calling from FASTQ, BAM, indexed CRAM, or Logan unitigs")
+    vl.add_argument("--analysis-mode", choices=("focused_cram", "wgs_stream", "diploid_wgs", "logan_unitigs"), default="diploid_wgs")
     vl.add_argument("--manifest", help="TSV/CSV sample manifest")
+    vl.add_argument("--sra-accessions", help="optional comma/space-separated public SRA/ENA run accessions for direct Logan/streaming calling")
+    vl.add_argument("--logan-mode", choices=("auto", "logan_only", "off"), default="auto", help="use pre-assembled Logan unitigs for public SRA/ENA runs when available")
+    vl.add_argument("--logan-min-ka", default="adapt", help="Logan unitig k-mer abundance floor ('adapt' or numeric threshold)")
     vl.add_argument("--reads", nargs="+", help="optional local FASTQ(.gz) files for manifest matching")
     vl.add_argument("--read-ids", nargs="+", help="sample identifiers matching --reads")
     vl.add_argument("--reads-r1", help="single-sample forward R1 FASTQ(.gz)")
@@ -478,6 +491,7 @@ def build_parser() -> argparse.ArgumentParser:
     vl.add_argument("--crai", help="optional CRAM/BAM index (.crai or .bai)")
     vl.add_argument("--sample-name", default="SAMPLE")
     vl.add_argument("--ref-fasta", help="reference genome FASTA(.gz)")
+    vl.add_argument("--ncbi-accession", help="optional NCBI assembly accession (GCF_.../GCA_...) to fetch reference genome FASTA")
     vl.add_argument("--reference-label", help="display label for reference genome in reports")
     vl.add_argument("--targets-bed", help="optional target intervals BED")
     vl.add_argument("--cram-pad-bp", type=int, default=1000)
@@ -506,13 +520,15 @@ def build_parser() -> argparse.ArgumentParser:
     vl.set_defaults(func=cmd_variationloop)
 
     gl = sub.add_parser("geneloop", help="adaptive eukaryotic structural genome annotation")
-    gl.add_argument("--genome", required=True, help="target genome assembly FASTA(.gz)")
+    gl.add_argument("--genome", help="target genome assembly FASTA(.gz)")
+    gl.add_argument("--ncbi-accession", help="optional NCBI assembly accession (GCF_.../GCA_...) to fetch target genome FASTA")
     gl.add_argument("--clade", default="vertebrates", help="organism clade preset")
     gl.add_argument("--mode", choices=("auto", "fast_evidence", "cpu_tiberius", "gpu_tiberius"), default="auto")
     gl.add_argument("--proteins", help="optional related-species homology protein FASTA(.gz)")
     gl.add_argument("--exclude-genus", default="", help="optional genus to strip from homology proteins")
     gl.add_argument("--tiberius-weights", help="optional Tiberius weights directory or .tar.gz archive")
     gl.add_argument("--rna-manifest", help="optional SRA/ENA RNA-seq run manifest")
+    gl.add_argument("--sra-accessions", help="optional comma/space-separated public SRA/ENA RNA-seq run accessions")
     gl.add_argument("--short-reads-1", nargs="+", help="optional local short-read R1 or single-end FASTQs")
     gl.add_argument("--short-reads-2", nargs="+", help="optional local short-read R2 FASTQs")
     gl.add_argument("--short-read-ids", nargs="+", help="sample identifiers matching short-read FASTQs")
@@ -522,7 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     gl.add_argument("--long-bams", nargs="+", help="optional pre-aligned long-read RNA-seq BAMs")
     gl.add_argument("--short-bam-ids", nargs="+", help="sample identifiers matching short-read BAMs")
     gl.add_argument("--long-bam-ids", nargs="+", help="sample identifiers matching long-read BAMs")
-    gl.add_argument("--logan-mode", choices=("auto", "off"), default="auto")
+    gl.add_argument("--logan-mode", choices=("auto", "logan_only", "off"), default="auto")
     gl.add_argument("--max-frac-spots", type=float, default=0.35)
     gl.add_argument("--p0-stop", type=float, default=0.005)
     gl.add_argument("--wave-spots", type=int, default=1_000_000)

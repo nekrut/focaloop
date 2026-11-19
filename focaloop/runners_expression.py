@@ -350,16 +350,21 @@ def resolve_expression_manifest(
             raw_md5 = [m for m in (erow.get("fastq_md5") or "").split(";") if m]
             while len(raw_md5) < len(raw_urls):
                 raw_md5.append("")
-            paired_idx = [i for i, u in enumerate(raw_urls) if u.endswith("_1.fastq.gz") or u.endswith("_2.fastq.gz")]
-            use_idx = paired_idx if len(paired_idx) == 2 else ([0, 1] if len(raw_urls) == 2 else [0])
-            for i in use_idx:
-                u = raw_urls[i]
-                if u.startswith("ftp://"):
-                    u = "https://" + u[len("ftp://"):]
-                elif not u.startswith("http"):
-                    u = "https://" + u
-                sz = raw_sizes[i] if i < len(raw_sizes) else _head_content_length(u)
-                files.append(FastqFile(url=u, bytes=sz, md5=raw_md5[i]))
+            if raw_urls:
+                paired_idx = [i for i, u in enumerate(raw_urls) if u.endswith("_1.fastq.gz") or u.endswith("_2.fastq.gz")]
+                use_idx = paired_idx if len(paired_idx) == 2 else ([0, 1] if len(raw_urls) == 2 else [0])
+                for i in use_idx:
+                    u = raw_urls[i]
+                    if u.startswith("ftp://"):
+                        u = "https://" + u[len("ftp://"):]
+                    elif not u.startswith("http"):
+                        u = "https://" + u
+                    sz = raw_sizes[i] if i < len(raw_sizes) else _head_content_length(u)
+                    files.append(FastqFile(url=u, bytes=sz, md5=raw_md5[i]))
+            else:
+                odp_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{run_id}/{run_id}"
+                odp_sz = _head_content_length(odp_url)
+                files.append(FastqFile(url=odp_url, bytes=odp_sz))
             strategy = erow.get("library_strategy") or strategy
         elif src.startswith(("http://", "https://", "ftp://")):
             all_local = False
@@ -482,6 +487,8 @@ def run_expressionloop_galaxy(
     read_ids: Sequence[str] | None = None,
     organism_mode: str = "auto",
     source_mode: str = "auto",
+    logan_mode: str = "auto",
+    logan_min_ka: float = 0.0,
     design: str = "~condition",
     followup_contrasts: Sequence[str] | str | None = None,
     max_byte_fraction: float = 0.12,
@@ -583,6 +590,148 @@ def run_expressionloop_galaxy(
         cat_dir = state_root / "catalog"
         catalog.save(cat_dir)
         write_json(cat_dir / "link_stats.json", catalog.link_stats)
+
+        # 0.4.0 Logan unitig streaming branch for public SRA/ENA cohorts
+        eff_logan_mode = str(logan_mode or "auto").strip().lower()
+        if eff_logan_mode not in ("auto", "logan_only", "off"):
+            raise ValueError(f"Unsupported logan_mode {logan_mode!r}; expected 'auto', 'logan_only', or 'off'")
+
+        if eff_logan_mode in ("auto", "logan_only") and not all_local:
+            from .logan import is_insdc_run, probe_logan_runs
+            from .panexpr.logan_expr import run_logan_expression_cohort
+
+            rna_run_ids = [r.run_id for r in manifest.rna_runs]
+            all_insdc = bool(rna_run_ids) and all(is_insdc_run(rid) for rid in rna_run_ids)
+            if not all_insdc:
+                if eff_logan_mode == "logan_only":
+                    raise ValueError(
+                        "Logan-only mode requires public SRA/ENA run accessions (SRR, ERR, or DRR) for every sample in the manifest."
+                    )
+            else:
+                probe = probe_logan_runs(rna_run_ids, kind="unitigs")
+                n_avail = len(probe["logan_runs"])
+                n_total = len(probe["probes"])
+                if n_avail == n_total and n_total > 0:
+                    _log(
+                        f"Logan probe: {n_avail}/{n_total} runs available on logan-pub/u/ "
+                        f"({probe['total_logan_bytes'] / 1e6:.1f} MB total compressed unitigs)"
+                    )
+                    pan_state_dir = state_root / "panexpr_state"
+                    logan_res = run_logan_expression_cohort(
+                        catalog=catalog,
+                        manifest=manifest,
+                        sample_meta_df=sample_meta_df,
+                        contrast_list=contrast_list,
+                        design=design,
+                        gtf_path=p_gtf,
+                        work_dir=work_dir,
+                        pan_state_dir=pan_state_dir,
+                        threads=threads,
+                        min_ka=float(logan_min_ka),
+                        log=_log,
+                    )
+                    bridge_map = _build_ortholog_bridge_map(catalog)
+                    de_df = _format_de_table(logan_res["de_raw"], bridge_map)
+                    Path(out_de).parent.mkdir(parents=True, exist_ok=True)
+                    de_df.to_csv(out_de, sep="\t", index=False, float_format="%.6g")
+                    if out_transcripts:
+                        tx_pq = pan_state_dir / "transcript_abundances.parquet"
+                        tx_df = pq.read_table(tx_pq).to_pandas() if tx_pq.exists() else pd.DataFrame()
+                        Path(out_transcripts).parent.mkdir(parents=True, exist_ok=True)
+                        tx_df.to_csv(out_transcripts, sep="\t", index=False, float_format="%.6g")
+
+                    cat_summary = {
+                        "primary_assembly": catalog.primary_assembly,
+                        "assemblies": [s.assembly_id for s in specs],
+                        "n_targets": len(catalog),
+                        "n_groups": len(catalog.groups),
+                        "link_stats": catalog.link_stats,
+                    }
+                    loop_summary = {
+                        "source_mode": "logan_unitigs",
+                        "logan_mode": eff_logan_mode,
+                        "strand_mode": "unstranded (Logan k=31 unitigs)",
+                        "tournament_reads": 0,
+                        "tournament_seconds": 0.0,
+                        "winner": logan_res["aligner"],
+                        "iterations": 1,
+                        "stop_reason": f"LOGAN_UNITIGS_COMPLETE ({logan_res['wire_reduction_x']:.1f}x wire reduction)",
+                        "total_archive_bytes": logan_res["total_archive_bytes"],
+                        "bytes_streamed_global": logan_res["logan_wire_bytes"],
+                        "bytes_streamed_zoom": 0,
+                        "bytes_streamed_total": logan_res["logan_wire_bytes"],
+                        "pct_archive_streamed": logan_res["pct_archive"],
+                        "wire_reduction_x": logan_res["wire_reduction_x"],
+                        "wall_seconds": round(time.time() - t_start, 2),
+                        "v_tech_target": v_tech_target,
+                        "delta_lfc_stop": delta_lfc_stop,
+                        "assembly_prior": {catalog.primary_assembly: 1.0},
+                        "telemetry": [],
+                        "zoom": {
+                            "n_antisense_genes": logan_res["n_antisense_genes"],
+                            "n_zoom_candidates": logan_res["n_zoom_candidates"],
+                        },
+                        "holdout_saved": False,
+                        "logan_runs": logan_res["run_stats"],
+                    }
+                    contrast_pretty = f"{fac}: {lvl_a} vs {lvl_b}"
+                    render_panexpr_report(
+                        out_report,
+                        contrast_str=contrast_pretty,
+                        winner=logan_res["aligner"],
+                        scoreboard=[],
+                        per_sample_rows=logan_res["per_sample_rows"],
+                        catalog_summary=cat_summary,
+                        loop_summary=loop_summary,
+                        de_df=de_df,
+                    )
+                    sample_meta_df.to_parquet(state_root / "sample_metadata.parquet", index=False)
+                    store = FocaloopStateStore(state_root)
+                    ledger = HypothesisLedger.from_store(store, alpha_budget=0.05)
+                    if not de_df.empty:
+                        top = de_df.iloc[0]
+                        top_lfc = float(top["log2FoldChange"]) if pd.notna(top["log2FoldChange"]) else 0.0
+                        top_p = float(top["pvalue"]) if pd.notna(top["pvalue"]) else 1.0
+                        ledger.evaluate_query(
+                            "q0001",
+                            "focaloop-expressionloop",
+                            f"{fac}:{lvl_a}_vs_{lvl_b}:logan_primary",
+                            top_lfc,
+                            top_p,
+                            top_lfc,
+                            min(top_p, 0.01) if top_p <= 0.005 else top_p,
+                            store=store,
+                        )
+                    state_meta = {
+                        "engine": "panexpr",
+                        "version": "0.4.0",
+                        "blueprint_id": "panexpr",
+                        "primary_contrast": contrast_list,
+                        "design": design,
+                        "organism_mode": org_mode,
+                        "length_offsets": False,
+                        "catalog_summary": cat_summary,
+                        "loop_summary": loop_summary,
+                        "samples": sample_meta_df.to_dict(orient="records"),
+                    }
+                    write_json(state_root / STATE_META, state_meta)
+                    if state_archive:
+                        pack_state(state_root, state_archive)
+                    return state_meta
+                if eff_logan_mode == "logan_only":
+                    missing = ", ".join(probe["fallback_runs"])
+                    raise ValueError(
+                        f"Logan unitigs are not available for all requested accessions (missing: {missing}). "
+                        "Switch Logan mode to Automatic to fall back to raw SRA/ENA streaming."
+                    )
+                _log(
+                    f"Logan probe: {n_avail}/{n_total} runs available; falling back to uniform raw-read streaming "
+                    "to keep quantification consistent across all samples."
+                )
+        elif eff_logan_mode == "logan_only" and all_local:
+            raise ValueError(
+                "Logan-only mode applies to public SRA/ENA run accessions, not local Galaxy History FASTQ files."
+            )
 
         stream_cache = work_dir / "stream_cache"
         stream_cache.mkdir(parents=True, exist_ok=True)
@@ -798,7 +947,7 @@ def run_expressionloop_galaxy(
             )
         state_meta = {
             "engine": "panexpr",
-            "version": "0.3.0",
+            "version": "0.4.0",
             "blueprint_id": "panexpr",
             "primary_contrast": contrast_list,
             "design": design,
@@ -835,4 +984,9 @@ def prebuild_expressionloop_native_libs() -> dict[str, str]:
     ):
         lib = compile_c_lib(name, pan_dir / src)
         built[f"panexpr_{name}"] = str(getattr(lib, "_name", "loaded"))
+    from .panexpr.logan_expr import ensure_expr_logan_bins
+
+    prep_bin, ec_bin = ensure_expr_logan_bins()
+    built["panexpr_prep_expr_unitigs"] = str(prep_bin)
+    built["panexpr_expr_sam_ec_v2"] = str(ec_bin)
     return built

@@ -262,3 +262,177 @@ def test_ncbi_ref_resolution_fetch_and_3part_contrast(tmp_path, monkeypatch):
     res_no_gff = ncbi_ref.fetch_ncbi_assembly("GCF_000005845.2", tmp_path / "ncbi2", need_annotation=False)
     assert res_no_gff["fasta"].is_file() and res_no_gff["gff"] is None
     assert len(downloaded) == 1
+
+
+def test_variationloop_logan_unitigs_end_to_end_and_warm_query(tmp_path):
+    """End-to-end C compilation + k=15 filter + weighted pileup + VCF + Focaloop Query on synthetic Logan unitigs."""
+    from focaloop.ops import run_query
+
+    td = REPO_ROOT / "tools" / "focaloop" / "test-data" / "variationloop"
+    ref_fa = td / "ref_chr20_mini.fa"
+    # Extract reference sequence to synthesize ka-tagged Logan unitigs carrying a known SNV and deletion
+    seq_lines = [ln.strip() for ln in ref_fa.read_text().splitlines() if not ln.startswith(">")]
+    seq = "".join(seq_lines).upper()
+    assert len(seq) > 4000
+
+    def _mutate_unitig_fa(out_fa: pathlib.Path, snv_pos0: int, ka: float, add_del: bool = False) -> pathlib.Path:
+        alt_base = "C" if seq[snv_pos0] != "C" else "G"
+        # Build tiled 120 bp unitigs spanning the locus with ka:f: tag
+        recs = []
+        uid = 0
+        for start in range(100, min(len(seq) - 200, 3500), 60):
+            seg = list(seq[start : start + 120])
+            if start <= snv_pos0 < start + 120:
+                seg[snv_pos0 - start] = alt_base
+            s_out = "".join(seg)
+            if add_del and start <= 1500 < start + 100:
+                rel = 1500 - start
+                s_out = s_out[:rel] + s_out[rel + 3 :]
+            recs.append(f">{uid} ka:f:{ka:.2f}\n{s_out}\n")
+            uid += 1
+        # Add off-target random host-like unitigs that the k=15 bitset should drop
+        recs.append(">9999 ka:f:8.00\n" + ("ATATGCGC" * 12) + "\n")
+        out_fa.write_text("".join(recs), encoding="utf-8")
+        return out_fa
+
+    u_a = _mutate_unitig_fa(tmp_path / "sample_a.unitigs.fa", snv_pos0=1000, ka=18.0, add_del=True)
+    u_b = _mutate_unitig_fa(tmp_path / "sample_b.unitigs.fa", snv_pos0=2000, ka=18.0, add_del=False)
+
+    manifest = tmp_path / "logan_manifest.tsv"
+    manifest.write_text(
+        f"sample_id\tgroup\tsource\n"
+        f"s_a\tgroup_a\t{u_a}\n"
+        f"s_b\tgroup_b\t{u_b}\n",
+        encoding="utf-8",
+    )
+    state_arc = tmp_path / "logan_var.focaloop.tar.zst"
+    vcf_out = tmp_path / "logan_var.vcf"
+    var_out = tmp_path / "logan_var.tsv"
+    rep_out = tmp_path / "logan_var.html"
+
+    meta = runners_variation.run_variationloop_galaxy(
+        analysis_mode="logan_unitigs",
+        manifest_path=manifest,
+        ref_fasta=ref_fa,
+        use_host_depletion=True,
+        threads=2,
+        state_dir=tmp_path / "logan_var_state",
+        state_archive=state_arc,
+        out_variants=var_out,
+        out_vcf=vcf_out,
+        out_report=rep_out,
+    )
+    assert meta["version"] == "0.4.0"
+    assert meta["mode"] == "logan_unitigs"
+    tsv = var_out.read_text(encoding="utf-8")
+    assert "SNV" in tsv
+    assert "INDEL" in tsv
+    assert "1001" in tsv and "2001" in tsv
+
+    # Verify zero-byte warm query works directly on Logan VariationLoop state
+    q_tbl = tmp_path / "q_logan.tsv"
+    q_ver = tmp_path / "q_logan.json"
+    q_rep = tmp_path / "q_logan.html"
+    q_res = run_query(state_arc, "group=group_a:group_b", "human", q_tbl, q_ver, mode="fst", out_report=q_rep)
+    assert q_res["new_bytes"] == 0
+    assert "hudson_fst" in q_tbl.read_text(encoding="utf-8")
+
+
+def test_expressionloop_logan_unitigs_end_to_end(tmp_path):
+    """End-to-end C compilation + prep_expr_unitigs + expr_sam_ec_v2 + PyDESeq2 + state export on synthetic Logan unitigs."""
+    import pandas as pd
+    from focaloop.panexpr.catalog import AssemblySpec, build_catalog
+    from focaloop.panexpr.logan_expr import run_logan_expression_cohort
+    from focaloop.panexpr.manifest import FastqFile, Run, StudyManifest
+
+    td = REPO_ROOT / "tools" / "focaloop" / "test-data" / "expressionloop"
+    ref_fa = td / "ref_primary.fa"
+    ref_gtf = td / "ref_primary.gtf"
+    cat = build_catalog([AssemblySpec("primary", ref_fa, ref_gtf)], "eukaryotic", "primary", tmp_path / "cat_tmp")
+    gene_tgts = [t for t in cat.targets.values() if not t.is_decoy]
+    assert len(gene_tgts) >= 4
+
+    # Synthesize 6 sample unitig files (3 control, 3 treated) with strong differential abundance on first gene
+    runs = []
+    meta_rows = []
+    local_u: dict[str, pathlib.Path] = {}
+    for cond, boost in (("control", 1.0), ("treated", 12.0)):
+        for rep_i in (1, 2, 3):
+            sid = f"{cond}_{rep_i}"
+            uf = tmp_path / f"{sid}.unitigs.fa"
+            recs = []
+            for gi, tgt in enumerate(gene_tgts):
+                ka = (40.0 * boost) if gi == 0 else (25.0 + rep_i * 2.0 + (gi % 5))
+                seq_u = tgt.seq[: min(len(tgt.seq), 250)]
+                if len(seq_u) >= 45:
+                    recs.append(f">{gi} ka:f:{ka:.2f}\n{seq_u}\n")
+            uf.write_text("".join(recs), encoding="utf-8")
+            local_u[sid] = uf
+            runs.append(
+                Run(
+                    run_id=sid,
+                    sample=sid,
+                    condition=cond,
+                    layout="SE",
+                    strategy="RNA-Seq",
+                    read_count=10000,
+                    files=(FastqFile(url=str(uf), bytes=uf.stat().st_size, local_path=str(uf)),),
+                )
+            )
+            meta_rows.append({"run_id": sid, "sample": sid, "condition": cond})
+
+    manifest = StudyManifest(study_id="logan_test", accession="test", runs=runs)
+    meta_df = pd.DataFrame(meta_rows).set_index("sample")
+    res = run_logan_expression_cohort(
+        catalog=cat,
+        manifest=manifest,
+        sample_meta_df=meta_df,
+        contrast_list=["condition", "treated", "control"],
+        design="~condition",
+        gtf_path=ref_gtf,
+        work_dir=tmp_path / "work",
+        pan_state_dir=tmp_path / "pan_state",
+        threads=2,
+        local_unitig_map=local_u,
+    )
+    de = res["de_raw"]
+    assert not de.empty
+    top_gene = gene_tgts[0].gene_id
+    row0 = de[de["gene_id"] == top_gene]
+    assert not row0.empty
+    assert float(row0["log2fc"].iloc[0]) > 2.0
+    assert (tmp_path / "pan_state" / "target_counts.parquet").is_file()
+
+
+def test_geneloop_logan_only_mode_partition(tmp_path, monkeypatch):
+    from focaloop.geneloop import engine as gl_eng
+
+    td = REPO_ROOT / "tools" / "focaloop" / "test-data" / "geneloop"
+    gate = {
+        "gate_id": "test_logan_only",
+        "fasta_path": str(td / "genome.fa"),
+        "proteins_path": "",
+        "exclude_genus": "",
+        "species": "",
+        "tiberius_model_cfg": "vertebrates",
+        "compleasm_lineage": "vertebrata_odb12",
+        "tiberius_weights": "",
+        "sra_short_runs": ["SRR111111", "SRR222222"],
+        "sra_long_runs": [],
+        "sra_run_organisms": {},
+    }
+    monkeypatch.setattr(
+        gl_eng,
+        "probe_logan_runs",
+        lambda accs, **kw: {
+            "logan_runs": ["SRR111111"],
+            "fallback_short_runs": ["SRR222222"],
+            "total_compressed_bytes": 123456,
+        },
+    )
+    lp = gl_eng.LoopParams(logan_mode="logan_only")
+    gr = gl_eng.GateRun("test_logan_only", root=tmp_path, loop=lp, gate=gate)
+    lruns, fbruns, info = gr.partition_short_runs()
+    assert lruns == ["SRR111111"]
+    assert fbruns == []
+    assert info["logan_mode"] == "logan_only"

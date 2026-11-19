@@ -1154,6 +1154,10 @@ def run_variationloop_galaxy(
     out_drm: str | Path | None = None,
     manifest_path: str | Path | None = None,
     ref_fasta: str | Path | None = None,
+    ncbi_accession: str | None = None,
+    sra_accessions: str | None = None,
+    logan_mode: str = "auto",
+    logan_min_ka: str = "adapt",
     targets_bed: str | Path | None = None,
     cram_pad_bp: int = 1000,
     reads: Sequence[str] | None = None,
@@ -1179,9 +1183,12 @@ def run_variationloop_galaxy(
     reference_label: str | None = None,
     surveillance_panel: str = "none",
 ) -> dict[str, Any]:
-    """Execute Focaloop VariationLoop across diploid WGS/targeted, CRAM range slicing, or target-filtered FASTQ calling."""
-    if analysis_mode not in ("focused_cram", "wgs_stream", "diploid_wgs"):
+    """Execute Focaloop VariationLoop across diploid WGS/targeted, CRAM range slicing, target-filtered FASTQ, or Logan unitig calling."""
+    if analysis_mode not in ("focused_cram", "wgs_stream", "diploid_wgs", "logan_unitigs"):
         raise ValueError(f"Unsupported analysis_mode {analysis_mode!r}")
+    eff_logan_mode = str(logan_mode or "auto").strip().lower()
+    if eff_logan_mode not in ("auto", "logan_only", "off"):
+        raise ValueError(f"Unsupported logan_mode {logan_mode!r}; expected 'auto', 'logan_only', or 'off'")
 
     t_start = time.time()
     work_dir = Path(tempfile.mkdtemp(prefix="focaloop_varloop_"))
@@ -1199,6 +1206,16 @@ def run_variationloop_galaxy(
         local_map[sample_name] = pair
 
     try:
+        if ncbi_accession and str(ncbi_accession).strip():
+            from .ncbi_ref import fetch_ncbi_assembly
+
+            acc_ref = str(ncbi_accession).strip()
+            _log(f"Fetching NCBI reference assembly {acc_ref}...")
+            fetched = fetch_ncbi_assembly(acc_ref, work_dir / "ncbi_ref", need_annotation=False)
+            ref_fasta = fetched["fasta"]
+            if not reference_label:
+                reference_label = acc_ref
+
         # Specialized P. falciparum surveillance branch only when explicitly opted in (or legacy call with no ref_fasta)
         use_pf3d7 = (
             analysis_mode in ("focused_cram", "wgs_stream")
@@ -1276,6 +1293,10 @@ def run_variationloop_galaxy(
                 if not src:
                     raise ValueError(f"Sample {sid!r}: missing input source column in manifest")
                 jobs.append({"sample": sid, "group": grp, "src": src, "mate2": mate2, "crai": crai_u, "row": row})
+        elif sra_accessions and str(sra_accessions).strip():
+            tokens = [t.strip() for t in re.split(r"[\s,;]+", str(sra_accessions).strip()) if t.strip()]
+            for tok in tokens:
+                jobs.append({"sample": tok, "group": "cohort", "src": tok, "mate2": "", "crai": "", "row": {"source": tok}})
         elif bam_path:
             jobs.append(
                 {
@@ -1344,9 +1365,49 @@ def run_variationloop_galaxy(
         per_sample_vcfs: list[Path] = []
         p_frac = float(np.clip(subsample_fraction, 1e-4, 1.0))
 
-        # Optional host/off-target 31-mer retention filter for target-filtered FASTQ calling
+        # 0.4.0 Logan unitig probe & optional k=15 host/off-target bitset
+        logan_avail: set[str] = set()
+        k15_bit_path: Path | None = None
+        if analysis_mode == "logan_unitigs" or eff_logan_mode in ("auto", "logan_only"):
+            from .logan import is_insdc_run, probe_logan_runs
+            from .malariavar.logan_var import build_k15_reference_bitset, ensure_var_logan_bins, run_varloop_logan_unitigs
+
+            cand_accs = [
+                j["src"].strip().upper()
+                for j in jobs
+                if is_insdc_run(j["src"]) and j["src"] not in local_map and j["sample"] not in local_map
+            ]
+            if cand_accs:
+                lprobe = probe_logan_runs(cand_accs, kind="unitigs")
+                logan_avail = set(lprobe["logan_runs"])
+                _log(
+                    f"Logan probe: {len(logan_avail)}/{len(lprobe['probes'])} accessions available on logan-pub/u/ "
+                    f"({lprobe['total_logan_bytes'] / 1e6:.1f} MB compressed)"
+                )
+                if (analysis_mode == "logan_unitigs" or eff_logan_mode == "logan_only") and lprobe["fallback_runs"]:
+                    missing = ", ".join(lprobe["fallback_runs"])
+                    raise ValueError(
+                        f"Logan unitigs are not available for accession(s): {missing}. "
+                        "Use Whole-genome or Target-filtered FASTQ calling with Logan mode set to Automatic for fallback."
+                    )
+            if logan_avail or analysis_mode == "logan_unitigs":
+                prep_bin, _ = ensure_var_logan_bins()
+                if use_host_depletion:
+                    k15_bit_path = build_k15_reference_bitset(
+                        eff_ref,
+                        work_dir / "logan_k15.bit",
+                        prep_bin=prep_bin,
+                        targets_bed=Path(targets_bed) if targets_bed else None,
+                        log=_log,
+                    )
+
+        # Optional host/off-target 31-mer retention filter for target-filtered raw FASTQ calling
         kset_tab = None
-        if analysis_mode == "wgs_stream" and use_host_depletion:
+        has_raw_fq_jobs = any(
+            not (j["src"].strip().upper() in logan_avail and j["src"] not in local_map and j["sample"] not in local_map)
+            for j in jobs
+        )
+        if analysis_mode == "wgs_stream" and use_host_depletion and has_raw_fq_jobs:
             regs_k = bed_regions or [(cn, 0, ln) for cn, ln in ctg_lens.items()]
             target_span = sum(max(0, e - s) for _, s, e in regs_k)
             if target_span > 45_000_000:
@@ -1367,6 +1428,42 @@ def run_variationloop_galaxy(
             sid = job["sample"]
             src = job["src"]
             s_vcf_gz = work_dir / "vcfs" / f"{idx_j:03d}_{re.sub(r'[^A-Za-z0-9_.-]', '_', sid)}.vcf.gz"
+            src_u = src.strip().upper()
+            use_logan_for_job = (
+                (src_u in logan_avail and src not in local_map and sid not in local_map)
+                or (analysis_mode == "logan_unitigs" and Path(src).is_file())
+            )
+            if use_logan_for_job:
+                from .malariavar.logan_var import run_varloop_logan_unitigs
+
+                local_u = Path(src) if (analysis_mode == "logan_unitigs" and Path(src).is_file()) else None
+                tel = run_varloop_logan_unitigs(
+                    acc=src_u,
+                    sample=sid,
+                    ref_fa=eff_ref,
+                    ctg_lens=ctg_lens,
+                    out_vcf_gz=s_vcf_gz,
+                    work_dir=work_dir,
+                    targets_bed=Path(targets_bed) if targets_bed else None,
+                    k15_bit=k15_bit_path,
+                    mapper=mapper,
+                    threads=max(1, threads),
+                    min_mapq=int(min_mapq),
+                    snv_min_qual=float(snv_min_qual),
+                    indel_min_qual=float(indel_min_qual),
+                    min_ka_mode=str(logan_min_ka or "adapt"),
+                    local_unitigs_path=local_u,
+                    log=_log,
+                )
+                sample_tels.append(tel)
+                per_sample_vcfs.append(s_vcf_gz)
+                var_frames.append(_vcf_to_dataframe(s_vcf_gz, sample_override=sid))
+                _log(
+                    f"  [{idx_j}/{len(jobs)}] {sid} (Logan): {tel.get('n_variants', 0)} variants, "
+                    f"{tel.get('wire_bytes', 0) / 1e6:.2f} MB wire ({tel.get('wall_s', 0):.2f}s)"
+                )
+                continue
+
             src_clean = src.split("?", 1)[0].lower()
             aln_fmt = None
             if src_clean.endswith(".cram"):
@@ -1519,7 +1616,7 @@ def run_variationloop_galaxy(
             sample_records.append(rec)
         state_meta = {
             "engine": "variationloop",
-            "version": "0.3.0",
+            "version": "0.4.0",
             "blueprint_id": "variationloop",
             "mode": analysis_mode,
             "summary": summary_stats,

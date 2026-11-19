@@ -19,7 +19,7 @@ from focaloop.reports import render_malariavar_report
 
 def test_native_c_accelerators_compile_and_run() -> None:
     built = prebuild_all_native_libs()
-    assert len(built) == 12
+    assert len(built) == 16
 
     rng = np.random.default_rng(7)
     seq = "".join(rng.choice(list("ACGT"), size=512)).encode("ascii")
