@@ -20,16 +20,20 @@ from .streamer import FastqBlockReader, open_source, read_fasta
 
 
 def parse_contrast(text: str) -> tuple[str, tuple[str, str]]:
-    """``treated:control`` | ``treated,control`` | ``treated_vs_control`` | ``site=Mali:Ghana``."""
+    """``treated:control`` | ``condition:treated:control`` | ``treated,control`` | ``treated_vs_control`` | ``site=Mali:Ghana``."""
     field = "condition"
     if "=" in text:
         field, text = text.split("=", 1)
+    elif text.count(":") == 2:
+        fac, a, b = text.split(":", 2)
+        if fac.strip() and a.strip() and b.strip():
+            return fac.strip(), (a.strip(), b.strip())
     for sep in (":", ",", "_vs_"):
         if sep in text:
             a, b = text.split(sep, 1)
             if a and b:
                 return field.strip(), (a.strip(), b.strip())
-    raise ValueError(f"cannot parse contrast {text!r}; use A:B or field=A:B")
+    raise ValueError(f"cannot parse contrast {text!r}; use A:B, factor:A:B, or field=A:B")
 
 
 def _meta(state_dir: Path) -> dict[str, Any]:

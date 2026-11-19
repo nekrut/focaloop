@@ -154,6 +154,7 @@ def cmd_expressionloop(a: argparse.Namespace) -> int:
             manifest_path=a.manifest,
             ref_fasta=a.ref_fasta,
             ref_gtf=a.ref_gtf,
+            ncbi_accession=a.ncbi_accession,
             contrast=a.contrast,
             out_de=a.out_de,
             out_report=a.out_report,
@@ -431,8 +432,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     el = sub.add_parser("expressionloop", help="adaptive RNA-seq differential gene and isoform expression")
     el.add_argument("--manifest", required=True, help="TSV/CSV sample manifest")
-    el.add_argument("--ref-fasta", required=True, help="primary reference genome or transcriptome FASTA(.gz)")
-    el.add_argument("--ref-gtf", required=True, help="primary reference annotation GTF/GFF3(.gz)")
+    el.add_argument("--ref-fasta", help="primary reference genome FASTA(.gz)")
+    el.add_argument("--ref-gtf", help="primary reference annotation GTF/GFF3(.gz)")
+    el.add_argument("--ncbi-accession", help="optional NCBI assembly accession (GCF_.../GCA_...) to fetch genome FASTA and matching GFF3")
     el.add_argument("--secondary-fasta", help="optional secondary strain/assembly/pathogen FASTA(.gz)")
     el.add_argument("--secondary-gtf", help="optional secondary strain/assembly/pathogen GTF/GFF3(.gz)")
     el.add_argument("--primary-label", default="primary")

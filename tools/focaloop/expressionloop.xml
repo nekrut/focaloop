@@ -15,8 +15,22 @@
     <version_command>focaloop --version</version_command>
     <command detect_errors="aggressive"><![CDATA[
 focaloop expressionloop
-    --ref-fasta '$ref_fasta'
-    --ref-gtf '$ref_gtf'
+    #if str($ref_source.source) == "cached"
+        --ref-fasta '$ref_source.cached_fasta.fields.path'
+        #if str($ref_source.cached_gtf_source.gtf_source) == "cached"
+            --ref-gtf '$ref_source.cached_gtf_source.cached_gff.fields.path'
+        #else
+            --ref-gtf '$ref_source.cached_gtf_source.ref_gtf'
+        #end if
+    #elif str($ref_source.source) == "history"
+        --ref-fasta '$ref_source.ref_fasta'
+        --ref-gtf '$ref_source.ref_gtf'
+    #else
+        --ncbi-accession '${str($ref_source.ncbi_accession).strip()}'
+        #if $ref_source.custom_gtf
+            --ref-gtf '$ref_source.custom_gtf'
+        #end if
+    #end if
     #if str($secondary_reference.multi_assembly.use_secondary) == "yes"
         --primary-label '$secondary_reference.multi_assembly.primary_label'
         --secondary-fasta '$secondary_reference.multi_assembly.secondary_fasta'
@@ -106,8 +120,49 @@ focaloop expressionloop
     #end if
     ]]></command>
     <inputs>
-        <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" label="Primary reference genome or transcriptome (FASTA)" help="Reference sequences in FASTA format (uncompressed or gzip-compressed)."/>
-        <param argument="--ref-gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Primary gene annotation (GTF or GFF3)" help="Gene and exon annotation matching the primary FASTA. Used to build spliced transcript targets and non-coding background decoys."/>
+        <conditional name="ref_source">
+            <param name="source" type="select" label="Reference genome and gene annotation source" help="ExpressionLoop requires a reference genome FASTA and matching gene annotation (GTF or GFF3) to build spliced transcripts and non-coding background decoys. Choose a genome pre-cached on this Galaxy server, datasets in your History, or an NCBI assembly accession to download automatically.">
+                <option value="cached" selected="true">Built-in Galaxy genome (CVMFS cache)</option>
+                <option value="history">Genome and annotation from your Galaxy History</option>
+                <option value="ncbi">Fetch automatically by NCBI assembly accession</option>
+            </param>
+            <when value="cached">
+                <param name="cached_fasta" type="select" label="Built-in reference genome" help="Select a reference genome pre-cached on this Galaxy server.">
+                    <options from_data_table="all_fasta">
+                        <filter type="sort_by" column="2"/>
+                        <validator type="no_options" message="No built-in genomes are cached on this Galaxy server. Switch Reference genome and gene annotation source to History or NCBI accession."/>
+                    </options>
+                </param>
+                <conditional name="cached_gtf_source">
+                    <param name="gtf_source" type="select" label="Gene annotation source" help="Provide a matching GTF or GFF3 gene annotation from your Galaxy History or select one cached on this server.">
+                        <option value="history" selected="true">From your Galaxy History (GTF or GFF3)</option>
+                        <option value="cached">Built-in Galaxy annotation</option>
+                    </param>
+                    <when value="history">
+                        <param argument="--ref-gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Gene annotation (GTF or GFF3)" help="Gene and exon annotation matching the selected built-in genome. Used to build spliced transcripts and non-coding background decoys."/>
+                    </when>
+                    <when value="cached">
+                        <param name="cached_gff" type="select" label="Built-in gene annotation" help="Select a cached GTF or GFF3 gene annotation matching the built-in genome.">
+                            <options from_data_table="all_gff">
+                                <filter type="sort_by" column="2"/>
+                                <validator type="no_options" message="No built-in gene annotations are cached on this Galaxy server. Choose a GTF or GFF3 file from your Galaxy History instead."/>
+                            </options>
+                        </param>
+                    </when>
+                </conditional>
+            </when>
+            <when value="history">
+                <param argument="--ref-fasta" type="data" format="fasta,fasta.gz" label="Reference genome (FASTA)" help="Reference genome sequences in FASTA format (uncompressed or gzip-compressed)."/>
+                <param argument="--ref-gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Gene annotation (GTF or GFF3)" help="Gene and exon annotation matching the reference genome. Used to build spliced transcripts and non-coding background decoys."/>
+            </when>
+            <when value="ncbi">
+                <param argument="--ncbi-accession" type="text" value="" label="NCBI assembly accession" help="RefSeq (GCF_ prefix, recommended because it includes curated gene annotation) or GenBank (GCA_ prefix) assembly accession. Both the genome FASTA and its matching NCBI GFF3 annotation are downloaded automatically.">
+                    <validator type="empty_field" message="Enter an NCBI assembly accession starting with GCF_ or GCA_."/>
+                    <validator type="regex" message="Enter a valid NCBI RefSeq (GCF_) or GenBank (GCA_) assembly accession with 9 digits and optional version.">^ *GC[AF]_[0-9]{9}(\.[0-9]+)? *$</validator>
+                </param>
+                <param argument="--ref-gtf" name="custom_gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" optional="true" label="Custom gene annotation override (optional)" help="Leave empty to download and use NCBI's matching GFF3 annotation automatically. Select a GTF or GFF3 from your History only if you want to override NCBI's annotation."/>
+            </when>
+        </conditional>
 
         <conditional name="input_source">
             <param name="source_type" type="select" label="RNA-seq read source" help="Analyze FASTQ files already in your Galaxy History, or stream public SRA/ENA run accessions and remote URLs on demand.">
@@ -242,8 +297,11 @@ focaloop expressionloop
     <tests>
         <!-- Test 1: Single-end History FASTQs with dual-assembly orthology bridging -->
         <test expect_num_outputs="3">
-            <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
-            <param name="ref_gtf" value="expressionloop/ref_primary.gtf" ftype="gtf"/>
+            <conditional name="ref_source">
+                <param name="source" value="history"/>
+                <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
+                <param name="ref_gtf" value="expressionloop/ref_primary.gtf" ftype="gtf"/>
+            </conditional>
             <conditional name="input_source">
                 <param name="source_type" value="history_single"/>
                 <param name="reads" value="expressionloop/ctrl1.fastq.gz,expressionloop/ctrl2.fastq.gz,expressionloop/ctrl3.fastq.gz,expressionloop/trt1.fastq.gz,expressionloop/trt2.fastq.gz,expressionloop/trt3.fastq.gz" ftype="fastqsanger.gz"/>
@@ -289,8 +347,11 @@ focaloop expressionloop
 
         <!-- Test 2: Paired-end list:paired collection + batch design + transcript abundances output -->
         <test expect_num_outputs="4">
-            <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
-            <param name="ref_gtf" value="expressionloop/ref_primary.gtf" ftype="gtf"/>
+            <conditional name="ref_source">
+                <param name="source" value="history"/>
+                <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
+                <param name="ref_gtf" value="expressionloop/ref_primary.gtf" ftype="gtf"/>
+            </conditional>
             <conditional name="input_source">
                 <param name="source_type" value="history_paired"/>
                 <param name="paired_reads">
@@ -374,8 +435,11 @@ focaloop expressionloop
 
         <!-- Test 3: Prokaryotic CDS mode with custom stopping budget and borderline include filter -->
         <test expect_num_outputs="3">
-            <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
-            <param name="ref_gtf" value="expressionloop/ref_prok.gtf" ftype="gtf"/>
+            <conditional name="ref_source">
+                <param name="source" value="history"/>
+                <param name="ref_fasta" value="expressionloop/ref_primary.fa" ftype="fasta"/>
+                <param name="ref_gtf" value="expressionloop/ref_prok.gtf" ftype="gtf"/>
+            </conditional>
             <conditional name="input_source">
                 <param name="source_type" value="history_single"/>
                 <param name="reads" value="expressionloop/ctrl1.fastq.gz,expressionloop/ctrl2.fastq.gz,expressionloop/ctrl3.fastq.gz,expressionloop/trt1.fastq.gz,expressionloop/trt2.fastq.gz,expressionloop/trt3.fastq.gz" ftype="fastqsanger.gz"/>
@@ -457,7 +521,13 @@ The `.focaloop.tar.zst` archive stores the transcript catalog, per-sample gene a
 
 **Inputs and manifest format**
 
-Provide a primary reference FASTA and matching GTF or GFF3 annotation (`.gz` supported). Optionally expand **Secondary assembly, strain, or host-pathogen comparison** to include a second FASTA and annotation.
+Choose your primary reference genome and matching gene annotation using one of three sources:
+
+- **Built-in Galaxy genome (CVMFS cache, default):** Pick a genome pre-cached on this Galaxy server and pair it with a matching GTF/GFF3 annotation from your History or the server cache.
+- **Genome and annotation from your Galaxy History:** Select your own reference genome FASTA and GTF or GFF3 file (`.gz` supported).
+- **Fetch automatically by NCBI assembly accession:** Enter a RefSeq (`GCF_` prefix, recommended because it provides curated gene annotation) or GenBank (`GCA_` prefix) assembly accession to download both the genome FASTA and its matching NCBI GFF3 automatically, with an optional History GTF/GFF3 override.
+
+Optionally expand **Secondary assembly, strain, or host-pathogen comparison** to include a second FASTA and annotation.
 
 Your sample sheet or manifest must be a tab-separated (TSV) or comma-separated (CSV) file with a header row:
 

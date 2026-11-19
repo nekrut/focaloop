@@ -79,7 +79,10 @@ def _gunzip_if_needed(src: str | Path, dst_dir: Path, out_name: str) -> Path:
         with gzip.open(src_p, "rb") as fi, open(dst, "wb") as fo:
             shutil.copyfileobj(fi, fo)
         return dst
-    return src_p.resolve()
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    os.symlink(src_p.resolve(), dst)
+    return dst
 
 
 def _detect_organism_mode(gtf_path: Path, requested: str) -> str:
@@ -460,8 +463,9 @@ def _format_de_table(raw_de: pd.DataFrame, bridge_map: dict[str, str]) -> pd.Dat
 def run_expressionloop_galaxy(
     *,
     manifest_path: str | Path,
-    ref_fasta: str | Path,
-    ref_gtf: str | Path,
+    ref_fasta: str | Path | None = None,
+    ref_gtf: str | Path | None = None,
+    ncbi_accession: str | None = None,
     contrast: str,
     out_de: str | Path,
     out_report: str | Path,
@@ -542,6 +546,24 @@ def run_expressionloop_galaxy(
             eff_source_mode = source_mode
 
         refs_dir = work_dir / "refs"
+        if ncbi_accession and str(ncbi_accession).strip():
+            from .ncbi_ref import fetch_ncbi_assembly
+
+            acc_clean = str(ncbi_accession).strip()
+            need_gff = ref_gtf is None or not str(ref_gtf).strip()
+            _log(f"Fetching NCBI assembly {acc_clean} (annotation={'auto' if need_gff else 'custom override'})...")
+            fetched = fetch_ncbi_assembly(acc_clean, refs_dir / "ncbi", need_annotation=need_gff)
+            ref_fasta = fetched["fasta"]
+            if need_gff:
+                ref_gtf = fetched["gff"]
+            if primary_label == "primary":
+                primary_label = acc_clean
+
+        if not ref_fasta or not ref_gtf:
+            raise ValueError(
+                "Provide either a reference genome FASTA and GTF/GFF3 annotation, or an NCBI assembly accession (--ncbi-accession)."
+            )
+
         p_fna = _gunzip_if_needed(ref_fasta, refs_dir, f"{primary_label}.fna")
         gtf_ext = _sniff_annotation_ext(Path(ref_gtf))
         p_gtf = _gunzip_if_needed(ref_gtf, refs_dir, f"{primary_label}{gtf_ext}")

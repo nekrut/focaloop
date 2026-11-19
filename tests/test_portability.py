@@ -204,3 +204,61 @@ def test_geneloop_unmasked_alias_and_dat_weights_and_gff3_sniff(tmp_path):
     gff_dat = tmp_path / "dataset_12345.dat"
     gff_dat.write_text('##gff-version 3\nchr1\tsrc\tgene\t1\t100\t.\t+\t.\tID=g1;Name="alpha"\n', encoding="utf-8")
     assert _sniff_annotation_ext(gff_dat) == ".gff3"
+
+    # 4. Uncompressed .dat GFF3 symlink preserves .gff3 suffix so quoted attrs parse cleanly
+    from focaloop.panexpr.catalog import iter_features
+    from focaloop.runners_expression import _gunzip_if_needed
+
+    staged = _gunzip_if_needed(gff_dat, tmp_path / "refs", "primary.gff3")
+    assert staged.suffix == ".gff3"
+    feats = list(iter_features(staged))
+    assert len(feats) == 1 and feats[0].attrs["ID"] == "g1"
+
+
+def test_ncbi_ref_resolution_fetch_and_3part_contrast(tmp_path, monkeypatch):
+    import gzip
+    from focaloop import ncbi_ref
+    from focaloop.ops import parse_contrast
+
+    # 3-part contrast parsing used by ExpressionLoop & Focaloop Query
+    assert parse_contrast("condition:treated:control") == ("condition", ("treated", "control"))
+    assert parse_contrast("site=Ghana:Mali") == ("site", ("Ghana", "Mali"))
+    assert parse_contrast("treated:control") == ("condition", ("treated", "control"))
+
+    # Mock NCBI directory listing with numeric version ordering (.10 > .2)
+    listing_html = (
+        '<a href="GCF_000005845.2_ASM584v2/">GCF_000005845.2_ASM584v2/</a>\n'
+        '<a href="GCF_000005845.10_ASM584v10/">GCF_000005845.10_ASM584v10/</a>\n'
+    )
+    monkeypatch.setattr(ncbi_ref, "_fetch_text", lambda url, **kw: listing_html)
+
+    asm_dir, base_url = ncbi_ref.resolve_ncbi_assembly_dir("GCF_000005845.2")
+    assert asm_dir == "GCF_000005845.2_ASM584v2"
+    assert base_url.endswith("/GCF/000/005/845/GCF_000005845.2_ASM584v2")
+
+    latest_dir, _ = ncbi_ref.resolve_ncbi_assembly_dir("GCF_000005845")
+    assert latest_dir == "GCF_000005845.10_ASM584v10"
+
+    with pytest.raises(ValueError, match="Invalid NCBI assembly accession"):
+        ncbi_ref.resolve_ncbi_assembly_dir("NOT_AN_ACCESSION")
+
+    downloaded: list[str] = []
+
+    def _fake_download(url: str, dest: pathlib.Path, **kw):
+        downloaded.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(dest, "wt", encoding="utf-8") as fh:
+            fh.write(">chr1\nACGT\n" if url.endswith(".fna.gz") else "##gff-version 3\n")
+        return dest
+
+    monkeypatch.setattr(ncbi_ref, "_download_file", _fake_download)
+    monkeypatch.delenv("FOCALOOP_NCBI_CACHE_DIR", raising=False)
+
+    res = ncbi_ref.fetch_ncbi_assembly("GCF_000005845.2", tmp_path / "ncbi", need_annotation=True)
+    assert res["fasta"].is_file() and res["gff"] is not None and res["gff"].is_file()
+    assert len(downloaded) == 2
+
+    downloaded.clear()
+    res_no_gff = ncbi_ref.fetch_ncbi_assembly("GCF_000005845.2", tmp_path / "ncbi2", need_annotation=False)
+    assert res_no_gff["fasta"].is_file() and res_no_gff["gff"] is None
+    assert len(downloaded) == 1
