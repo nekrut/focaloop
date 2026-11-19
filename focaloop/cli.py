@@ -147,7 +147,17 @@ def cmd_malariavar(a: argparse.Namespace) -> int:
 
 
 def cmd_expressionloop(a: argparse.Namespace) -> int:
+    import json
     from .runners_expression import run_expressionloop_galaxy
+
+    extra_refs: list[dict[str, str]] = []
+    if a.extra_refs_json:
+        raw_j = json.loads(Path(a.extra_refs_json).read_text(encoding="utf-8"))
+        if isinstance(raw_j, list):
+            extra_refs.extend(raw_j)
+    for acc in a.extra_ncbi_accession or []:
+        if str(acc).strip():
+            extra_refs.append({"ncbi_accession": str(acc).strip()})
 
     try:
         meta = run_expressionloop_galaxy(
@@ -165,6 +175,9 @@ def cmd_expressionloop(a: argparse.Namespace) -> int:
             secondary_gtf=a.secondary_gtf,
             primary_label=a.primary_label,
             secondary_label=a.secondary_label,
+            extra_references=extra_refs or None,
+            auto_expand_strains=a.auto_expand_strains,
+            auto_expand_taxon=a.auto_expand_taxon,
             reads=a.reads,
             reads_r1=a.reads_r1,
             reads_r2=a.reads_r2,
@@ -447,6 +460,10 @@ def build_parser() -> argparse.ArgumentParser:
     el.add_argument("--secondary-gtf", help="optional secondary strain/assembly/pathogen GTF/GFF3(.gz)")
     el.add_argument("--primary-label", default="primary")
     el.add_argument("--secondary-label", default="secondary")
+    el.add_argument("--extra-refs-json", help="optional JSON list of additional reference dicts ({label, fasta, gtf, ncbi_accession})")
+    el.add_argument("--extra-ncbi-accession", action="append", default=[], help="repeatable additional NCBI assembly accession(s) to join into ortholog catalog")
+    el.add_argument("--auto-expand-strains", type=int, default=0, help="automatically fetch up to K distinct annotated RefSeq strains from NCBI (default: 0 = off)")
+    el.add_argument("--auto-expand-taxon", default="", help="species name or NCBI taxonomy ID for --auto-expand-strains (inferred from primary --ncbi-accession if omitted)")
     el.add_argument("--reads", nargs="+", help="optional single-end FASTQ(.gz) files")
     el.add_argument("--reads-r1", nargs="+", help="optional paired R1 FASTQ(.gz) files")
     el.add_argument("--reads-r2", nargs="+", help="optional paired R2 FASTQ(.gz) files")

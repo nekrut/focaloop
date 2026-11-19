@@ -449,3 +449,80 @@ def test_geneloop_logan_only_mode_partition(tmp_path, monkeypatch):
     assert lruns == ["SRR111111"]
     assert fbruns == []
     assert info["logan_mode"] == "logan_only"
+
+
+def test_ncbi_related_strain_dedup_and_multi_ref_expressionloop(tmp_path, monkeypatch):
+    from focaloop import ncbi_ref
+    from focaloop.runners_expression import run_expressionloop_galaxy
+
+    # 1. Verify strain deduplication drops duplicate ATCC 19606 assemblies & skips primary strain
+    fake_reports = {
+        "reports": [
+            {
+                "accession": "GCF_000000001.1",
+                "assembly_info": {"assembly_name": "ASM1", "assembly_level": "Complete Genome", "refseq_category": "reference genome"},
+                "organism": {"tax_id": 470, "organism_name": "Acinetobacter baumannii", "infraspecific_names": {"strain": "ATCC 19606"}},
+            },
+            {
+                "accession": "GCF_000000002.1",
+                "assembly_info": {"assembly_name": "ASM2", "assembly_level": "Complete Genome"},
+                "organism": {"tax_id": 470, "organism_name": "Acinetobacter baumannii", "infraspecific_names": {"strain": "ATCC 19606"}},
+            },
+            {
+                "accession": "GCF_000000003.1",
+                "assembly_info": {"assembly_name": "ASM3", "assembly_level": "Complete Genome"},
+                "organism": {"tax_id": 470, "organism_name": "Acinetobacter baumannii", "infraspecific_names": {"strain": "ARC6851"}},
+            },
+            {
+                "accession": "GCF_000000004.1",
+                "assembly_info": {"assembly_name": "ASM4", "assembly_level": "Complete Genome"},
+                "organism": {"tax_id": 470, "organism_name": "Acinetobacter baumannii", "infraspecific_names": {"strain": "AB5075"}},
+            },
+        ]
+    }
+    monkeypatch.setattr(ncbi_ref, "_fetch_json", lambda url, **kw: fake_reports)
+    cands = ncbi_ref.discover_related_ncbi_assemblies(
+        "Acinetobacter baumannii",
+        max_strains=2,
+        exclude_accessions=["GCF_025677625.1"],
+        exclude_strains=["ARC6851"],
+    )
+    accs = [c["accession"] for c in cands]
+    assert accs == ["GCF_000000001.1", "GCF_000000004.1"]
+
+    # 2. Verify explicit extra_references + auto_expand_strains end-to-end in run_expressionloop_galaxy
+    td = REPO_ROOT / "tools" / "focaloop" / "test-data" / "expressionloop"
+    monkeypatch.setattr(
+        ncbi_ref,
+        "fetch_ncbi_assembly",
+        lambda acc, dest_dir, need_annotation=True: {
+            "accession": acc,
+            "assembly_dir": acc,
+            "base_url": "mock://",
+            "fasta": td / "ref_secondary.fa",
+            "gff": td / "ref_secondary.gtf",
+        },
+    )
+    reads = [str(td / f) for f in ("ctrl1.fastq.gz", "ctrl2.fastq.gz", "ctrl3.fastq.gz", "trt1.fastq.gz", "trt2.fastq.gz", "trt3.fastq.gz")]
+    meta = run_expressionloop_galaxy(
+        manifest_path=td / "manifest_se.tsv",
+        ref_fasta=td / "ref_primary.fa",
+        ref_gtf=td / "ref_primary.gtf",
+        primary_label="v3",
+        extra_references=[{"label": "v2", "fasta": str(td / "ref_secondary.fa"), "gtf": str(td / "ref_secondary.gtf")}],
+        auto_expand_strains=1,
+        auto_expand_taxon="Acinetobacter baumannii",
+        reads=reads,
+        contrast="condition:treated:control",
+        out_de=tmp_path / "de.tsv",
+        out_report=tmp_path / "rep.html",
+        state_dir=tmp_path / "state",
+        kernel_names=["mappy"],
+        n_tournament_reads=400,
+        threads=2,
+    )
+    asms = meta["catalog_summary"]["assemblies"]
+    assert asms == ["v3", "v2", "GCF_000000001.1"]
+    de_txt = (tmp_path / "de.tsv").read_text(encoding="utf-8")
+    assert "v2:LEGACY_001458" in de_txt
+    assert "GCF_000000001.1:LEGACY_001458" in de_txt

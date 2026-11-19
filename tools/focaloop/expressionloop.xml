@@ -31,13 +31,15 @@ focaloop expressionloop
             --ref-gtf '$ref_source.custom_gtf'
         #end if
     #end if
-    #if str($secondary_reference.multi_assembly.use_secondary) == "yes"
-        --primary-label '$secondary_reference.multi_assembly.primary_label'
-        --secondary-fasta '$secondary_reference.multi_assembly.secondary_fasta'
-        --secondary-gtf '$secondary_reference.multi_assembly.secondary_gtf'
-        --secondary-label '$secondary_reference.multi_assembly.secondary_label'
-    #else
-        --primary-label 'primary'
+    --primary-label '${str($secondary_reference.primary_label).strip() or "primary"}'
+    #if len($secondary_reference.extra_references) > 0
+        --extra-refs-json '$extra_refs_json'
+    #end if
+    #if str($secondary_reference.auto_expand.enable) == "yes"
+        --auto-expand-strains $secondary_reference.auto_expand.auto_expand_strains
+        #if str($secondary_reference.auto_expand.auto_expand_taxon).strip()
+            --auto-expand-taxon '${str($secondary_reference.auto_expand.auto_expand_taxon).strip()}'
+        #end if
     #end if
     --manifest '$input_source.manifest'
     #if str($input_source.source_type) == "history_paired"
@@ -124,6 +126,33 @@ focaloop expressionloop
         --out-transcripts '$transcript_abundances'
     #end if
     ]]></command>
+    <configfiles>
+        <configfile name="extra_refs_json"><![CDATA[[
+#for $i, $er in enumerate($secondary_reference.extra_references)
+#if $i > 0
+,
+#end if
+#set $lbl = str($er.label).strip().replace('\\', '\\\\').replace('"', '\\"')
+#if str($er.extra_source.source) == "cached"
+#set $efa = str($er.extra_source.cached_fasta.fields.path).replace('\\', '\\\\').replace('"', '\\"')
+#if str($er.extra_source.cached_gtf_source.gtf_source) == "cached"
+#set $egtf = str($er.extra_source.cached_gtf_source.cached_gff.fields.path).replace('\\', '\\\\').replace('"', '\\"')
+#else
+#set $egtf = str($er.extra_source.cached_gtf_source.ref_gtf).replace('\\', '\\\\').replace('"', '\\"')
+#end if
+{"label": "$lbl", "fasta": "$efa", "gtf": "$egtf", "ncbi_accession": ""}
+#elif str($er.extra_source.source) == "history"
+#set $efa = str($er.extra_source.ref_fasta).replace('\\', '\\\\').replace('"', '\\"')
+#set $egtf = str($er.extra_source.ref_gtf).replace('\\', '\\\\').replace('"', '\\"')
+{"label": "$lbl", "fasta": "$efa", "gtf": "$egtf", "ncbi_accession": ""}
+#else
+#set $eacc = str($er.extra_source.ncbi_accession).strip().replace('\\', '\\\\').replace('"', '\\"')
+#set $egtf = str($er.extra_source.custom_gtf).replace('\\', '\\\\').replace('"', '\\"') if $er.extra_source.custom_gtf else ""
+{"label": "$lbl", "fasta": "", "gtf": "$egtf", "ncbi_accession": "$eacc"}
+#end if
+#end for
+]]]></configfile>
+    </configfiles>
     <inputs>
         <conditional name="ref_source">
             <param name="source" type="select" label="Reference genome and gene annotation source" help="ExpressionLoop requires a reference genome FASTA and matching gene annotation (GTF or GFF3) to build spliced transcripts and non-coding background decoys. Choose a genome pre-cached on this Galaxy server, datasets in your History, or an NCBI assembly accession to download automatically.">
@@ -205,21 +234,68 @@ focaloop expressionloop
             <validator type="regex" message="Formula must start with ~ followed by valid column names">^~\s*[A-Za-z0-9_]+(\s*[+*:]\s*[A-Za-z0-9_]+)*$</validator>
         </param>
 
-        <section name="secondary_reference" title="Secondary assembly, strain, or host-pathogen comparison (optional)" expanded="false">
-            <conditional name="multi_assembly">
-                <param name="use_secondary" type="select" label="Include a secondary reference genome or transcriptome?" help="Enable to jointly quantify a second genome release, co-infecting strain, or pathogen and automatically link homologous gene IDs across both annotations.">
-                    <option value="no" selected="true">No (single reference only)</option>
-                    <option value="yes">Yes (joint dual-reference quantification and gene ID bridging)</option>
+        <section name="secondary_reference" title="Additional reference genomes and multi-strain pan-transcriptome (optional)" expanded="false">
+            <param argument="--primary-label" type="text" value="primary" label="Primary reference label" help="Short identifier for your primary reference recorded in outputs and the saved state bundle when quantifying across multiple genomes.">
+                <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
+            </param>
+            <repeat name="extra_references" title="Additional reference genome" min="0" help="Add one or more extra genomes (other strains, older annotation releases, plasmids, or co-infecting pathogens). ExpressionLoop indexes all genomes together, links orthologous genes automatically, and quantifies strain-specific or accessory genes without double-counting conserved core genes.">
+                <param name="label" type="text" value="" optional="true" label="Assembly label (optional)" help="Short prefix attached to gene IDs from this genome in the ortholog_bridge column (for example, prev or strainB). Leave empty to derive automatically from the accession or position.">
+                    <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]*$</validator>
+                </param>
+                <conditional name="extra_source">
+                    <param name="source" type="select" label="Additional reference source" help="Fetch a genome and annotation automatically from NCBI, pick a built-in Galaxy genome, or use datasets from your Galaxy History.">
+                        <option value="ncbi" selected="true">Fetch automatically by NCBI assembly accession</option>
+                        <option value="cached">Built-in Galaxy genome (CVMFS cache)</option>
+                        <option value="history">Genome and annotation from your Galaxy History</option>
+                    </param>
+                    <when value="ncbi">
+                        <param name="ncbi_accession" type="text" value="" label="NCBI assembly accession" help="RefSeq (GCF_ prefix, recommended because it includes curated gene annotation) or GenBank (GCA_ prefix) assembly accession. Both the genome FASTA and its matching NCBI GFF3 are downloaded automatically.">
+                            <validator type="empty_field" message="Enter an NCBI assembly accession starting with GCF_ or GCA_."/>
+                            <validator type="regex" message="Enter a valid NCBI RefSeq (GCF_) or GenBank (GCA_) assembly accession with 9 digits and optional version.">^ *GC[AF]_[0-9]{9}(\.[0-9]+)? *$</validator>
+                        </param>
+                        <param name="custom_gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" optional="true" label="Custom gene annotation override (optional)" help="Leave empty to download and use NCBI's matching GFF3 annotation automatically."/>
+                    </when>
+                    <when value="cached">
+                        <param name="cached_fasta" type="select" label="Built-in reference genome" help="Select an additional reference genome pre-cached on this Galaxy server.">
+                            <options from_data_table="all_fasta">
+                                <filter type="sort_by" column="2"/>
+                                <validator type="no_options" message="No built-in genomes are cached on this Galaxy server."/>
+                            </options>
+                        </param>
+                        <conditional name="cached_gtf_source">
+                            <param name="gtf_source" type="select" label="Gene annotation source" help="Provide a matching GTF or GFF3 annotation from your Galaxy History or select one cached on this server.">
+                                <option value="history" selected="true">From your Galaxy History (GTF or GFF3)</option>
+                                <option value="cached">Built-in Galaxy annotation</option>
+                            </param>
+                            <when value="history">
+                                <param name="ref_gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Gene annotation (GTF or GFF3)" help="Gene and exon annotation matching the selected built-in genome."/>
+                            </when>
+                            <when value="cached">
+                                <param name="cached_gff" type="select" label="Built-in gene annotation" help="Select a cached GTF or GFF3 annotation matching the built-in genome.">
+                                    <options from_data_table="all_gff">
+                                        <filter type="sort_by" column="2"/>
+                                        <validator type="no_options" message="No built-in gene annotations are cached on this Galaxy server. Select a GTF or GFF3 file from your Galaxy History instead."/>
+                                    </options>
+                                </param>
+                            </when>
+                        </conditional>
+                    </when>
+                    <when value="history">
+                        <param name="ref_fasta" type="data" format="fasta,fasta.gz" label="Additional reference genome (FASTA)" help="Additional genome FASTA (uncompressed or gzip-compressed)."/>
+                        <param name="ref_gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Additional gene annotation (GTF or GFF3)" help="Annotation matching the additional genome FASTA."/>
+                    </when>
+                </conditional>
+            </repeat>
+            <conditional name="auto_expand">
+                <param name="enable" type="select" label="Automatically fetch related RefSeq strains from NCBI?" help="Opt in to automatically discover and download distinct, annotated RefSeq genomes from the same species on NCBI (prioritizing reference and complete assemblies) to capture accessory and strain-specific genes.">
+                    <option value="no" selected="true">No (use only the reference genome(s) selected above)</option>
+                    <option value="yes">Yes (auto-expand pan-transcriptome with distinct RefSeq strains from NCBI)</option>
                 </param>
                 <when value="no"/>
                 <when value="yes">
-                    <param argument="--primary-label" type="text" value="primary" label="Primary assembly label" help="Short identifier for the primary reference recorded in outputs and the saved state bundle.">
-                        <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
-                    </param>
-                    <param argument="--secondary-fasta" type="data" format="fasta,fasta.gz" label="Secondary reference (FASTA)" help="Second genome or transcriptome FASTA (such as an older release, co-infecting strain, or pathogen)."/>
-                    <param argument="--secondary-gtf" type="data" format="gtf,gtf.gz,gff,gff3,gff3.gz" label="Secondary gene annotation (GTF or GFF3)" help="Annotation matching the secondary FASTA."/>
-                    <param argument="--secondary-label" type="text" value="secondary" label="Secondary assembly label" help="Short prefix attached to bridged gene IDs in the ortholog_bridge output column (for example, prev:GENE_0142).">
-                        <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
+                    <param argument="--auto-expand-strains" type="integer" min="1" max="10" value="3" label="Number of additional distinct strains to fetch" help="Fetches up to this many strain-deduplicated RefSeq genomes with gene annotations and joins them into the ortholog catalog alongside your primary genome."/>
+                    <param argument="--auto-expand-taxon" type="text" value="" optional="true" label="Species name or NCBI taxonomy ID (optional if primary genome is an NCBI accession)" help="Required when your primary genome comes from CVMFS or Galaxy History (for example, Escherichia coli or Saccharomyces cerevisiae). Leave empty when using an NCBI primary accession to infer the species automatically.">
+                        <validator type="regex" message="Use letters, digits, spaces, underscores, dots, or hyphens only">^[A-Za-z0-9 _.-]*$</validator>
                     </param>
                 </when>
             </conditional>
@@ -319,13 +395,15 @@ focaloop expressionloop
             </conditional>
             <param name="contrast" value="condition:treated:control"/>
             <section name="secondary_reference">
-                <conditional name="multi_assembly">
-                    <param name="use_secondary" value="yes"/>
-                    <param name="primary_label" value="v3"/>
-                    <param name="secondary_fasta" value="expressionloop/ref_secondary.fa" ftype="fasta"/>
-                    <param name="secondary_gtf" value="expressionloop/ref_secondary.gtf" ftype="gtf"/>
-                    <param name="secondary_label" value="v2"/>
-                </conditional>
+                <param name="primary_label" value="v3"/>
+                <repeat name="extra_references">
+                    <param name="label" value="v2"/>
+                    <conditional name="extra_source">
+                        <param name="source" value="history"/>
+                        <param name="ref_fasta" value="expressionloop/ref_secondary.fa" ftype="fasta"/>
+                        <param name="ref_gtf" value="expressionloop/ref_secondary.gtf" ftype="gtf"/>
+                    </conditional>
+                </repeat>
             </section>
             <section name="alignment_options">
                 <param name="tournament_reads" value="600"/>
@@ -538,7 +616,10 @@ Choose your primary reference genome and matching gene annotation using one of t
 - **Genome and annotation from your Galaxy History:** Select your own reference genome FASTA and GTF or GFF3 file (`.gz` supported).
 - **Fetch automatically by NCBI assembly accession:** Enter a RefSeq (`GCF_` prefix, recommended because it provides curated gene annotation) or GenBank (`GCA_` prefix) assembly accession to download both the genome FASTA and its matching NCBI GFF3 automatically, with an optional History GTF/GFF3 override.
 
-Optionally expand **Secondary assembly, strain, or host-pathogen comparison** to include a second FASTA and annotation.
+Optionally expand **Additional reference genomes and multi-strain pan-transcriptome** to include extra assemblies in two ways:
+
+- **Explicit additional reference genomes:** Add any number of extra strains, older annotation releases, plasmids, or co-infecting pathogens (each chosen from NCBI accession, built-in CVMFS cache, or your History).
+- **Automatic related RefSeq strain expansion (opt-in):** Automatically discover and fetch up to *K* strain-deduplicated RefSeq genomes with gene annotations for the same species on NCBI (inferred automatically from a primary NCBI accession, or specified by species name/taxonomy ID for CVMFS or History genomes) to capture accessory genes absent from your primary assembly.
 
 Your sample sheet or manifest must be a tab-separated (TSV) or comma-separated (CSV) file with a header row:
 

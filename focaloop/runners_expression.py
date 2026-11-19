@@ -429,6 +429,12 @@ def _build_ortholog_bridge_map(catalog: Any) -> dict[str, str]:
                 bridge.setdefault(pg, [])
                 if joined not in bridge[pg]:
                     bridge[pg].append(joined)
+        elif not prim_genes and sec_genes:
+            joined = ",".join(sec_genes)
+            for t in ts:
+                bridge.setdefault(t.gene_id, [])
+                if joined not in bridge[t.gene_id]:
+                    bridge[t.gene_id].append(joined)
     return {k: ";".join(v) for k, v in bridge.items()}
 
 
@@ -486,6 +492,9 @@ def run_expressionloop_galaxy(
     secondary_gtf: str | Path | None = None,
     primary_label: str = "primary",
     secondary_label: str = "secondary",
+    extra_references: Sequence[dict[str, Any]] | None = None,
+    auto_expand_strains: int = 0,
+    auto_expand_taxon: str | None = None,
     reads: Sequence[str] | None = None,
     reads_r1: Sequence[str] | None = None,
     reads_r2: Sequence[str] | None = None,
@@ -582,13 +591,112 @@ def run_expressionloop_galaxy(
         org_mode = _detect_organism_mode(p_gtf, organism_mode)
 
         specs = [AssemblySpec(primary_label, p_fna, p_gtf)]
+        used_labels: set[str] = {primary_label}
+        used_ncbi_accs: list[str] = []
+        if ncbi_accession and str(ncbi_accession).strip():
+            used_ncbi_accs.append(str(ncbi_accession).strip().upper())
+
+        def _unique_label(raw: str, fallback: str) -> str:
+            base = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(raw or "").strip()).strip("._") or fallback
+            cand = base
+            idx_u = 2
+            while cand in used_labels:
+                cand = f"{base}_{idx_u}"
+                idx_u += 1
+            used_labels.add(cand)
+            return cand
+
         if bool(secondary_fasta) ^ bool(secondary_gtf):
             raise ValueError("Both --secondary-fasta and --secondary-gtf must be provided together.")
         if secondary_fasta and secondary_gtf:
-            s_fna = _gunzip_if_needed(secondary_fasta, refs_dir, f"{secondary_label}.fna")
+            sec_lbl = _unique_label(secondary_label, "secondary")
+            s_fna = _gunzip_if_needed(secondary_fasta, refs_dir, f"{sec_lbl}.fna")
             s_ext = _sniff_annotation_ext(Path(secondary_gtf))
-            s_gtf = _gunzip_if_needed(secondary_gtf, refs_dir, f"{secondary_label}{s_ext}")
-            specs.append(AssemblySpec(secondary_label, s_fna, s_gtf))
+            s_gtf = _gunzip_if_needed(secondary_gtf, refs_dir, f"{sec_lbl}{s_ext}")
+            specs.append(AssemblySpec(sec_lbl, s_fna, s_gtf))
+
+        # Explicit repeatable additional reference genomes (CVMFS, History, or NCBI accession)
+        for idx_e, eref in enumerate(extra_references or [], 1):
+            e_acc = str(eref.get("ncbi_accession") or "").strip()
+            e_fa = str(eref.get("fasta") or "").strip()
+            e_gtf = str(eref.get("gtf") or "").strip()
+            e_lbl_raw = str(eref.get("label") or "").strip()
+            if e_acc:
+                from .ncbi_ref import fetch_ncbi_assembly
+
+                need_e_gff = not e_gtf
+                _log(f"Fetching extra NCBI reference {e_acc} (annotation={'auto' if need_e_gff else 'custom override'})...")
+                efetch = fetch_ncbi_assembly(e_acc, refs_dir / "ncbi", need_annotation=need_e_gff)
+                e_fa = str(efetch["fasta"])
+                if need_e_gff:
+                    e_gtf = str(efetch["gff"])
+                used_ncbi_accs.append(e_acc.upper())
+                if not e_lbl_raw:
+                    e_lbl_raw = e_acc.upper()
+            if not e_fa or not e_gtf:
+                raise ValueError(
+                    f"Additional reference #{idx_e} requires either an NCBI assembly accession or both a genome FASTA and GTF/GFF3 annotation."
+                )
+            e_lbl = _unique_label(e_lbl_raw, f"extra_{idx_e}")
+            efna_p = _gunzip_if_needed(e_fa, refs_dir, f"{e_lbl}.fna")
+            eext = _sniff_annotation_ext(Path(e_gtf))
+            egtf_p = _gunzip_if_needed(e_gtf, refs_dir, f"{e_lbl}{eext}")
+            specs.append(AssemblySpec(e_lbl, efna_p, egtf_p))
+
+        # Optional automatic pan-transcriptome expansion with distinct RefSeq strains from NCBI
+        auto_expanded_info: list[dict[str, Any]] = []
+        n_expand = int(auto_expand_strains or 0)
+        if n_expand > 0:
+            from .ncbi_ref import discover_related_ncbi_assemblies, fetch_ncbi_assembly, lookup_ncbi_assembly_taxon
+
+            taxon_q = str(auto_expand_taxon or "").strip()
+            excl_strains: list[str] = []
+            if not taxon_q:
+                if ncbi_accession and str(ncbi_accession).strip():
+                    tax_meta = lookup_ncbi_assembly_taxon(str(ncbi_accession).strip())
+                    taxon_q = tax_meta["species_name"] or str(tax_meta.get("tax_id") or "")
+                    if tax_meta.get("strain"):
+                        excl_strains.append(tax_meta["strain"])
+                    _log(
+                        f"Auto-expand inferred species {taxon_q!r} from primary accession {ncbi_accession!r}"
+                        + (f" (excluding primary strain {tax_meta['strain']!r})" if tax_meta.get("strain") else "")
+                    )
+                else:
+                    raise ValueError(
+                        "Auto-expanding related RefSeq strains requires a species name or NCBI taxonomy ID "
+                        "when the primary genome is selected from CVMFS or Galaxy History."
+                    )
+            cands = discover_related_ncbi_assemblies(
+                taxon_q,
+                max_strains=n_expand,
+                exclude_accessions=used_ncbi_accs,
+                exclude_strains=excl_strains,
+            )
+            if not cands:
+                _log(f"Auto-expand found no additional annotated RefSeq assemblies for {taxon_q!r}; continuing with {len(specs)} reference(s).")
+            else:
+                added = 0
+                for cand in cands:
+                    if added >= n_expand:
+                        break
+                    c_acc = cand["accession"]
+                    try:
+                        cfetch = fetch_ncbi_assembly(c_acc, refs_dir / "ncbi", need_annotation=True)
+                    except Exception as exc:
+                        _log(f"Skipping candidate {c_acc} ({type(exc).__name__}: {exc})")
+                        continue
+                    c_lbl = _unique_label(c_acc, f"strain_{added + 1}")
+                    cfna_p = _gunzip_if_needed(cfetch["fasta"], refs_dir, f"{c_lbl}.fna")
+                    cext = _sniff_annotation_ext(Path(cfetch["gff"]))
+                    cgtf_p = _gunzip_if_needed(cfetch["gff"], refs_dir, f"{c_lbl}{cext}")
+                    specs.append(AssemblySpec(c_lbl, cfna_p, cgtf_p))
+                    used_ncbi_accs.append(c_acc)
+                    auto_expanded_info.append({**cand, "label": c_lbl})
+                    added += 1
+                _log(
+                    f"Auto-expanded catalog with {added} distinct RefSeq strain(s) for {taxon_q!r}: "
+                    f"{[x['accession'] for x in auto_expanded_info]}"
+                )
 
         _log(f"Building {org_mode} catalog across {[s.assembly_id for s in specs]}...")
         catalog = build_catalog(specs, org_mode, primary_label, work_dir / "tmp", decoys="auto")
