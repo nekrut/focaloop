@@ -103,7 +103,12 @@ def _detect_organism_mode(gtf_path: Path, requested: str) -> str:
                 exon_by_tx[tx] = exon_by_tx.get(tx, 0) + 1
         elif feat.ftype == "CDS":
             n_cds += 1
-    if any(v >= 2 for v in exon_by_tx.values()) or n_exon > 0:
+    multi_exon_tx = sum(1 for v in exon_by_tx.values() if v >= 2)
+    if multi_exon_tx >= 3:
+        return "eukaryotic"
+    if n_cds > 0 and n_exon < max(5, int(0.25 * n_cds)):
+        return "prokaryotic"
+    if n_exon > 0:
         return "eukaryotic"
     return "prokaryotic" if n_cds > 0 else "eukaryotic"
 

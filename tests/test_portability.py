@@ -214,6 +214,19 @@ def test_geneloop_unmasked_alias_and_dat_weights_and_gff3_sniff(tmp_path):
     feats = list(iter_features(staged))
     assert len(feats) == 1 and feats[0].attrs["ID"] == "g1"
 
+    # 5. NCBI RefSeq bacterial GFF3 (many CDSs + few single-exon tRNA/rRNA exons) auto-detects as prokaryotic
+    from focaloop.runners_expression import _detect_organism_mode
+
+    prok_gff = tmp_path / "refseq_bact.gff3"
+    lines = ["##gff-version 3"]
+    for idx in range(200):
+        lines.append(f"chr1\tRefSeq\tgene\t{idx*100+1}\t{idx*100+90}\t.\t+\t.\tID=g{idx};locus_tag=LT_{idx}")
+        lines.append(f"chr1\tRefSeq\tCDS\t{idx*100+1}\t{idx*100+90}\t.\t+\t0\tID=cds{idx};Parent=g{idx}")
+    for idx in range(10):
+        lines.append(f"chr1\tRefSeq\texon\t{30000+idx*100}\t{30080+idx*100}\t.\t+\t.\tID=ex{idx};Parent=trna{idx}")
+    prok_gff.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert _detect_organism_mode(prok_gff, "auto") == "prokaryotic"
+
 
 def test_ncbi_ref_resolution_fetch_and_3part_contrast(tmp_path, monkeypatch):
     import gzip
