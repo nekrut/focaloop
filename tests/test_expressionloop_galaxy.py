@@ -419,3 +419,156 @@ def test_panexpr_html_report_tournament_keys_contrast_and_logan_layout(tmp_path:
     assert "primary: 100.0%" in txt_l
     assert "{'primary': 1.0}" not in txt_l
     assert "sieve" not in txt_l.lower()
+
+
+def test_expressionloop_large_cohort_preflight_hardening(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify all 6 pre-flight hardening fixes for 500-1,000-sample bacterial cohorts."""
+    import subprocess
+    import time
+    import numpy as np
+    from focaloop import cvmfs_annot, logan
+    from focaloop.galaxy_runners import _parse_subset_spec, _prune_constant_design_terms, run_warm_engine_query
+    from focaloop.panexpr.logan_expr import ensure_expr_logan_bins
+    from focaloop.panexpr.solver import run_pydeseq2
+
+    # 1. prep_expr_unitigs tiles >2.5 kb unitigs with exact (L - 30) midpoint-bp conservation
+    prep_bin, _ = ensure_expr_logan_bins()
+    short_seq = "ACGT" * 25
+    long_seq = "".join("ACGT"[(i * 7 + (i // 13)) & 3] for i in range(34000))
+    res = subprocess.run(
+        [str(prep_bin), "1.5"],
+        input=f">0 ka:f:8.25\n{short_seq}\n>1 ka:f:14.5\n{long_seq}\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    recs: list[tuple[str, str]] = []
+    cur_h = None
+    for ln in res.stdout.splitlines():
+        if ln.startswith(">"):
+            cur_h = ln[1:]
+        elif cur_h is not None:
+            recs.append((cur_h, ln.strip()))
+            cur_h = None
+    assert recs[0] == ("0_825", short_seq)
+    tiles = recs[1:]
+    assert len(tiles) >= 16
+    assert all(h.endswith("_1450") and "c" in h for h, _ in tiles)
+    assert all(500 < len(s) <= 2500 for _, s in tiles)
+    # Exact sum of expr_sam_ec_v2 midpoint weights: sum(len(t) - 30) == len(long_seq) - 30
+    assert sum(len(s) - 30 for _, s in tiles) == len(long_seq) - 30
+
+    # 2. Logan probe rejects 55-byte empty zstd stubs (<= 100 B)
+    class _FakeResp:
+        def __init__(self, code: int, cl: int):
+            self.status_code = code
+            self.headers = {"Content-Length": str(cl)}
+
+    class _FakeSess:
+        def head(self, url: str, timeout: float = 8.0, allow_redirects: bool = True):
+            if "SRR100001" in url:
+                return _FakeResp(200, 55)
+            if "SRR100002" in url:
+                return _FakeResp(200, 1250000)
+            return _FakeResp(404, 0)
+
+    monkeypatch.setattr(logan, "_ipv4_session", lambda: _FakeSess())
+    probe = logan.probe_logan_runs(["SRR100001", "SRR100002", "SRR100003"])
+    assert probe["logan_runs"] == ["SRR100002"]
+    assert probe["stub_runs"] == ["SRR100001"]
+    assert set(probe["fallback_runs"]) == {"SRR100001", "SRR100003"}
+    assert probe["probes"]["SRR100001"]["available"] is False
+    assert probe["probes"]["SRR100001"]["is_stub"] is True
+
+    # 3. PyDESeq2 poscounts auto-switch when every gene has >=1 zero + drops 0-count sample cleanly
+    rng = np.random.default_rng(7)
+    n_s, n_g = 24, 30
+    mat = rng.poisson(lam=45.0, size=(n_s, n_g)).astype(float)
+    # Force at least one zero in EVERY gene (which triggers slow Powell fallback under fit_type='ratio')
+    for gi in range(n_g):
+        mat[gi % n_s, gi] = 0.0
+    # Make first 12 samples treated with 4x boost on first 5 genes; inject 1 completely empty sample
+    mat[:12, :5] *= 4.0
+    mat[11, :] = 0.0
+    snames = [f"s{i}" for i in range(n_s)]
+    gnames = [f"g{j}" for j in range(n_g)]
+    counts_df = pd.DataFrame(mat, index=snames, columns=gnames)
+    meta_df = pd.DataFrame({"condition": ["treated"] * 12 + ["control"] * 12}, index=snames)
+    t0 = time.time()
+    de_res, disp, sf = run_pydeseq2(counts_df, meta_df, ["condition", "treated", "control"])
+    assert (time.time() - t0) < 15.0
+    assert not de_res.empty
+    assert float(de_res.loc["g0", "log2FoldChange"]) > 1.0
+    assert sf.reindex(snames).notna().all()
+
+    # 4. CVMFS species typo fix must not double the trailing 'a' on valid Pseudomonas aeruginosa names
+    assert cvmfs_annot._clean_species_name("Pseudomonas aeruginos PAO1") == "Pseudomonas aeruginosa"
+    assert cvmfs_annot._clean_species_name("Pseudomonas aeruginosa UCBPP-PA14") == "Pseudomonas aeruginosa"
+    assert cvmfs_annot._clean_species_name("Pseudomonas aeruginosa") == "Pseudomonas aeruginosa"
+
+    # 5. Focaloop Query --subset parsing & constant-covariate pruning on a multi-plate state
+    clauses = _parse_subset_spec("plate_id=P1 timepoint=60m,120m")
+    assert clauses == [("plate_id", ["P1"]), ("timepoint", ["60m", "120m"])]
+    sub_meta = pd.DataFrame({"plate_id": ["P1"] * 4, "condition": ["cip", "cip", "dmso", "dmso"]})
+    assert _prune_constant_design_terms("~plate_id + condition", sub_meta, "condition") == "~condition"
+
+    # End-to-end ExpressionLoop state -> Warm Query with --subset
+    state_dir = tmp_path / "st_multi"
+    manifest_p = tmp_path / "multi_plate.tsv"
+    c1 = (TEST_DATA / "ctrl1.fastq.gz").resolve()
+    c2 = (TEST_DATA / "ctrl2.fastq.gz").resolve()
+    t1 = (TEST_DATA / "trt1.fastq.gz").resolve()
+    t2 = (TEST_DATA / "trt2.fastq.gz").resolve()
+    manifest_p.write_text(
+        "sample_id\tcondition\tplate_id\trun_or_url\n"
+        f"p1_c1\tcontrol\tP1\t{c1}\n"
+        f"p1_c2\tcontrol\tP1\t{c2}\n"
+        f"p1_t1\ttreated\tP1\t{t1}\n"
+        f"p1_t2\ttreated\tP1\t{t2}\n"
+        f"p2_c1\tcontrol\tP2\t{c1}\n"
+        f"p2_c2\tcontrol\tP2\t{c2}\n"
+        f"p2_t1\ttreated\tP2\t{t1}\n"
+        f"p2_t2\ttreated\tP2\t{t2}\n",
+        encoding="utf-8",
+    )
+    meta_out = run_expressionloop_galaxy(
+        ref_fasta=TEST_DATA / "ref_primary.fa",
+        ref_gtf=TEST_DATA / "ref_primary.gtf",
+        manifest_path=manifest_p,
+        contrast="condition:treated:control",
+        design="~plate_id + condition",
+        source_mode="local_bytes",
+        max_byte_fraction=1.0,
+        kernel_names=["mappy"],
+        n_tournament_reads=600,
+        out_de=tmp_path / "de.tsv",
+        out_report=tmp_path / "rep.html",
+        state_dir=state_dir,
+        threads=2,
+        logan_mode="off",
+    )
+    q_verdict = tmp_path / "q_sub.json"
+    q_res = run_warm_engine_query(
+        state_dir=state_dir,
+        meta=meta_out,
+        contrast="condition:treated:control",
+        actor="tester",
+        out_table=tmp_path / "q_sub.tsv",
+        out_verdict=q_verdict,
+        subset="plate_id=P1",
+        mode="contrast",
+    )
+    assert q_res["n_samples_queried"] == 4
+    assert q_res["effective_design"] == "~condition"
+    assert q_res["subset"] == "plate_id=P1"
+    with pytest.raises(ValueError, match="matched 0 samples"):
+        run_warm_engine_query(
+            state_dir=state_dir,
+            meta=meta_out,
+            contrast="condition:treated:control",
+            actor="tester",
+            out_table=tmp_path / "q_empty.tsv",
+            out_verdict=tmp_path / "q_empty.json",
+            subset="plate_id=NOPE",
+            mode="contrast",
+        )

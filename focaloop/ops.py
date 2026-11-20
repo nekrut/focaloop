@@ -46,7 +46,7 @@ def _meta(state_dir: Path) -> dict[str, Any]:
 def run_query(state_ref: str | Path, contrast: str, actor: str, out_table: str | Path, out_verdict: str | Path,
               hypothesis: str | None = None, mode: str = "auto", out_state_archive: str | Path | None = None,
               alpha_budget: float = 0.05, n_perm: int = 199, out_report: str | Path | None = None,
-              design: str | None = None) -> dict[str, Any]:
+              design: str | None = None, subset: str | None = None) -> dict[str, Any]:
     t0 = time.time()
     state_dir, tmp = materialize_state(state_ref)
     try:
@@ -70,6 +70,7 @@ def run_query(state_ref: str | Path, contrast: str, actor: str, out_table: str |
                 out_verdict=out_verdict,
                 hypothesis=hypothesis,
                 design_override=design,
+                subset=subset,
                 mode=mode,
                 n_perm=n_perm,
                 out_report=out_report,

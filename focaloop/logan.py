@@ -12,6 +12,8 @@ _INSDC_RUN_RE = re.compile(r"^[SED]RR\d+$", re.IGNORECASE)
 
 LOGAN_UNITIGS_URL_TEMPLATE = "https://s3.amazonaws.com/logan-pub/u/{acc}/{acc}.unitigs.fa.zst"
 LOGAN_CONTIGS_URL_TEMPLATE = "https://s3.amazonaws.com/logan-pub/c/{acc}/{acc}.contigs.fa.zst"
+# Empty zstd frames in logan-pub are ~55 bytes and decompress to 0 bytes; reject <=100 B stubs
+MIN_LOGAN_ARCHIVE_BYTES = 100
 
 
 def is_insdc_run(text: str) -> bool:
@@ -65,10 +67,12 @@ def probe_logan_url(
             last_status = int(r.status_code)
             if r.status_code == 200:
                 cl = int(r.headers.get("Content-Length") or 0)
+                is_stub = 0 < cl <= MIN_LOGAN_ARCHIVE_BYTES
                 return {
                     "accession": clean,
                     "kind": kind,
-                    "available": cl > 0,
+                    "available": cl > MIN_LOGAN_ARCHIVE_BYTES,
+                    "is_stub": is_stub,
                     "content_length": cl,
                     "status": 200,
                     "url": url,
@@ -122,11 +126,13 @@ def probe_logan_runs(
                 probes[res["accession"]] = res
     logan_runs = [a for a in ordered if probes.get(a, {}).get("available")]
     fallback_runs = [a for a in ordered if not probes.get(a, {}).get("available")]
+    stub_runs = [a for a in ordered if probes.get(a, {}).get("is_stub")]
     total_logan_bytes = sum(int(probes[a].get("content_length", 0)) for a in logan_runs)
     return {
         "kind": kind,
         "logan_runs": logan_runs,
         "fallback_runs": fallback_runs,
+        "stub_runs": stub_runs,
         "probes": probes,
         "total_logan_bytes": total_logan_bytes,
     }
@@ -166,8 +172,8 @@ def fetch_ena_run_lengths(runs: Sequence[str], timeout: float = 30.0) -> dict[st
                 fb = sum(int(x) for x in fb_raw.split(";") if x.strip().isdigit())
                 mates = 2 if lay == "PAIRED" else 1
                 read_len = (bc / (rc * mates)) if (rc > 0 and bc > 0) else 100.0
-                # Exact 31-mer occurrences emitted per sequenced fragment: mates * (read_len - 30)
-                kmers_per_frag = max(20.0, mates * max(10.0, read_len - 30.0))
+                # Exact 31-mer occurrences emitted per sequenced fragment: mates * max(1, read_len - 30)
+                kmers_per_frag = max(2.0, mates * max(1.0, read_len - 30.0))
                 out[acc] = {
                     "read_count": rc,
                     "base_count": bc,

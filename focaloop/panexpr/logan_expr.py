@@ -21,11 +21,12 @@ import pyarrow as pa
 from ..logan import fetch_ena_run_lengths, is_insdc_run, logan_unitigs_url
 from .catalog import Catalog, iter_features
 from .manifest import StudyManifest
-from .solver import de_with_uncertainty, transcript_level_table
+from .solver import DE_EXCLUDED_BIOTYPES, de_with_uncertainty, transcript_level_table
 from .state import StateStore as PanStateStore, TARGET_COUNTS_SCHEMA, TRANSCRIPT_ABUNDANCE_SCHEMA
 
 _DECOY_SENTINEL = "__FOCALOOP_DECOY__"
 _COMPILE_LOCK = threading.Lock()
+_INDEX_LOCK = threading.Lock()
 
 
 def _bin_cache_dir() -> Path:
@@ -126,15 +127,24 @@ def _select_unitig_aligner() -> tuple[str, str]:
 def _build_aligner_index(aligner_name: str, aligner_bin: str, tx_fa: Path, log: Callable[[str], None]) -> None:
     if aligner_name == "bwa-mem2":
         marker = Path(str(tx_fa) + ".bwt.2bit.64")
-        if not (marker.is_file() and marker.stat().st_size > 0):
-            t0 = time.time()
-            log(f"Building bwa-mem2 transcriptome index ({tx_fa.stat().st_size / 1e6:.1f} MB)...")
-            subprocess.run([aligner_bin, "index", str(tx_fa)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            log(f"bwa-mem2 index ready in {time.time() - t0:.1f}s")
+        if marker.is_file() and marker.stat().st_size > 0:
+            return
+        with _INDEX_LOCK:
+            if not (marker.is_file() and marker.stat().st_size > 0):
+                t0 = time.time()
+                log(f"Building bwa-mem2 transcriptome index ({tx_fa.stat().st_size / 1e6:.1f} MB)...")
+                subprocess.run([aligner_bin, "index", str(tx_fa)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                log(f"bwa-mem2 index ready in {time.time() - t0:.1f}s")
     elif aligner_name == "bwa":
         marker = Path(str(tx_fa) + ".bwt")
-        if not (marker.is_file() and marker.stat().st_size > 0):
-            subprocess.run([aligner_bin, "index", str(tx_fa)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if marker.is_file() and marker.stat().st_size > 0:
+            return
+        with _INDEX_LOCK:
+            if not (marker.is_file() and marker.stat().st_size > 0):
+                t0 = time.time()
+                log(f"Building bwa transcriptome index ({tx_fa.stat().st_size / 1e6:.1f} MB)...")
+                subprocess.run([aligner_bin, "index", str(tx_fa)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                log(f"bwa index ready in {time.time() - t0:.1f}s")
 
 
 def _aligner_cmd(aligner_name: str, aligner_bin: str, tx_fa: Path, threads: int) -> list[str]:
@@ -159,100 +169,130 @@ def stream_logan_expression_run(
     threads: int = 2,
     min_ka: float = 0.0,
     local_unitigs_path: Path | None = None,
+    log: Callable[[str], None] = lambda msg: None,
 ) -> dict[str, Any]:
     """Stream one run's Logan unitigs through prep_expr_unitigs -> aligner -> expr_sam_ec_v2."""
     t0 = time.time()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_bp = out_dir / f"{acc}.bp.tsv"
     prep_err = out_dir / f"{acc}.prep.err"
+    aln_err = out_dir / f"{acc}.aln.err"
     ec_err = out_dir / f"{acc}.ec.err"
 
-    # Source stream: either local file (.fa, .fa.gz, .fa.zst) or live HTTPS logan-pub/u/
-    wire_bytes = 0
-    procs: list[subprocess.Popen] = []
-    p_curl: subprocess.Popen | None = None
-    p_decomp: subprocess.Popen | None = None
+    def _run_once(a_name: str, a_bin: str) -> tuple[list[int], int]:
+        wbytes = 0
+        procs: list[subprocess.Popen] = []
+        p_curl: subprocess.Popen | None = None
+        p_decomp: subprocess.Popen | None = None
 
-    def _pipe_and_count(src_stream, dst_stream) -> None:
-        nonlocal wire_bytes
-        try:
-            while True:
-                chunk = src_stream.read(1 << 18)
-                if not chunk:
-                    break
-                wire_bytes += len(chunk)
-                dst_stream.write(chunk)
-        finally:
+        def _pipe_and_count(src_stream, dst_stream) -> None:
+            nonlocal wbytes
             try:
-                dst_stream.close()
-            except Exception:
-                pass
+                while True:
+                    chunk = src_stream.read(1 << 18)
+                    if not chunk:
+                        break
+                    wbytes += len(chunk)
+                    dst_stream.write(chunk)
+            finally:
+                try:
+                    dst_stream.close()
+                except Exception:
+                    pass
 
-    with open(prep_err, "wb") as f_perr, open(ec_err, "wb") as f_eerr:
-        if local_unitigs_path is not None:
-            lp = Path(local_unitigs_path)
-            wire_bytes = lp.stat().st_size
-            with open(lp, "rb") as fh:
-                magic = fh.read(4)
-            if magic == b"\x28\xb5\x2f\xfd":
-                p_decomp = subprocess.Popen(["zstd", "-dc", str(lp)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                prep_stdin = p_decomp.stdout
-                procs.append(p_decomp)
-            elif magic[:2] == b"\x1f\x8b":
-                p_decomp = subprocess.Popen(["gzip", "-dc", str(lp)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                prep_stdin = p_decomp.stdout
-                procs.append(p_decomp)
+        with open(prep_err, "wb") as f_perr, open(aln_err, "wb") as f_aerr, open(ec_err, "wb") as f_eerr:
+            if local_unitigs_path is not None:
+                lp = Path(local_unitigs_path)
+                wbytes = lp.stat().st_size
+                with open(lp, "rb") as fh:
+                    magic = fh.read(4)
+                if magic == b"\x28\xb5\x2f\xfd":
+                    p_decomp = subprocess.Popen(["zstd", "-dc", str(lp)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    prep_stdin = p_decomp.stdout
+                    procs.append(p_decomp)
+                elif magic[:2] == b"\x1f\x8b":
+                    p_decomp = subprocess.Popen(["gzip", "-dc", str(lp)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    prep_stdin = p_decomp.stdout
+                    procs.append(p_decomp)
+                else:
+                    prep_stdin = open(lp, "rb")
+                feeder = None
             else:
-                prep_stdin = open(lp, "rb")
-            feeder = None
-        else:
-            url = logan_unitigs_url(acc)
-            p_curl = subprocess.Popen(
-                ["curl", "-4", "-sSL", "--fail", "--retry", "5", "--retry-delay", "2", "--max-time", "600", url],
+                url = logan_unitigs_url(acc)
+                p_curl = subprocess.Popen(
+                    ["curl", "-4", "-sSL", "--fail", "--retry", "5", "--retry-delay", "2", "--max-time", "600", url],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                p_decomp = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                procs.extend([p_curl, p_decomp])
+                feeder = threading.Thread(target=_pipe_and_count, args=(p_curl.stdout, p_decomp.stdin), daemon=True)
+                feeder.start()
+                prep_stdin = p_decomp.stdout
+
+            p_prep = subprocess.Popen(
+                [str(prep_bin), str(min_ka)],
+                stdin=prep_stdin,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=f_perr,
             )
-            p_decomp = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            procs.extend([p_curl, p_decomp])
-            feeder = threading.Thread(target=_pipe_and_count, args=(p_curl.stdout, p_decomp.stdin), daemon=True)
-            feeder.start()
-            prep_stdin = p_decomp.stdout
+            p_aln = subprocess.Popen(
+                _aligner_cmd(a_name, a_bin, tx_fa, threads),
+                stdin=p_prep.stdout,
+                stdout=subprocess.PIPE,
+                stderr=f_aerr,
+            )
+            p_ec = subprocess.Popen(
+                [str(ec_bin), str(tx2gene), str(out_bp)],
+                stdin=p_aln.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=f_eerr,
+            )
+            procs.extend([p_prep, p_aln, p_ec])
 
-        p_prep = subprocess.Popen(
-            [str(prep_bin), str(min_ka)],
-            stdin=prep_stdin,
-            stdout=subprocess.PIPE,
-            stderr=f_perr,
-        )
-        p_aln = subprocess.Popen(
-            _aligner_cmd(aligner_name, aligner_bin, tx_fa, threads),
-            stdin=p_prep.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        p_ec = subprocess.Popen(
-            [str(ec_bin), str(tx2gene), str(out_bp)],
-            stdin=p_aln.stdout,
-            stdout=subprocess.DEVNULL,
-            stderr=f_eerr,
-        )
-        procs.extend([p_prep, p_aln, p_ec])
+            # Close parent references to intermediate pipes so downstream EOF propagates cleanly
+            if p_decomp is not None and p_decomp.stdout is not None:
+                p_decomp.stdout.close()
+            elif local_unitigs_path is not None and hasattr(prep_stdin, "close"):
+                prep_stdin.close()
+            if p_prep.stdout is not None:
+                p_prep.stdout.close()
+            if p_aln.stdout is not None:
+                p_aln.stdout.close()
 
-        # Close parent references to intermediate pipes so downstream EOF propagates cleanly
-        if p_decomp is not None and p_decomp.stdout is not None:
-            p_decomp.stdout.close()
-        elif local_unitigs_path is not None and hasattr(prep_stdin, "close"):
-            prep_stdin.close()
-        if p_prep.stdout is not None:
-            p_prep.stdout.close()
-        if p_aln.stdout is not None:
-            p_aln.stdout.close()
+            if feeder is not None:
+                feeder.join()
+            return [p.wait() for p in procs], wbytes
 
-        if feeder is not None:
-            feeder.join()
-        rcs = [p.wait() for p in procs]
-        if any(rc != 0 for rc in rcs):
-            raise RuntimeError(f"Logan unitig stream failed for {acc} (exit codes={rcs})")
+    cur_aln_name, cur_aln_bin = aligner_name, aligner_bin
+    rcs, wire_bytes = _run_once(cur_aln_name, cur_aln_bin)
+    # Retry once on transient mid-stream S3/curl network reset
+    if local_unitigs_path is None and len(rcs) == 5 and rcs[0] in (18, 28, 35, 52, 56, 92):
+        log(f"Transient Logan download error for {acc} (curl rc={rcs[0]}), retrying once...")
+        time.sleep(2.0)
+        rcs, wire_bytes = _run_once(cur_aln_name, cur_aln_bin)
+    # Fallback to classic bwa if bwa-mem2 exits on a negative signal
+    aln_rc_idx = len(rcs) - 2
+    if (
+        any(rc != 0 for rc in rcs)
+        and aln_rc_idx >= 0
+        and rcs[aln_rc_idx] < 0
+        and cur_aln_name == "bwa-mem2"
+        and shutil.which("bwa")
+    ):
+        bwa_bin = shutil.which("bwa")
+        assert bwa_bin is not None
+        log(f"bwa-mem2 exited with signal {rcs[aln_rc_idx]} on {acc}, retrying with classic bwa...")
+        _build_aligner_index("bwa", bwa_bin, tx_fa, log)
+        cur_aln_name, cur_aln_bin = "bwa", bwa_bin
+        rcs, wire_bytes = _run_once(cur_aln_name, cur_aln_bin)
+
+    if any(rc != 0 for rc in rcs):
+        aln_tail = " | ".join(aln_err.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-4:])
+        raise RuntimeError(
+            f"Logan unitig stream failed for {acc} (exit codes={rcs})"
+            + (f" aln_err={aln_tail}" if aln_tail else "")
+        )
 
     wall_s = time.time() - t0
     prep_m: dict[str, Any] = {}
@@ -295,6 +335,7 @@ def run_logan_expression_cohort(
     threads: int = 4,
     min_ka: float = 0.0,
     local_unitig_map: dict[str, Path] | None = None,
+    write_transcript_table: bool = True,
     log: Callable[[str], None] = lambda msg: None,
 ) -> dict[str, Any]:
     """Quantify an entire RNA-seq cohort from Logan unitigs and run PyDESeq2 + state export."""
@@ -336,7 +377,7 @@ def run_logan_expression_cohort(
             run_kpf[r.run_id] = float(mates * 70.0)
             est_raw_bytes += int(r.total_bytes)
 
-    n_workers = min(len(rna_runs), max(1, min(4, threads // 2 if threads >= 4 else 1)))
+    n_workers = min(len(rna_runs), max(1, min(10, threads // 2 if threads >= 4 else 1)))
     aln_threads = max(1, threads // n_workers)
     runs_out_dir = logan_work / "runs"
 
@@ -359,6 +400,7 @@ def run_logan_expression_cohort(
             threads=aln_threads,
             min_ka=min_ka,
             local_unitigs_path=lpath,
+            log=log,
         )
 
     run_stats: list[dict[str, Any]] = []
@@ -377,12 +419,20 @@ def run_logan_expression_cohort(
             rep_target[tgt.group_id] = tgt
     group_ids = sorted(rep_target.keys())
 
+    # Exclude rRNA/tRNA/structural RNAs from primary DE (matching Focaloop Query's gene_level_tables)
+    # while still persisting all targets into target_counts.parquet for inspection.
+    excluded_bt = set(DE_EXCLUDED_BIOTYPES)
+    de_group_ids = [gid for gid in group_ids if str(rep_target[gid].biotype or "") not in excluded_bt]
+    if not de_group_ids:
+        de_group_ids = list(group_ids)
+    de_group_set = set(de_group_ids)
+
     # Normalize sample metadata to unique sample index (matches run_pydeseq2 samples x genes layout)
     meta_idx = sample_meta_df.set_index("sample") if "sample" in sample_meta_df.columns else sample_meta_df.copy()
     meta_idx = meta_idx[~meta_idx.index.duplicated(keep="first")]
     samples = list(meta_idx.index)
-    counts_mat = pd.DataFrame(0.0, index=group_ids, columns=samples)
-    avar_mat = pd.DataFrame(0.0, index=group_ids, columns=samples)
+    counts_mat = pd.DataFrame(0.0, index=de_group_ids, columns=samples)
+    avar_mat = pd.DataFrame(0.0, index=de_group_ids, columns=samples)
     tc_rows: list[dict[str, Any]] = []
 
     for r in rna_runs:
@@ -398,10 +448,13 @@ def run_logan_expression_cohort(
                 tot_c = float(row.midpoint_bp) / kpf
                 uniq_c = float(row.uniq_bp) / kpf
                 bp_map[gid] = (tot_c, uniq_c)
-                if r.sample in counts_mat.columns:
+                if gid in de_group_set and r.sample in counts_mat.columns:
                     counts_mat.at[gid, r.sample] += tot_c
                     ambig = max(0.0, tot_c - uniq_c)
                     avar_mat.at[gid, r.sample] += 0.25 * ambig
+        # Clean up per-run temporary files immediately to keep scratch bounded at 1,000+ runs
+        for ext in (".bp.tsv", ".prep.err", ".aln.err", ".ec.err"):
+            (runs_out_dir / f"{r.run_id}{ext}").unlink(missing_ok=True)
 
         for gid in group_ids:
             tot_c, uniq_c = bp_map.get(gid, (0.0, 0.0))
@@ -436,14 +489,17 @@ def run_logan_expression_cohort(
         tc_table = pa.Table.from_pylist(tc_rows, schema=TARGET_COUNTS_SCHEMA)
     else:
         tc_table = pa.Table.from_pydict({f.name: [] for f in TARGET_COUNTS_SCHEMA}, schema=TARGET_COUNTS_SCHEMA)
+    del tc_rows
     pan_store.write("target_counts", tc_table, TARGET_COUNTS_SCHEMA)
 
-    tx_tbl = transcript_level_table(tc_table, catalog)
-    pan_store.write("transcript_abundances", tx_tbl, TRANSCRIPT_ABUNDANCE_SCHEMA)
+    if write_transcript_table:
+        tx_tbl = transcript_level_table(tc_table, catalog)
+        pan_store.write("transcript_abundances", tx_tbl, TRANSCRIPT_ABUNDANCE_SCHEMA)
+    del tc_table
 
-    symbols = {gid: rep_target[gid].symbol for gid in group_ids}
-    gene_ids = {gid: rep_target[gid].gene_id for gid in group_ids}
-    dna_prob = pd.Series(1.0, index=group_ids)
+    symbols = {gid: rep_target[gid].symbol for gid in de_group_ids}
+    gene_ids = {gid: rep_target[gid].gene_id for gid in de_group_ids}
+    dna_prob = pd.Series(1.0, index=de_group_ids)
 
     de_raw = de_with_uncertainty(
         counts_mat.T,

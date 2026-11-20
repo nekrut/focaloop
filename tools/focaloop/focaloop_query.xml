@@ -18,6 +18,9 @@ focaloop query
     #if str($query_type.mode) == "contrast"
         --mode contrast
         --contrast '${query_type.factor_name}:${query_type.group_a}:${query_type.group_b}'
+        #if str($query_type.subset).strip()
+            --subset '$query_type.subset'
+        #end if
         #if str($query_type.hypothesis).strip()
             --hypothesis '$query_type.hypothesis'
         #end if
@@ -27,12 +30,18 @@ focaloop query
     #elif str($query_type.mode) == "fst"
         --mode fst
         --contrast '${query_type.group_column}=${query_type.group_a}:${query_type.group_b}'
+        #if str($query_type.subset).strip()
+            --subset '$query_type.subset'
+        #end if
         #if str($query_type.hypothesis).strip()
             --hypothesis '$query_type.hypothesis'
         #end if
     #else
         --mode auto
         --contrast '$query_type.contrast'
+        #if str($query_type.subset).strip()
+            --subset '$query_type.subset'
+        #end if
         #if str($query_type.hypothesis).strip()
             --hypothesis '$query_type.hypothesis'
         #end if
@@ -67,6 +76,9 @@ focaloop query
                 <param name="group_b" type="text" value="control" label="Reference group (denominator)" help="Baseline group level for the denominator.">
                     <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
                 </param>
+                <param argument="--subset" type="text" value="" label="Filter samples to a subset before fitting (optional)" help="Optional space-separated metadata filters such as plate_id=plate1 or drug=cip timepoint=60m,120m. Automatically drops any constant design covariate inside the subset.">
+                    <validator type="regex" message="Use space-separated column=val1,val2 clauses (letters, digits, underscores, dots, hyphens, commas, equals)">^($|[A-Za-z0-9_]+=[A-Za-z0-9_,.-]+(\s+[A-Za-z0-9_]+=[A-Za-z0-9_,.-]+)*)$</validator>
+                </param>
                 <param argument="--hypothesis" type="text" value="" label="Specific gene ID to validate on held-out reads (optional)" help="Leave blank to validate the top-ranked gene automatically. Results for all genes are always written to the output table.">
                     <validator type="regex" message="Use letters, digits, underscores, colons, dots, hyphens, or equals signs only">^[A-Za-z0-9_:.=-]*$</validator>
                 </param>
@@ -89,6 +101,9 @@ focaloop query
                 <param name="group_b" type="text" value="group_b" label="Second group (Group B)" help="One group label (or comma-separated labels) for the second population.">
                     <validator type="regex" message="Use letters, digits, underscores, dots, commas, or hyphens only">^[A-Za-z0-9_,.-]+$</validator>
                 </param>
+                <param argument="--subset" type="text" value="" label="Filter samples to a subset (optional)" help="Optional space-separated metadata filters such as year=2020 or site=north,east to restrict the Fst comparison to a sub-cohort.">
+                    <validator type="regex" message="Use space-separated column=val1,val2 clauses (letters, digits, underscores, dots, hyphens, commas, equals)">^($|[A-Za-z0-9_]+=[A-Za-z0-9_,.-]+(\s+[A-Za-z0-9_]+=[A-Za-z0-9_,.-]+)*)$</validator>
+                </param>
                 <param argument="--hypothesis" type="text" value="" label="Specific chromosome or genomic interval to focus on (optional)" help="Optional chromosome name (for example, chr1) or interval (chr1:1000-5000) to restrict the comparison. Leave blank for all called sites.">
                     <validator type="regex" message="Use letters, digits, underscores, colons, dots, hyphens, or equals signs only">^[A-Za-z0-9_:.=-]*$</validator>
                 </param>
@@ -96,6 +111,9 @@ focaloop query
             <when value="auto">
                 <param argument="--contrast" type="text" value="condition:treated:control" label="Comparison specification" help="Written as groupA:groupB or factor:groupA:groupB for expression states, or column=groupA:groupB for variant cohorts.">
                     <validator type="regex" message="Use groupA:groupB, factor:groupA:groupB, or column=groupA:groupB">^([A-Za-z0-9_]+[:=])?[A-Za-z0-9_,.-]+:[A-Za-z0-9_,.-]+$</validator>
+                </param>
+                <param argument="--subset" type="text" value="" label="Filter samples to a subset (optional)" help="Optional space-separated metadata filters such as plate_id=plate1 timepoint=60m to restrict the query to a subgroup of samples.">
+                    <validator type="regex" message="Use space-separated column=val1,val2 clauses (letters, digits, underscores, dots, hyphens, commas, equals)">^($|[A-Za-z0-9_]+=[A-Za-z0-9_,.-]+(\s+[A-Za-z0-9_]+=[A-Za-z0-9_,.-]+)*)$</validator>
                 </param>
                 <param argument="--hypothesis" type="text" value="" label="Specific gene ID or genomic region to test (optional)" help="Leave blank to test the top discovery hit or genome-wide comparison automatically.">
                     <validator type="regex" message="Use letters, digits, underscores, colons, dots, hyphens, or equals signs only">^[A-Za-z0-9_:.=-]*$</validator>
@@ -223,6 +241,7 @@ focaloop query
 
 **Key parameters**
 
+- **Filter samples to a subset (`--subset`, optional):** Restricts a large cohort state bundle to a subgroup before running the comparison (for example, `plate_id=plate1` or `drug=cip timepoint=60m,120m`). Any additive design covariate that becomes constant inside the subset is dropped automatically.
 - **Override statistical model formula (ExpressionLoop only):** Leave blank to keep the model formula from the original run, or enter a new formula (for example, `~batch + condition`) referencing columns from the original sample sheet.
 - **Cumulative significance error budget (`--alpha-budget`):** Default `0.05`. Controls the total false-positive budget tracked across sequential follow-up queries on the same state bundle.
 - **Permutation replicates (`--n-perm`):** Default `199`. Increases resolution of the permutation p-value in population Fst queries (with 199 replicates, the smallest possible p-value is `0.005`).

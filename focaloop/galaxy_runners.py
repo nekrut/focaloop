@@ -1198,6 +1198,61 @@ def _bh_padj(pvals: np.ndarray) -> np.ndarray:
     return out
 
 
+def _parse_subset_spec(subset: str | None) -> list[tuple[str, list[str]]]:
+    """Parse space- or &-separated sample subset filters like 'plate_id=P1 timepoint=60m,120m'."""
+    raw = str(subset or "").strip()
+    if not raw:
+        return []
+    clauses: list[tuple[str, list[str]]] = []
+    for tok in re.split(r"[\s&]+", raw):
+        t = tok.strip()
+        if not t:
+            continue
+        if "=" not in t:
+            raise ValueError(f"Invalid --subset clause {t!r}; expected column=val1,val2 (space-separated for multiple filters)")
+        col, vals_s = t.split("=", 1)
+        col = col.strip()
+        vals = [v.strip() for v in vals_s.split(",") if v.strip()]
+        if not col or not vals:
+            raise ValueError(f"Invalid --subset clause {t!r}; both column name and value(s) are required")
+        clauses.append((col, vals))
+    return clauses
+
+
+def _apply_subset_df(df: pd.DataFrame, clauses: list[tuple[str, list[str]]]) -> pd.DataFrame:
+    if not clauses:
+        return df
+    out = df
+    cols_ci = {str(c).lower(): c for c in out.columns}
+    for col, vals in clauses:
+        real_col = col if col in out.columns else cols_ci.get(col.lower())
+        if real_col is None:
+            raise ValueError(f"Subset column {col!r} was not found in saved sample metadata columns {list(out.columns)}")
+        mask = out[real_col].astype(str).isin(set(vals))
+        out = out.loc[mask]
+    if out.empty:
+        spec = " ".join(f"{c}={','.join(vs)}" for c, vs in clauses)
+        raise ValueError(f"Subset filter {spec!r} matched 0 samples in the saved state bundle.")
+    return out
+
+
+def _prune_constant_design_terms(design: str, meta_df: pd.DataFrame, focal_factor: str) -> str:
+    """Drop additive covariates that collapsed to a single level after --subset so PyDESeq2 stays full-rank."""
+    d = str(design or "~condition").strip()
+    if not d.startswith("~") or "*" in d or ":" in d or "(" in d:
+        return d
+    terms = [t.strip() for t in d[1:].split("+") if t.strip()]
+    kept: list[str] = []
+    for term in terms:
+        if term == focal_factor or term not in meta_df.columns:
+            kept.append(term)
+        elif int(meta_df[term].astype(str).nunique(dropna=True)) >= 2:
+            kept.append(term)
+    if not kept:
+        kept = [focal_factor]
+    return "~" + " + ".join(kept)
+
+
 def run_warm_engine_query(
     *,
     state_dir: Path,
@@ -1208,6 +1263,7 @@ def run_warm_engine_query(
     out_verdict: str | Path,
     hypothesis: str | None = None,
     design_override: str | None = None,
+    subset: str | None = None,
     mode: str = "auto",
     n_perm: int = 199,
     out_report: str | Path | None = None,
@@ -1219,6 +1275,7 @@ def run_warm_engine_query(
     engine = meta["engine"]
     store = FocaloopStateStore(state_dir)
     ledger = HypothesisLedger.from_store(store, alpha_budget=alpha_budget)
+    subset_clauses = _parse_subset_spec(subset)
 
     sock_guard = _block_all_network_sockets()
     try:
@@ -1242,19 +1299,35 @@ def run_warm_engine_query(
             if sample_meta is not None and not sample_meta.empty:
                 idx_col = "sample" if "sample" in sample_meta.columns else ("sample_id" if "sample_id" in sample_meta.columns else None)
                 sm = sample_meta.set_index(idx_col) if idx_col else sample_meta
+                sm = sm[~sm.index.duplicated(keep="first")]
                 for col in sm.columns:
                     if col not in meta_df.columns:
                         meta_df[col] = sm[col].reindex(meta_df.index)
             counts = gl.get("counts_length_scaled", gl["counts"]) if length_offsets else gl["counts"]
+            avar = gl["avar"]
+            if subset_clauses:
+                meta_df = _apply_subset_df(meta_df, subset_clauses)
+                counts = counts.loc[meta_df.index]
+                avar = avar.loc[meta_df.index]
+                if fac not in meta_df.columns:
+                    raise ValueError(f"Contrast factor {fac!r} not found in sample metadata columns {list(meta_df.columns)}")
+                avail_lvls = set(meta_df[fac].astype(str))
+                missing_lvls = [lv for lv in (lvl_a, lvl_b) if lv not in avail_lvls]
+                if missing_lvls:
+                    raise ValueError(
+                        f"After applying subset {subset!r} ({len(meta_df)} samples), contrast level(s) {missing_lvls} "
+                        f"are absent from column {fac!r} (present: {sorted(avail_lvls)})."
+                    )
+            eff_design = _prune_constant_design_terms(design, meta_df, fac) if subset_clauses else design
             symbols = {g: ts[0].symbol for g, ts in catalog.groups.items()}
             gene_ids = catalog.primary_gene_of_group()
 
             raw_de = de_with_uncertainty(
                 counts,
-                gl["avar"],
+                avar,
                 meta_df,
                 contrast_list,
-                design=design,
+                design=eff_design,
                 dna_prob=gl["dna_prob"],
                 symbols=symbols,
                 gene_ids=gene_ids,
@@ -1313,6 +1386,9 @@ def run_warm_engine_query(
                 "engine": "panexpr",
                 "mode": "contrast",
                 "contrast": {"field": fac, "a": lvl_a, "b": lvl_b},
+                "subset": subset or None,
+                "effective_design": eff_design,
+                "n_samples_queried": int(len(meta_df)),
                 "new_bytes": 0,
                 "network_sockets_blocked": True,
                 "wall_seconds": wall_s,
@@ -1572,6 +1648,8 @@ def run_warm_engine_query(
             if not s_rows:
                 raise ValueError("Saved VariationLoop state contains no sample metadata for group comparisons.")
             s_df = pd.DataFrame(s_rows)
+            if subset_clauses:
+                s_df = _apply_subset_df(s_df, subset_clauses)
 
             raw_c = contrast.strip()
             if "=" in raw_c and ":" in raw_c:

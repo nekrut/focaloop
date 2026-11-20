@@ -128,7 +128,7 @@ def _clean_species_name(raw: str) -> str:
     s = re.sub(r"\s+", " ", str(raw or "").strip())
     low = s.lower()
     for bad, good in _SPECIES_TYPOS.items():
-        if low.startswith(bad):
+        if re.match(rf"^{re.escape(bad)}(?:\b|$)", low):
             s = good + s[len(bad):]
             break
     # Keep binomial "Genus species" if trailing subspecies/strain markers exist

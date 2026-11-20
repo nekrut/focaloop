@@ -263,19 +263,38 @@ def resolve_expression_manifest(
             and not row.get("fastq_ftp")
         ):
             accs_needed.append(src.upper())
-    for acc in dict.fromkeys(accs_needed):
-        last_err: Exception | None = None
-        for attempt in range(4):
+    unique_accs = list(dict.fromkeys(accs_needed))
+    for i_chunk in range(0, len(unique_accs), 40):
+        chunk = unique_accs[i_chunk : i_chunk + 40]
+        batch_ok = False
+        for attempt in range(3):
             try:
-                tsv = fetch_ena_filereport(acc, timeout=60.0)
+                tsv = fetch_ena_filereport(",".join(chunk), timeout=60.0)
                 parsed = list(csv.DictReader(io.StringIO(tsv), delimiter="\t"))
                 if parsed:
-                    ena_cache[acc] = parsed[0]
+                    for prow in parsed:
+                        ra = str(prow.get("run_accession") or "").strip().upper()
+                        if ra:
+                            ena_cache[ra] = prow
+                    batch_ok = True
                     break
-            except Exception as exc:
-                last_err = exc
-                time.sleep(2.0 * (attempt + 1))
-        if acc not in ena_cache and last_err is not None:
+            except Exception:
+                time.sleep(1.5 * (attempt + 1))
+        if not batch_ok:
+            for acc in chunk:
+                if acc in ena_cache:
+                    continue
+                for attempt in range(3):
+                    try:
+                        tsv = fetch_ena_filereport(acc, timeout=60.0)
+                        parsed = list(csv.DictReader(io.StringIO(tsv), delimiter="\t"))
+                        if parsed:
+                            ena_cache[acc] = parsed[0]
+                            break
+                    except Exception:
+                        time.sleep(1.5 * (attempt + 1))
+    for acc in unique_accs:
+        if acc not in ena_cache:
             odp_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}"
             odp_sz = _head_content_length(odp_url)
             layout_guess = "PE"
@@ -390,12 +409,10 @@ def resolve_expression_manifest(
             read_count = max(1, sum(f.bytes for f in files) // 100)
 
         layout = "PE" if len(files) == 2 else "SE"
-        cov_extra = {
-            k: v
-            for k, v in row.items()
-            if k not in ("sample_id", "sample", "condition", "group", "run_or_url", "fastq_ftp", "fastq_bytes", "fastq_md5", "mate2_url", "run_id")
-            and v
-        }
+        skip_cols = {"sample_id", "sample", "condition", "run_or_url", "fastq_ftp", "fastq_bytes", "fastq_md5", "mate2_url", "run_id"}
+        if "condition" not in row:
+            skip_cols.add("group")
+        cov_extra = {k: v for k, v in row.items() if k not in skip_cols and v}
         runs.append(
             Run(
                 run_id=run_id,
@@ -413,7 +430,7 @@ def resolve_expression_manifest(
         meta_records.append(cov_row)
 
     manifest = StudyManifest(study_id=Path(manifest_path).stem, accession="galaxy_cohort", runs=runs)
-    meta_df = pd.DataFrame(meta_records)
+    meta_df = pd.DataFrame(meta_records).fillna("")
     return manifest, meta_df, all_local
 
 
@@ -785,9 +802,10 @@ def run_expressionloop_galaxy(
                         "Logan-only mode requires public SRA/ENA run accessions (SRR, ERR, or DRR) for every sample in the manifest."
                     )
             else:
-                probe = probe_logan_runs(rna_run_ids, kind="unitigs")
+                probe = probe_logan_runs(rna_run_ids, kind="unitigs", max_workers=min(32, max(8, int(threads) * 2)))
                 n_avail = len(probe["logan_runs"])
                 n_total = len(probe["probes"])
+                stub_runs = probe.get("stub_runs") or []
                 if n_avail == n_total and n_total > 0:
                     _log(
                         f"Logan probe: {n_avail}/{n_total} runs available on logan-pub/u/ "
@@ -805,6 +823,7 @@ def run_expressionloop_galaxy(
                         pan_state_dir=pan_state_dir,
                         threads=threads,
                         min_ka=float(logan_min_ka),
+                        write_transcript_table=bool(out_transcripts) or (len(sample_meta_df) <= 100),
                         log=_log,
                     )
                     bridge_map = _build_ortholog_bridge_map(catalog)
@@ -897,12 +916,14 @@ def run_expressionloop_galaxy(
                     return state_meta
                 if eff_logan_mode == "logan_only":
                     missing = ", ".join(probe["fallback_runs"])
+                    stub_note = f" (empty <=100 B stubs: {', '.join(stub_runs)})" if stub_runs else ""
                     raise ValueError(
-                        f"Logan unitigs are not available for all requested accessions (missing: {missing}). "
-                        "Switch Logan mode to Automatic to fall back to raw SRA/ENA streaming."
+                        f"Logan unitigs are not available for all requested accessions (missing: {missing}){stub_note}. "
+                        "Remove stub/missing accessions or switch Logan mode to Automatic to fall back to raw SRA/ENA streaming."
                     )
+                stub_note = f" ({len(stub_runs)} empty <=100 B stub(s): {', '.join(stub_runs[:5])})" if stub_runs else ""
                 _log(
-                    f"Logan probe: {n_avail}/{n_total} runs available; falling back to uniform raw-read streaming "
+                    f"Logan probe: {n_avail}/{n_total} runs usable{stub_note}; falling back to uniform raw-read streaming "
                     "to keep quantification consistent across all samples."
                 )
         elif eff_logan_mode == "logan_only" and all_local:

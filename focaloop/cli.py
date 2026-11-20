@@ -335,19 +335,22 @@ def cmd_query(a: argparse.Namespace) -> int:
     actor = a.actor or "human"
     hypothesis = a.hypothesis
     design = a.design
+    subset = a.subset
     if a.args_json:
         payload = json.loads(Path(a.args_json).read_text(encoding="utf-8"))
         contrast = contrast or payload.get("contrast") or None
         actor = payload.get("actor") or actor
         hypothesis = hypothesis or payload.get("hypothesis") or None
         design = design or payload.get("design") or None
+        subset = subset or payload.get("subset") or None
     if not contrast:
         _err("--contrast is required (via CLI flags or --args-json)")
         return EXIT_ERROR
 
     try:
         out = run_query(a.state_dir, contrast, actor, a.out_table, a.out_verdict, hypothesis, a.mode,
-                        a.out_state_archive, a.alpha_budget, a.n_perm, out_report=a.out_report, design=design)
+                        a.out_state_archive, a.alpha_budget, a.n_perm, out_report=a.out_report, design=design,
+                        subset=subset)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         _err(str(exc))
         return EXIT_ERROR
@@ -599,6 +602,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--actor", default="human", help="audit tag recorded in the statistical test ledger (default: human)")
     q.add_argument("--hypothesis", help="specific gene ID or chromosome/region to test (default: top hit)")
     q.add_argument("--design", help="optional statistical model formula override for ExpressionLoop queries")
+    q.add_argument("--subset", help="optional space-separated sample filter clauses like 'plate_id=P1 timepoint=60m'")
     q.add_argument("--mode", choices=("auto", "contrast", "fst"), default="auto")
     q.add_argument("--alpha-budget", type=float, default=0.05)
     q.add_argument("--n-perm", type=int, default=199)

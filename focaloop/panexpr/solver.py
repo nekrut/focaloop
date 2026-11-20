@@ -857,12 +857,35 @@ def run_pydeseq2(
     meta_aligned = meta.loc[counts.index].copy()
     keep = counts.sum(axis=0) >= min_total
     sub = counts.loc[:, keep].round().astype(int)
-    dds = DeseqDataSet(counts=sub, metadata=meta_aligned, design=design, refit_cooks=True, quiet=True, n_cpus=n_cpus)
+    nonzero_samples = sub.sum(axis=1) > 0
+    if not bool(nonzero_samples.all()):
+        dropped = list(sub.index[~nonzero_samples])
+        sub = sub.loc[nonzero_samples]
+        meta_aligned = meta_aligned.loc[nonzero_samples]
+        factor, lvl_a, lvl_b = contrast
+        rem_lvls = set(meta_aligned[factor].astype(str)) if factor in meta_aligned.columns else set()
+        if lvl_a not in rem_lvls or lvl_b not in rem_lvls:
+            raise ValueError(
+                f"Dropped {len(dropped)} zero-count sample(s) ({', '.join(map(str, dropped[:5]))}), "
+                f"leaving contrast {factor}:{lvl_a}:{lvl_b} without samples in one or both groups."
+            )
+    # PyDESeq2 'ratio' silently falls back to N-dimensional Powell optimization when every gene
+    # has >=1 zero (virtually guaranteed at 500-1,000 samples), which hangs on 1 CPU; use 'poscounts'.
+    sf_fit_type = "poscounts" if (not sub.empty and bool((sub == 0).any(axis=0).all())) else "ratio"
+    dds = DeseqDataSet(
+        counts=sub,
+        metadata=meta_aligned,
+        design=design,
+        refit_cooks=True,
+        quiet=True,
+        n_cpus=n_cpus,
+        size_factors_fit_type=sf_fit_type,
+    )
     dds.deseq2()
     ds = DeseqStats(dds, contrast=contrast, alpha=0.05, cooks_filter=False, independent_filter=True, quiet=True, n_cpus=n_cpus)
     ds.summary()
     disp = pd.Series(np.asarray(dds.var["dispersions"]), index=dds.var_names)
-    sf = pd.Series(np.asarray(dds.obs["size_factors"]), index=dds.obs_names)
+    sf = pd.Series(np.asarray(dds.obs["size_factors"]), index=dds.obs_names).reindex(counts.index).fillna(1.0)
     return ds.results_df.copy(), disp, sf
 
 
