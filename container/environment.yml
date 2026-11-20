@@ -1,4 +1,4 @@
-# Pinned conda environment for ghcr.io/nekrut/focaloop:0.3.0
+# Pinned conda environment for Focaloop 0.4.0 (ghcr.io/nekrut/focaloop:0.4.0 / focaloop_0.4.0.sif)
 name: focaloop
 channels:
   - conda-forge
@@ -22,16 +22,16 @@ dependencies:
   - zstandard
   - bwa=0.7.19
   - bwa-mem2=2.2.1
-  - strobealign=0.14.0
-  - minimap2=2.28
-  - bowtie2=2.5.4
-  - hisat2=2.2.1
-  - salmon=1.10.3
-  - piscem>=0.10.3
+  - strobealign>=0.14.0
+  - minimap2>=2.28
+  - bowtie2>=2.5.4
+  - hisat2>=2.2.1
+  - salmon>=1.10.3
+  - piscem>=0.25.0
   - kallisto
-  - samtools=1.21
-  - bcftools=1.21
-  - htslib=1.21
+  - samtools>=1.21
+  - bcftools>=1.21
+  - htslib>=1.21
   - miniprot
   - diamond
   - tantan
@@ -46,4 +46,5 @@ dependencies:
   - curl
   - zstd
   - pip
-# xsra (Tier-2 SRA decoder, `xsra dump -Q -P https`) and themisto can be added from release binaries.
+# xsra (0.2.29, built from crates.io in builder stage) and themisto (v3.2.2 release binary)
+# are installed alongside this environment in container/Dockerfile and container/Apptainer.def.

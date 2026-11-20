@@ -1,8 +1,36 @@
 Bootstrap: docker
-From: mambaorg/micromamba:2.0.5-ubuntu24.04
+From: ubuntu:24.04
+Stage: xsra_builder
 
-# Build from repository root (with optional staged cluster assets under $PWD/cluster_assets/):
-#   APPTAINER_TMPDIR=/tmp apptainer build focaloop_proto_0.3.0.sif container/Apptainer.def
+# Standalone multi-stage Apptainer definition for Focaloop 0.4.0 (usegalaxy.org / CVMFS ready).
+# Build from repository root with zero host-staged dependencies:
+#   APPTAINER_TMPDIR=/tmp apptainer build focaloop_0.4.0.sif container/Apptainer.def
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git build-essential cmake pkg-config \
+        clang libclang-dev flex bison libssl-dev zlib1g-dev libbz2-dev
+    rm -rf /var/lib/apt/lists/*
+    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    export PATH="/root/.cargo/bin:$PATH"
+    cargo install --locked xsra --version 0.2.29 --root /usr/local
+    /usr/local/bin/xsra --version
+
+Bootstrap: docker
+From: mambaorg/micromamba:2.0.5-ubuntu24.04
+Stage: runtime
+
+%labels
+    Title focaloop
+    Version 0.4.0
+    Description Adaptive streaming genomics tools for ExpressionLoop, VariationLoop, GeneLoop, and Focaloop Query
+    Source https://github.com/nekrut/focaloop
+    License MIT
+
+%files from xsra_builder
+    /usr/local/bin/xsra /usr/local/bin/xsra
 
 %files
     container/environment.yml /opt/focaloop/environment.yml
@@ -16,72 +44,83 @@ From: mambaorg/micromamba:2.0.5-ubuntu24.04
     blueprints/focaloop_bait/blueprint.focaloop.yml /opt/focaloop/blueprints/focaloop_bait/blueprint.focaloop.yml
 
 %environment
-    export PATH="/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH"
+    export PATH="/opt/focaloop/native_cache:/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH"
     export FOCALOOP_BLUEPRINT_PATH="/opt/focaloop/blueprints"
     export FOCALOOP_NATIVE_DIR="/opt/focaloop/native_cache"
     export FOCALOOP_NATIVE_CACHE="/opt/focaloop/native_cache"
+    export FOCALOOP_BIN_CACHE="/opt/focaloop/native_cache"
     export FOCALOOP_PORTABLE_ISA="1"
-    export S="/opt/focaloop/pf3d7_ref"
-    export FOCALOOP_PF3D7_DIR="/opt/focaloop/pf3d7_ref/ref"
-    export MALARIAVAR_PLA_SIEVE="/opt/focaloop/pf3d7_ref/ref/pf_pla_sieve.pla"
-    export TIBERIUS_WEIGHTS_DIR="/data/galaxy_local/refdata/tiberius_weights"
+    export TIBERIUS_WEIGHTS_DIR="/opt/focaloop/tiberius_weights"
     export TF_USE_LEGACY_KERAS="0"
     export PANEXPR_DESEQ2_CPUS="1"
     export PYTHONDONTWRITEBYTECODE="1"
 
 %post
     set -eux
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update && apt-get install -y --no-install-recommends \
-        iproute2 ca-certificates git gcc libc6-dev libgomp1 \
-        && rm -rf /var/lib/apt/lists/*
+        iproute2 ca-certificates curl git gcc libc6-dev libgomp1
+    rm -rf /var/lib/apt/lists/*
+
+    chmod 0755 /usr/local/bin/xsra
     export MAMBA_ROOT_PREFIX=/opt/conda
     micromamba install -y -n base -f /opt/focaloop/environment.yml
     micromamba clean --all --yes
     export PATH="/opt/conda/bin:$PATH"
 
-    # Optional cluster-staged external binaries & Pf3D7 reference assets if mounted under /opt/focaloop/stage
-    if [ -x /opt/focaloop/stage/bin_extra/piscem ]; then
-        cp -f /opt/focaloop/stage/bin_extra/piscem /opt/conda/bin/piscem
-        chmod 0755 /opt/conda/bin/piscem
-    fi
-    if [ -x /opt/focaloop/stage/bin_extra/xsra ]; then
-        cp -f /opt/focaloop/stage/bin_extra/xsra /opt/conda/bin/xsra
-        chmod 0755 /opt/conda/bin/xsra
-    fi
-    if [ -x /opt/focaloop/stage/themisto ]; then
-        mkdir -p /opt/themisto
-        cp -f /opt/focaloop/stage/themisto /opt/themisto/themisto
-        chmod 0755 /opt/themisto/themisto
-        printf '#!/bin/sh\nLD_LIBRARY_PATH=/opt/conda/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec /opt/themisto/themisto "$@"\n' > /opt/conda/bin/themisto
-        chmod 0755 /opt/conda/bin/themisto
-    fi
+    # Install prebuilt Themisto v3.2.2 Linux binary
+    mkdir -p /opt/themisto
+    curl -sSL --fail --retry 5 \
+        "https://github.com/algbio/themisto/releases/download/v3.2.2/themisto_linux-v3.2.2.tar.gz" \
+        -o /tmp/themisto.tar.gz
+    tar -xzf /tmp/themisto.tar.gz -C /tmp
+    cp -f /tmp/themisto_linux-v3.2.2/themisto /opt/themisto/themisto
+    chmod 0755 /opt/themisto/themisto
+    printf '#!/bin/sh\nLD_LIBRARY_PATH=/opt/conda/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec /opt/themisto/themisto "$@"\n' > /opt/conda/bin/themisto
+    chmod 0755 /opt/conda/bin/themisto
+    rm -rf /tmp/themisto.tar.gz /tmp/themisto_linux-v3.2.2
 
-    # Install CPU TensorFlow + Tiberius v2.0.9 runtime (--no-deps on bricks2marble/hidten to avoid PyPI CUDA wheels)
+    # Install CPU-only TensorFlow + Tiberius v2.0.9 runtime
     export TF_USE_LEGACY_KERAS="0"
     python -m pip install --no-cache-dir --no-deps "bricks2marble==0.1.1" "hidten==1.0.0"
     python -m pip install --no-cache-dir "tensorflow-cpu>=2.17,<2.21" "keras==3.15.1" "rich==13.9.4" "pydantic>=2.0"
-    if [ -d /opt/focaloop/stage/Tiberius ]; then
-        cp -a /opt/focaloop/stage/Tiberius /opt/Tiberius
-    else
-        git clone --depth 1 --branch v2.0.9 https://github.com/Gaius-Augustus/Tiberius.git /opt/Tiberius \
-            || git clone --depth 1 https://github.com/Gaius-Augustus/Tiberius.git /opt/Tiberius
-    fi
+    git clone --depth 1 --branch v2.0.9 https://github.com/Gaius-Augustus/Tiberius.git /opt/Tiberius
     (cd /opt/Tiberius && python -m pip install --no-deps --no-cache-dir .)
     chmod +x /opt/Tiberius/tiberius.py /opt/Tiberius/tiberius/*.py
 
-    mkdir -p /opt/focaloop/native_cache /opt/focaloop/pf3d7_ref/ref
+    # Bundle all 7 official Tiberius v2 clade weight packs (~195 MB total) so GeneLoop works offline
+    mkdir -p /opt/focaloop/tiberius_weights
+    unpack_weights() {
+        url="$1"; dest="$2"
+        mkdir -p /tmp/tw_stage; rm -rf /tmp/tw_stage/*
+        curl -sSL --fail --retry 5 "$url" -o /tmp/tw.tar.gz
+        tar -xzf /tmp/tw.tar.gz -C /tmp/tw_stage
+        src_dir="$(find /tmp/tw_stage -maxdepth 3 \( -name weights.h5 -o -name model_config.json \) -printf '%h\n' | head -n 1)"
+        test -n "$src_dir"
+        rm -rf "/opt/focaloop/tiberius_weights/$dest"
+        mv "$src_dir" "/opt/focaloop/tiberius_weights/$dest"
+        rm -rf /tmp/tw.tar.gz /tmp/tw_stage
+    }
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/tiberius_nosm_weights_v2.tar.gz" "tiberius_nosm_weights_v2"
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/vertebrates_weights.tar.gz" "vertebrates_weights"
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/insecta_unmasked_v2.tar.gz" "insecta_unmasked_v2"
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/angiosperms.tar.gz" "angiosperms_weights"
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/fungi.tar.gz" "fungi_weights"
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/chlorophyta.tar.gz" "chlorophyta_weights"
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/diatoms_unmasked.tar.gz" "diatoms_weights"
+
+    # Install Focaloop 0.4.0 and precompile all portable (-msse4.2 -mpopcnt) C99/OpenMP binaries & libs
+    mkdir -p /opt/focaloop/native_cache
     python -m pip install --no-deps --no-cache-dir /opt/focaloop/src
 
-    # Portable -O3 -msse4.2 -mpopcnt so mixed Slurm partitions (Ivy Bridge + Cascade Lake) never SIGILL
     export FOCALOOP_PORTABLE_ISA="1"
     export FOCALOOP_BUILD_NATIVE_DIR="/opt/focaloop/native_cache"
     export FOCALOOP_NATIVE_CACHE="/opt/focaloop/native_cache"
     export FOCALOOP_NATIVE_DIR="/opt/focaloop/native_cache"
+    export FOCALOOP_BIN_CACHE="/opt/focaloop/native_cache"
     export FOCALOOP_BLUEPRINT_PATH="/opt/focaloop/blueprints"
-    export S="/opt/focaloop/pf3d7_ref"
-    export FOCALOOP_PF3D7_DIR="/opt/focaloop/pf3d7_ref/ref"
-    export MALARIAVAR_PLA_SIEVE="/opt/focaloop/pf3d7_ref/ref/pf_pla_sieve.pla"
-    export PATH="/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH"
+    export TIBERIUS_WEIGHTS_DIR="/opt/focaloop/tiberius_weights"
+    export PATH="/opt/focaloop/native_cache:/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH"
     export NUMBA_CACHE_DIR="/tmp/build_numba_cache"
 
     python -c "
@@ -89,24 +128,46 @@ from focaloop.galaxy_runners import prebuild_all_native_libs
 libs = prebuild_all_native_libs()
 print('Native libs count:', len(libs), sorted(libs))
 "
-    if [ -f /opt/focaloop/pf3d7_ref/ref/Pf3D7_v54.fa ]; then
-        python -c "
-from focaloop.malariavar import genome as G, prepare as P
-g = G.load()
-print('Pf3D7 genome loaded: L=', g.L)
-meta = P.build_pla_sieve(num_threads=8)
-print('PLA depletion built:', meta['total_mb'], 'MB')
-"
-        bwa index /opt/focaloop/pf3d7_ref/ref/Pf3D7_v54.fa
-        bwa-mem2 index /opt/focaloop/pf3d7_ref/ref/Pf3D7_v54.fa
-    fi
     rm -rf /tmp/build_numba_cache
-    chmod -R a+rX /opt/focaloop /opt/conda /opt/Tiberius
+    chmod -R a+rX /opt/focaloop /opt/conda /opt/Tiberius /opt/themisto
 
+    # Build-time smoke verification: CLI, blueprints, native C tiling, Tiberius + all 7 weights, aligners & tools
     focaloop --version
     focaloop validate panexpr malariavar geneloop focaloop_query focaloop_bait
+    xsra --version
     tiberius.py --help >/dev/null
-    python -c "from focaloop.geneloop.seed import detect_tiberius_runtime; rt = detect_tiberius_runtime(); assert rt['backend'] == 'native', rt"
+    python -c "
+import subprocess
+from focaloop.geneloop.seed import detect_tiberius_runtime, discover_tiberius_weights
+from focaloop.malariavar.logan_var import ensure_var_logan_bins
+rt = detect_tiberius_runtime()
+assert rt['backend'] == 'native', rt
+models = ('mammalia_nosofttmasking_v2','vertebrates','insecta','angiosperms','fungi','chlorophyta','diatoms')
+found = {m: discover_tiberius_weights(m) for m in models}
+assert all(found.values()), found
+prep, pile = ensure_var_logan_bins()
+r = subprocess.run([str(prep),'1.5','0','-','0','0','3.0'], input='>0 ka:f:12.0'+chr(10)+('ACGT'*8500)+chr(10), capture_output=True, text=True, check=True)
+tiles = [ln for ln in r.stdout.splitlines() if ln.startswith('>')]
+assert len(tiles) >= 16 and 'c' in tiles[0], tiles[:3]
+print('FOCALOOP_040_SIF_VERIFIED_OK', len(found), prep, len(tiles))
+"
+    (bwa 2>&1 | grep -q '^Version: 0.7')
+    bwa-mem2 version
+    strobealign --version
+    minimap2 --version
+    bowtie2 --version
+    hisat2 --version
+    salmon --version
+    piscem --version
+    kallisto version
+    samtools --version
+    bcftools --version
+    miniprot --version
+    diamond version
+    stringtie --version
+    compleasm -h >/dev/null
+    test -x /opt/themisto/themisto
+    test -x /opt/conda/bin/themisto
 
 %runscript
     exec focaloop "$@"
