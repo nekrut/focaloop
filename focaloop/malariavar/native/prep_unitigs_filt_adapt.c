@@ -13,6 +13,38 @@
 #define KMASK ((1U << (2 * K)) - 1U)
 #define BITSET_BYTES (1ULL << (2 * K - 3)) /* 128 MiB: 2^30 bits */
 #define CAL_LIMIT 150000
+#define MAX_TILE_LEN 2000
+#define TILE_OVERLAP 30
+#define MIN_TILE_TAIL 500
+
+/*
+ * Emit a unitig, tiling sequences longer than MAX_TILE_LEN + MIN_TILE_TAIL into
+ * overlapping chunks (TILE_OVERLAP = 30 bp) so bwa-mem2 never hits its >32 kb
+ * signed-16-bit SIGSEGV or quadratic DP slowdown, while midpoint_only=1 (15 bp
+ * trim each side) still counts every interior base of the unitig exactly once.
+ */
+static void emit_unitig_tiled(FILE *out, long long uid, long long ka100, const char *s, size_t slen) {
+    if (slen <= (size_t)(MAX_TILE_LEN + MIN_TILE_TAIL)) {
+        fprintf(out, ">%lld_%lld\n", uid, ka100);
+        fwrite(s, 1, slen, out);
+        fputc('\n', out);
+        return;
+    }
+    size_t pos = 0;
+    int ci = 0;
+    while (pos < slen) {
+        size_t end = pos + (size_t)MAX_TILE_LEN;
+        if (end >= slen || (slen - end) <= (size_t)MIN_TILE_TAIL) {
+            end = slen;
+        }
+        fprintf(out, ">%lldc%d_%lld\n", uid, ci, ka100);
+        fwrite(s + pos, 1, end - pos, out);
+        fputc('\n', out);
+        if (end >= slen) break;
+        pos = end - (size_t)TILE_OVERLAP;
+        ci++;
+    }
+}
 
 static const uint8_t ENC[256] = {
     4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4, 4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
@@ -171,9 +203,7 @@ int main(int argc, char **argv) {
                 } else { \
                     long long ka100 = llround(_r->ka * 100.0); \
                     if (ka100 < 1) ka100 = 1; \
-                    fprintf(stdout, ">%lld_%lld\n", _r->uid, ka100); \
-                    fwrite(cal_seqs + _r->seq_off, 1, _r->slen, stdout); \
-                    fputc('\n', stdout); \
+                    emit_unitig_tiled(stdout, _r->uid, ka100, cal_seqs + _r->seq_off, _r->slen); \
                     kept_u++; kept_bp += (long long)_r->slen; w_bp += _r->ka * (double)_r->slen; \
                 } \
             } \
@@ -210,7 +240,7 @@ int main(int argc, char **argv) {
                 } else { \
                     long long ka100 = llround(ka * 100.0); \
                     if (ka100 < 1) ka100 = 1; \
-                    fprintf(stdout, ">%lld_%lld\n%s\n", n_u - 1, ka100, seq); \
+                    emit_unitig_tiled(stdout, n_u - 1, ka100, seq, slen); \
                     kept_u++; kept_bp += (long long)slen; w_bp += ka * (double)slen; \
                 } \
             } else { \

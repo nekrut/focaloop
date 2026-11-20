@@ -21,6 +21,7 @@ import pandas as pd
 from ..logan import logan_unitigs_url
 
 _COMPILE_LOCK = threading.Lock()
+_INDEX_LOCK = threading.Lock()
 
 
 def _bin_cache_dir() -> Path:
@@ -85,25 +86,30 @@ def ensure_var_aligner_index(aligner_name: str, aligner_bin: str, ref_fa: Path, 
         if marker.is_file() and marker.stat().st_size > 0:
             return ref_fa
         idx_fa = work_dir / "logan_idx" / ref_fa.name
-        idx_fa.parent.mkdir(parents=True, exist_ok=True)
-        if not idx_fa.exists():
-            os.symlink(ref_fa.resolve(), idx_fa)
-        if not Path(str(idx_fa) + ".bwt.2bit.64").is_file():
-            t0 = time.time()
-            log(f"Building bwa-mem2 reference index for Logan unitigs ({ref_fa.stat().st_size / 1e6:.1f} MB)...")
-            subprocess.run([aligner_bin, "index", str(idx_fa)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            log(f"bwa-mem2 index ready in {time.time() - t0:.1f}s")
+        with _INDEX_LOCK:
+            idx_fa.parent.mkdir(parents=True, exist_ok=True)
+            if not idx_fa.exists():
+                os.symlink(ref_fa.resolve(), idx_fa)
+            if not Path(str(idx_fa) + ".bwt.2bit.64").is_file():
+                t0 = time.time()
+                log(f"Building bwa-mem2 reference index for Logan unitigs ({ref_fa.stat().st_size / 1e6:.1f} MB)...")
+                subprocess.run([aligner_bin, "index", str(idx_fa)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                log(f"bwa-mem2 index ready in {time.time() - t0:.1f}s")
         return idx_fa
     if aligner_name == "bwa":
         marker = Path(str(ref_fa) + ".bwt")
         if marker.is_file() and marker.stat().st_size > 0:
             return ref_fa
         idx_fa = work_dir / "logan_idx" / ref_fa.name
-        idx_fa.parent.mkdir(parents=True, exist_ok=True)
-        if not idx_fa.exists():
-            os.symlink(ref_fa.resolve(), idx_fa)
-        if not Path(str(idx_fa) + ".bwt").is_file():
-            subprocess.run([aligner_bin, "index", str(idx_fa)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with _INDEX_LOCK:
+            idx_fa.parent.mkdir(parents=True, exist_ok=True)
+            if not idx_fa.exists():
+                os.symlink(ref_fa.resolve(), idx_fa)
+            if not Path(str(idx_fa) + ".bwt").is_file():
+                t0 = time.time()
+                log(f"Building bwa reference index for Logan unitigs ({ref_fa.stat().st_size / 1e6:.1f} MB)...")
+                subprocess.run([aligner_bin, "index", str(idx_fa)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                log(f"bwa index ready in {time.time() - t0:.1f}s")
         return idx_fa
     return ref_fa
 
@@ -289,6 +295,7 @@ def run_varloop_logan_unitigs(
     sample_work.mkdir(parents=True, exist_ok=True)
     cand_tsv = sample_work / "candidates.tsv"
     prep_err = sample_work / "prep.err"
+    aln_err = sample_work / "aln.err"
     pile_err = sample_work / "pile.err"
 
     bit_arg = str(k15_bit) if (k15_bit is not None and k15_bit.is_file()) else "-"
@@ -296,95 +303,125 @@ def run_varloop_logan_unitigs(
     relax_ka = "5.0" if bit_arg != "-" else "0"
     bed_arg = str(targets_bed) if (targets_bed is not None and targets_bed.is_file()) else "-"
 
-    if aligner_name in ("bwa-mem2", "bwa"):
-        aln_cmd = [aligner_bin, "mem", "-k", "15", "-T", "22", "-t", str(max(1, threads)), str(idx_ref), "-"]
-    else:
-        aln_cmd = [aligner_bin, "-x", "sr", "-k", "15", "-w", "5", "-a", "-t", str(max(1, threads)), str(idx_ref), "-"]
+    def _build_aln_cmd(a_name: str, a_bin: str, a_idx: Path) -> list[str]:
+        if a_name in ("bwa-mem2", "bwa"):
+            return [a_bin, "mem", "-k", "15", "-T", "22", "-t", str(max(1, threads)), str(a_idx), "-"]
+        return [a_bin, "-x", "sr", "-k", "15", "-w", "5", "-a", "-t", str(max(1, threads)), str(a_idx), "-"]
 
-    wire_bytes = 0
-    procs: list[subprocess.Popen] = []
+    def _run_pipeline(a_name: str, a_bin: str, a_idx: Path) -> tuple[list[int], int]:
+        aln_cmd = _build_aln_cmd(a_name, a_bin, a_idx)
+        wbytes = 0
+        procs: list[subprocess.Popen] = []
 
-    def _pipe_and_count(src_stream, dst_stream) -> None:
-        nonlocal wire_bytes
-        try:
-            while True:
-                chunk = src_stream.read(1 << 18)
-                if not chunk:
-                    break
-                wire_bytes += len(chunk)
-                dst_stream.write(chunk)
-        finally:
+        def _pipe_and_count(src_stream, dst_stream) -> None:
+            nonlocal wbytes
             try:
-                dst_stream.close()
-            except Exception:
-                pass
+                while True:
+                    chunk = src_stream.read(1 << 18)
+                    if not chunk:
+                        break
+                    wbytes += len(chunk)
+                    dst_stream.write(chunk)
+            finally:
+                try:
+                    dst_stream.close()
+                except Exception:
+                    pass
 
-    with open(prep_err, "wb") as f_perr, open(pile_err, "wb") as f_lerr:
-        p_decomp: subprocess.Popen | None = None
-        feeder: threading.Thread | None = None
-        if local_unitigs_path is not None:
-            lp = Path(local_unitigs_path)
-            wire_bytes = lp.stat().st_size
-            with open(lp, "rb") as fh:
-                magic = fh.read(4)
-            if magic == b"\x28\xb5\x2f\xfd":
-                p_decomp = subprocess.Popen(["zstd", "-dc", str(lp)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                prep_stdin = p_decomp.stdout
-                procs.append(p_decomp)
-            elif magic[:2] == b"\x1f\x8b":
-                p_decomp = subprocess.Popen(["gzip", "-dc", str(lp)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                prep_stdin = p_decomp.stdout
-                procs.append(p_decomp)
+        with open(prep_err, "wb") as f_perr, open(aln_err, "wb") as f_aerr, open(pile_err, "wb") as f_lerr:
+            p_decomp: subprocess.Popen | None = None
+            feeder: threading.Thread | None = None
+            if local_unitigs_path is not None:
+                lp = Path(local_unitigs_path)
+                wbytes = lp.stat().st_size
+                with open(lp, "rb") as fh:
+                    magic = fh.read(4)
+                if magic == b"\x28\xb5\x2f\xfd":
+                    p_decomp = subprocess.Popen(["zstd", "-dc", str(lp)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    prep_stdin = p_decomp.stdout
+                    procs.append(p_decomp)
+                elif magic[:2] == b"\x1f\x8b":
+                    p_decomp = subprocess.Popen(["gzip", "-dc", str(lp)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    prep_stdin = p_decomp.stdout
+                    procs.append(p_decomp)
+                else:
+                    prep_stdin = open(lp, "rb")
             else:
-                prep_stdin = open(lp, "rb")
-        else:
-            url = logan_unitigs_url(acc)
-            p_curl = subprocess.Popen(
-                ["curl", "-4", "-sSL", "--fail", "--retry", "5", "--retry-delay", "2", "--max-time", "600", url],
+                url = logan_unitigs_url(acc)
+                p_curl = subprocess.Popen(
+                    ["curl", "-4", "-sSL", "--fail", "--retry", "5", "--retry-delay", "2", "--max-time", "600", url],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                p_decomp = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                procs.extend([p_curl, p_decomp])
+                feeder = threading.Thread(target=_pipe_and_count, args=(p_curl.stdout, p_decomp.stdin), daemon=True)
+                feeder.start()
+                prep_stdin = p_decomp.stdout
+
+            p_prep = subprocess.Popen(
+                [str(prep_bin), str(min_ka_mode), "0", bit_arg, min_hits, relax_ka, str(max_ka_adapt)],
+                stdin=prep_stdin,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=f_perr,
             )
-            p_decomp = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            procs.extend([p_curl, p_decomp])
-            feeder = threading.Thread(target=_pipe_and_count, args=(p_curl.stdout, p_decomp.stdin), daemon=True)
-            feeder.start()
-            prep_stdin = p_decomp.stdout
+            p_aln = subprocess.Popen(
+                aln_cmd,
+                stdin=p_prep.stdout,
+                stdout=subprocess.PIPE,
+                stderr=f_aerr,
+            )
+            p_pile = subprocess.Popen(
+                [str(pile_bin), str(ref_fa), bed_arg, str(cand_tsv), str(int(min_mapq)), "0.12", "1"],
+                stdin=p_aln.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=f_lerr,
+            )
+            procs.extend([p_prep, p_aln, p_pile])
 
-        p_prep = subprocess.Popen(
-            [str(prep_bin), str(min_ka_mode), "0", bit_arg, min_hits, relax_ka, str(max_ka_adapt)],
-            stdin=prep_stdin,
-            stdout=subprocess.PIPE,
-            stderr=f_perr,
-        )
-        p_aln = subprocess.Popen(
-            aln_cmd,
-            stdin=p_prep.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        p_pile = subprocess.Popen(
-            [str(pile_bin), str(ref_fa), bed_arg, str(cand_tsv), str(int(min_mapq)), "0.12", "1"],
-            stdin=p_aln.stdout,
-            stdout=subprocess.DEVNULL,
-            stderr=f_lerr,
-        )
-        procs.extend([p_prep, p_aln, p_pile])
+            if p_decomp is not None and p_decomp.stdout is not None:
+                p_decomp.stdout.close()
+            elif local_unitigs_path is not None and hasattr(prep_stdin, "close"):
+                prep_stdin.close()
+            if p_prep.stdout is not None:
+                p_prep.stdout.close()
+            if p_aln.stdout is not None:
+                p_aln.stdout.close()
 
-        if p_decomp is not None and p_decomp.stdout is not None:
-            p_decomp.stdout.close()
-        elif local_unitigs_path is not None and hasattr(prep_stdin, "close"):
-            prep_stdin.close()
-        if p_prep.stdout is not None:
-            p_prep.stdout.close()
-        if p_aln.stdout is not None:
-            p_aln.stdout.close()
+            if feeder is not None:
+                feeder.join()
+            return [p.wait() for p in procs], wbytes
 
-        if feeder is not None:
-            feeder.join()
-        rcs = [p.wait() for p in procs]
-        if any(rc != 0 for rc in rcs):
-            pile_msg = pile_err.read_text(encoding="utf-8", errors="replace").strip()
-            raise RuntimeError(f"Logan VariationLoop stream failed for {sample} ({acc}): exit_codes={rcs} {pile_msg}")
+    rcs, wire_bytes = _run_pipeline(aligner_name, aligner_bin, idx_ref)
+    # Retry once on transient curl network failure (e.g. partial transfer / timeout / reset)
+    if local_unitigs_path is None and len(rcs) == 5 and rcs[0] in (18, 28, 35, 52, 56, 92):
+        log(f"Transient Logan download error for {sample} ({acc}, curl rc={rcs[0]}), retrying once...")
+        time.sleep(2.0)
+        rcs, wire_bytes = _run_pipeline(aligner_name, aligner_bin, idx_ref)
+    # Fallback to classic bwa if bwa-mem2 crashes with a signal under auto mapper selection
+    aln_rc_idx = len(rcs) - 2
+    if (
+        any(rc != 0 for rc in rcs)
+        and aln_rc_idx >= 0
+        and rcs[aln_rc_idx] < 0
+        and aligner_name == "bwa-mem2"
+        and mapper == "auto"
+        and shutil.which("bwa")
+    ):
+        bwa_bin = shutil.which("bwa")
+        assert bwa_bin is not None
+        log(f"bwa-mem2 exited with signal {rcs[aln_rc_idx]} on {sample} ({acc}), retrying with classic bwa...")
+        aligner_name, aligner_bin = "bwa", bwa_bin
+        idx_ref = ensure_var_aligner_index(aligner_name, aligner_bin, ref_fa, work_dir, log)
+        rcs, wire_bytes = _run_pipeline(aligner_name, aligner_bin, idx_ref)
+
+    if any(rc != 0 for rc in rcs):
+        pile_msg = pile_err.read_text(encoding="utf-8", errors="replace").strip()
+        aln_tail = " | ".join(aln_err.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-4:])
+        raise RuntimeError(
+            f"Logan VariationLoop stream failed for {sample} ({acc}): exit_codes={rcs} {pile_msg}"
+            + (f" aln_err={aln_tail}" if aln_tail else "")
+        )
 
     prep_m: dict[str, Any] = {}
     pile_m: dict[str, Any] = {}

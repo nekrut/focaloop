@@ -876,9 +876,13 @@ def render_variationloop_report(
     else:
         tel_rows = sample_telemetry or []
         n_samp = len(tel_rows) if tel_rows else int(variants_df["sample_id"].nunique() if not variants_df.empty else 0)
-        n_tot = len(variants_df)
-        n_snv = int((variants_df["kind"] == "SNV").sum()) if ("kind" in variants_df.columns and not variants_df.empty) else 0
-        n_indel = n_tot - n_snv
+        n_tot = int(summary_stats.get("n_variants", len(variants_df)))
+        if "n_snv" in summary_stats:
+            n_snv = int(summary_stats["n_snv"])
+            n_indel = int(summary_stats.get("n_indel", max(0, n_tot - n_snv)))
+        else:
+            n_snv = int((variants_df["kind"] == "SNV").sum()) if ("kind" in variants_df.columns and not variants_df.empty) else 0
+            n_indel = max(0, n_tot - n_snv)
         n_asm = sum(int(t.get("n_omnitig_assembled", 0) or 0) for t in tel_rows)
         n_dup = sum(int(t.get("pcr_dups_skipped", 0) or 0) for t in tel_rows)
         acc_mb = sum(float(t.get("acc_total_bytes", 0) or 0) for t in tel_rows) / 1e6
@@ -928,7 +932,7 @@ def render_variationloop_report(
     </table>
   </div>
   <div class="section">
-    <h2>Variant Calls Preview ({min(len(variants_df), 50)} of {len(variants_df):,})</h2>
+    <h2>Variant Calls Preview ({min(len(variants_df), 50)} of {n_tot:,})</h2>
     <table>
       <thead><tr><th>Sample</th><th>Locus</th><th>Alleles</th><th>Type</th><th>GT</th><th class="num">QUAL</th><th class="num">DP</th><th class="num">AD</th><th>Source</th></tr></thead>
       <tbody>{''.join(var_html) or '<tr><td colspan="9">No variants called above quality thresholds.</td></tr>'}</tbody>
@@ -1580,7 +1584,6 @@ def run_variationloop_galaxy(
         )
         chosen_mapper: str | None = None
         sample_tels: list[dict[str, Any]] = []
-        var_frames: list[pd.DataFrame] = []
         per_sample_vcfs: list[Path] = []
         used_engines: set[str] = set()
         p_frac = float(np.clip(subsample_fraction, 1e-4, 1.0))
@@ -1673,7 +1676,7 @@ def run_variationloop_galaxy(
             else:
                 other_indexed.append((idx_j, job, s_vcf_gz))
 
-        results_by_idx: dict[int, tuple[dict[str, Any], Path, pd.DataFrame]] = {}
+        results_by_idx: dict[int, tuple[dict[str, Any], Path, str]] = {}
         log_lock = threading.Lock()
 
         if logan_indexed:
@@ -1687,7 +1690,7 @@ def run_variationloop_galaxy(
                     f"({logan_per_threads} aligner threads/worker)"
                 )
 
-            def _run_logan_item(item: tuple[int, dict[str, Any], Path]) -> tuple[int, dict[str, Any], Path, pd.DataFrame]:
+            def _run_logan_item(item: tuple[int, dict[str, Any], Path]) -> tuple[int, dict[str, Any], Path, str]:
                 idx_j, job, s_vcf_gz = item
                 sid = job["sample"]
                 src = job["src"]
@@ -1709,24 +1712,23 @@ def run_variationloop_galaxy(
                     indel_min_qual=float(indel_min_qual),
                     min_ka_mode=str(logan_min_ka or "adapt"),
                     local_unitigs_path=local_u,
-                    log=lambda m: None,
+                    log=lambda m: _log(f"  [{idx_j}/{len(jobs)}] {m}"),
                 )
-                df_s = _vcf_to_dataframe(s_vcf_gz, sample_override=sid)
                 with log_lock:
                     _log(
                         f"  [{idx_j}/{len(jobs)}] {sid} (Logan): {tel.get('n_variants', 0)} variants, "
                         f"{tel.get('wire_bytes', 0) / 1e6:.2f} MB wire ({tel.get('wall_s', 0):.2f}s)"
                     )
-                return idx_j, tel, s_vcf_gz, df_s
+                return idx_j, tel, s_vcf_gz, sid
 
             if logan_workers > 1:
                 with ThreadPoolExecutor(max_workers=logan_workers) as ex:
-                    for idx_j, tel, s_vcf_gz, df_s in ex.map(_run_logan_item, logan_indexed):
-                        results_by_idx[idx_j] = (tel, s_vcf_gz, df_s)
+                    for idx_j, tel, s_vcf_gz, sid in ex.map(_run_logan_item, logan_indexed):
+                        results_by_idx[idx_j] = (tel, s_vcf_gz, sid)
             else:
                 for item in logan_indexed:
-                    idx_j, tel, s_vcf_gz, df_s = _run_logan_item(item)
-                    results_by_idx[idx_j] = (tel, s_vcf_gz, df_s)
+                    idx_j, tel, s_vcf_gz, sid = _run_logan_item(item)
+                    results_by_idx[idx_j] = (tel, s_vcf_gz, sid)
             used_engines.add("logan_unitigs")
 
         for idx_j, job, s_vcf_gz in other_indexed:
@@ -1821,24 +1823,94 @@ def run_variationloop_galaxy(
                     mapper_name=chosen_mapper,
                 )
 
-            results_by_idx[idx_j] = (tel, s_vcf_gz, _vcf_to_dataframe(s_vcf_gz, sample_override=sid))
+            results_by_idx[idx_j] = (tel, s_vcf_gz, sid)
             _log(f"  [{idx_j}/{len(jobs)}] {sid}: {tel.get('n_variants', 0)} variants ({tel.get('total_wall_s', tel.get('wall_s', 0)):.2f}s)")
 
-        for idx_j in range(1, len(jobs) + 1):
-            tel, s_vcf_gz, df_s = results_by_idx[idx_j]
-            sample_tels.append(tel)
-            per_sample_vcfs.append(s_vcf_gz)
-            var_frames.append(df_s)
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        var_cols = ["sample_id", "chrom", "pos", "ref", "alt", "kind", "gt", "gq", "dp", "ad_ref", "ad_alt", "qual", "source"]
+        var_schema = pa.schema(
+            [
+                ("sample_id", pa.string()),
+                ("chrom", pa.string()),
+                ("pos", pa.int64()),
+                ("ref", pa.string()),
+                ("alt", pa.string()),
+                ("kind", pa.string()),
+                ("gt", pa.string()),
+                ("gq", pa.float64()),
+                ("dp", pa.float64()),
+                ("ad_ref", pa.float64()),
+                ("ad_alt", pa.string()),
+                ("qual", pa.float64()),
+                ("source", pa.string()),
+            ]
+        )
+
+        out_variants_p.parent.mkdir(parents=True, exist_ok=True)
+        pq_path = state_root / "variants.parquet"
+        preview_chunks: list[pd.DataFrame] = []
+        preview_n = 0
+        total_variants = 0
+        total_snv = 0
+        total_indel = 0
+        wrote_tsv_header = False
+
+        with pq.ParquetWriter(str(pq_path), var_schema, compression="zstd") as pq_writer:
+            for idx_j in range(1, len(jobs) + 1):
+                tel, s_vcf_gz, sid = results_by_idx[idx_j]
+                sample_tels.append(tel)
+                per_sample_vcfs.append(s_vcf_gz)
+                df_s = _vcf_to_dataframe(s_vcf_gz, sample_override=sid)
+                n_s = len(df_s)
+                if n_s > 0:
+                    n_s_snv = int((df_s["kind"] == "SNV").sum())
+                    total_variants += n_s
+                    total_snv += n_s_snv
+                    total_indel += n_s - n_s_snv
+                    if preview_n < 50:
+                        take = df_s.head(50 - preview_n).copy()
+                        preview_chunks.append(take)
+                        preview_n += len(take)
+                    df_s.to_csv(
+                        out_variants_p,
+                        sep="\t",
+                        index=False,
+                        float_format="%.6g",
+                        mode="a" if wrote_tsv_header else "w",
+                        header=not wrote_tsv_header,
+                    )
+                    wrote_tsv_header = True
+                    df_typed = pd.DataFrame(
+                        {
+                            "sample_id": df_s["sample_id"].astype(str),
+                            "chrom": df_s["chrom"].astype(str),
+                            "pos": pd.to_numeric(df_s["pos"], errors="coerce").fillna(0).astype("int64"),
+                            "ref": df_s["ref"].astype(str),
+                            "alt": df_s["alt"].astype(str),
+                            "kind": df_s["kind"].astype(str),
+                            "gt": df_s["gt"].astype(str),
+                            "gq": pd.to_numeric(df_s["gq"], errors="coerce").astype("float64"),
+                            "dp": pd.to_numeric(df_s["dp"], errors="coerce").astype("float64"),
+                            "ad_ref": pd.to_numeric(df_s["ad_ref"], errors="coerce").astype("float64"),
+                            "ad_alt": df_s["ad_alt"].astype(str),
+                            "qual": pd.to_numeric(df_s["qual"], errors="coerce").astype("float64"),
+                            "source": df_s["source"].astype(str),
+                        }
+                    )
+                    pq_writer.write_table(pa.Table.from_pandas(df_typed, schema=var_schema, preserve_index=False))
+            if not wrote_tsv_header:
+                pd.DataFrame(columns=var_cols).to_csv(out_variants_p, sep="\t", index=False)
+                pq_writer.write_table(pa.Table.from_pydict({f.name: [] for f in var_schema}, schema=var_schema))
+
+        variants_preview_df = pd.concat(preview_chunks, ignore_index=True) if preview_chunks else pd.DataFrame(columns=var_cols)
 
         eff_mode = (
             analysis_mode
             if analysis_mode != "auto"
             else (next(iter(used_engines)) if len(used_engines) == 1 else ("hybrid_cohort" if used_engines else "diploid_wgs"))
         )
-
-        variants_df = pd.concat(var_frames, ignore_index=True) if var_frames else _vcf_to_dataframe(per_sample_vcfs[0])
-        out_variants_p.parent.mkdir(parents=True, exist_ok=True)
-        variants_df.to_csv(out_variants_p, sep="\t", index=False, float_format="%.6g")
 
         if out_vcf_p:
             if len(per_sample_vcfs) == 1:
@@ -1875,20 +1947,21 @@ def run_variationloop_galaxy(
             "mode": eff_mode,
             "reference_label": ref_lbl,
             "n_samples": len(jobs),
-            "n_variants": len(variants_df),
+            "n_variants": total_variants,
+            "n_snv": total_snv,
+            "n_indel": total_indel,
             "wall_s": round(time.time() - t_start, 2),
         }
         render_variationloop_report(
             out_report_p,
             analysis_mode=eff_mode,
             summary_stats=summary_stats,
-            variants_df=variants_df,
+            variants_df=variants_preview_df,
             sample_telemetry=sample_tels,
         )
 
         store = FocaloopStateStore(state_root)
         HypothesisLedger.from_store(store, alpha_budget=0.05)
-        variants_df.to_parquet(state_root / "variants.parquet", index=False)
         pd.DataFrame(sample_tels).to_parquet(state_root / "sample_telemetry.parquet", index=False)
         sample_records = []
         for j in jobs:

@@ -421,7 +421,7 @@ int main(int argc, char **argv) {
                 qp += num;
                 rpos += num;
             } else if (op == 'I') {
-                int ok_pos = (!midpoint_only) || (qlen <= 30) || (qp >= q_lo && (qp + num) <= q_hi + 1);
+                int ok_pos = (!midpoint_only) || (qlen <= 30) || (qp >= q_lo && qp < q_hi);
                 if (ok_pos && rpos > 0 && num > 0 && num <= 200) {
                     int64_t idx = map_pos_to_pile(ctg, regs, rpos - 1);
                     if (idx >= 0) {
@@ -436,7 +436,7 @@ int main(int argc, char **argv) {
                 }
                 qp += num;
             } else if (op == 'D') {
-                int ok_pos = (!midpoint_only) || (qlen <= 30) || (qp >= q_lo && qp <= q_hi);
+                int ok_pos = (!midpoint_only) || (qlen <= 30) || (qp >= q_lo && qp < q_hi);
                 if (ok_pos && rpos > 0 && num > 0 && num <= 200) {
                     int64_t anchor_idx = map_pos_to_pile(ctg, regs, rpos - 1);
                     for (int t = 0; t < num; t++) {

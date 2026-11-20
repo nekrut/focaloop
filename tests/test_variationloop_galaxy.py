@@ -505,3 +505,54 @@ def test_variationloop_parallel_logan_cohort_workers_and_order(
     assert len(seen_tids) >= 2
     chrom_line = [ln for ln in out_vcf.read_text(encoding="utf-8").splitlines() if ln.startswith("#CHROM")][0]
     assert chrom_line.split("\t")[9:] == ["pv_01", "pv_02", "pv_03", "pv_04", "pv_05"]
+
+
+def test_prep_unitigs_tiles_long_sequences_and_streaming_archive(tmp_path: Path) -> None:
+    """Verify prep_unitigs_filt_adapt tiles >2.5 kb unitigs with 30 bp overlap and archive streams cleanly."""
+    import subprocess
+    from focaloop.malariavar.logan_var import ensure_var_logan_bins
+    from focaloop.archive import pack_state, unpack_state
+
+    prep_bin, _ = ensure_var_logan_bins()
+    short_seq = "ACGT" * 125  # 500 bp
+    # Build deterministic non-repeating 34,000 bp sequence so overlap match is unique
+    bases = "ACGT"
+    long_seq = "".join(bases[(i * 7 + (i // 13)) & 3] for i in range(34000))
+    inp = f">0 ka:f:12.5\n{short_seq}\n>1 ka:f:11.7\n{long_seq}\n"
+    res = subprocess.run(
+        [str(prep_bin), "1.5", "0", "-", "0", "0", "3.0"],
+        input=inp,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    recs: list[tuple[str, str]] = []
+    cur_h = None
+    for ln in res.stdout.splitlines():
+        if ln.startswith(">"):
+            cur_h = ln[1:]
+        elif cur_h is not None:
+            recs.append((cur_h, ln.strip()))
+            cur_h = None
+
+    assert recs[0] == ("0_1250", short_seq)
+    tiles = [(h, s) for h, s in recs[1:]]
+    assert len(tiles) >= 16
+    assert all(h.endswith("_1170") and "c" in h for h, _ in tiles)
+    assert all(500 < len(s) <= 2500 for _, s in tiles)
+    # Reconstruct interior [15, L-15) from midpoint-trimmed tiles: must match original 100% bit-for-bit
+    reconstructed = "".join(s[15:-15] for _, s in tiles)
+    assert reconstructed == long_seq[15:-15]
+
+    # Streaming pack/unpack round-trip + zstd-bomb guard
+    st = tmp_path / "st_in"
+    st.mkdir()
+    (st / "meta.json").write_text('{"ok": true}\n', encoding="utf-8")
+    (st / "payload.bin").write_bytes(b"ABCD" * 20000)
+    arc = tmp_path / "st.tar.zst"
+    pack_state(st, arc)
+    out = unpack_state(arc, tmp_path / "st_out")
+    assert (out / "meta.json").read_text(encoding="utf-8") == '{"ok": true}\n'
+    assert (out / "payload.bin").read_bytes() == b"ABCD" * 20000
+    with pytest.raises(ValueError, match="inflates past"):
+        unpack_state(arc, tmp_path / "st_bomb", max_bytes=1024)
