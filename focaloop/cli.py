@@ -233,7 +233,9 @@ def cmd_variationloop(a: argparse.Namespace) -> int:
             sra_accessions=a.sra_accessions,
             logan_mode=a.logan_mode,
             logan_min_ka=a.logan_min_ka,
-            logan_min_wsaf=a.logan_min_wsaf,
+            logan_min_wsaf=a.min_wsaf,
+            ploidy=a.ploidy,
+            min_wsaf=a.min_wsaf,
             targets_bed=a.targets_bed,
             cram_pad_bp=a.cram_pad_bp,
             reads=a.reads,
@@ -511,7 +513,8 @@ def build_parser() -> argparse.ArgumentParser:
     vl.add_argument("--sra-accessions", help="optional newline/comma/space-separated public SRA/ENA run accessions for direct Logan/streaming calling")
     vl.add_argument("--logan-mode", choices=("auto", "logan_only", "off"), default="auto", help="use pre-assembled Logan unitigs for public SRA/ENA runs when available")
     vl.add_argument("--logan-min-ka", default="adapt", help="Logan unitig k-mer abundance floor ('adapt' or numeric threshold)")
-    vl.add_argument("--logan-min-wsaf", type=float, default=0.25, help="minimum within-sample allele fraction (WSAF) for Logan unitig calling (default: 0.25)")
+    vl.add_argument("--ploidy", choices=("haploid", "diploid"), default="diploid", help="calling model ploidy: 'haploid' for continuous WSAF mixtures (haploid parasites, bacteria, viruses, fungi) or 'diploid' for 0/1 and 1/1 genotypes (default: diploid)")
+    vl.add_argument("--min-wsaf", "--logan-min-wsaf", dest="min_wsaf", type=float, default=0.25, help="minimum within-sample allele fraction (WSAF) for haploid/mixed-clone calling and Logan unitigs (default: 0.25)")
     vl.add_argument("--reads", nargs="+", help="optional local FASTQ(.gz) files for manifest matching")
     vl.add_argument("--read-ids", nargs="+", help="sample identifiers matching --reads or --reads-r1/--reads-r2")
     vl.add_argument("--reads-r1", nargs="+", help="one or more forward R1 FASTQ(.gz) files")

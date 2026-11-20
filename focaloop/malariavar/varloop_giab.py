@@ -197,6 +197,10 @@ class DiploidParams:
     active_min_clip: int = 4
     active_min_qual: float = 22.0
 
+    # Calling model ploidy ('diploid' for 0/1 & 1/1 genotypes; 'haploid' for continuous WSAF mixtures)
+    ploidy: str = "diploid"
+    haploid_min_wsaf: float = 0.25
+
 
 # ============================================================================
 # 1. Target 31-mer Bait Table & Fast C Paired FASTQ Sieve
@@ -636,8 +640,22 @@ def beta_binom_logpmf(k: np.ndarray, n: np.ndarray, mu: float | np.ndarray, kapp
     )
 
 
+def _wsaf_llr_qual(ac: np.ndarray | float, other: np.ndarray | float, err: np.ndarray | float) -> np.ndarray:
+    """Phred-scaled binomial likelihood ratio for continuous allele fraction vs sequencing error `err`."""
+    ac_a = np.asarray(ac, dtype=np.float64)
+    ot_a = np.maximum(np.asarray(other, dtype=np.float64), 0.0)
+    tot = ac_a + ot_a
+    err_a = np.clip(np.asarray(err, dtype=np.float64), 1e-6, 0.49)
+    safe_tot = np.maximum(tot, 1.0)
+    p_hat = np.clip(ac_a / safe_tot, err_a, 1.0 - 1e-12)
+    ll_alt = ac_a * np.log(p_hat) + ot_a * np.log(np.maximum(1.0 - p_hat, 1e-12))
+    ll_err = ac_a * np.log(err_a) + ot_a * np.log(1.0 - err_a)
+    llr = np.where((ac_a > 0.0) & (p_hat > err_a), np.maximum(0.0, ll_alt - ll_err), 0.0)
+    return np.minimum(999.0, 10.0 * llr / LN10)
+
+
 def call_diploid_snvs_contig(g: G.Genome, ctg_id: int, cand: dict[str, np.ndarray], p: DiploidParams) -> list[dict]:
-    """Call calibrated diploid SNVs (`0/1`, `1/1`, `1/2`) on contig `ctg_id` with spanning-deletion awareness."""
+    """Call SNVs on contig `ctg_id` under diploid Beta-Binomial (`0/1`, `1/1`, `1/2`) or haploid continuous WSAF (`1`)."""
     pos0 = cand["pos0"]
     if len(pos0) == 0:
         return []
@@ -673,6 +691,35 @@ def call_diploid_snvs_contig(g: G.Genome, ctg_id: int, cand: dict[str, np.ndarra
     dp_full = tot + delc
     # Inside a homozygous 1/1 spanning deletion (delc >= 80% of total depth and delc >= 4), suppress residual SNV noise
     hom_del = (delc >= 4) & (delc >= 0.78 * np.maximum(dp_full, 1))
+
+    if str(p.ploidy).strip().lower() == "haploid":
+        eff_min_wsaf = max(0.05, min(0.99, float(p.haploid_min_wsaf)))
+        wsaf1 = ac1 / np.maximum(tot, 1).astype(np.float64)
+        qual1 = _wsaf_llr_qual(ac1, tot - ac1, max(float(p.snv_err), 0.005))
+        out_h: list[dict] = []
+        ctg_name = g.names[ctg_id]
+        bases_str = "ACGT"
+        for i in range(m):
+            if hom_del[i] or ac1[i] < p.snv_min_alt or wsaf1[i] < eff_min_wsaf or qual1[i] < p.snv_min_qual:
+                continue
+            q_i = float(qual1[i])
+            out_h.append(dict(
+                ctg_id=ctg_id,
+                chrom=ctg_name,
+                pos0=int(pos0[i]),
+                pos=int(pos0[i]) + 1,
+                ref=bases_str[int(ref[i])],
+                alt=bases_str[int(a1[i])],
+                gt="1",
+                qual=round(q_i, 2),
+                gq=min(99, max(0, int(round(q_i)))),
+                dp=int(dp_full[i]),
+                ad=(int(rc[i]), int(ac1[i])),
+                wsaf=(round(float(wsaf1[i]), 4),),
+                source="pileup_snv_wsaf",
+            ))
+        return out_h
+
     # Opposite a heterozygous 0/1 spanning deletion (delc in [22%, 78%] of dp_full and delc >= 3),
     # the remaining homologous chromosome is effectively haploid (0/* vs 1/* -> VCF GT 0/1, never 1/1!)
     het_span_del = (~hom_del) & (delc >= 3) & (delc >= 0.22 * np.maximum(dp_full, 1))
@@ -852,6 +899,20 @@ def call_diploid_indels_contig(
         ))
         # Hom-alt anchor overhang + homopolymer slippage rate: reads ending inside a repeat align as un-gapped M at a0
         err_0 = float(min(0.065, p.indel_base_err + p.indel_hp_err_quad * max(0, hp1 - 4) ** 2))
+        if str(p.ploidy).strip().lower() == "haploid":
+            eff_indel_wsaf = max(0.15, min(0.99, float(p.haploid_min_wsaf)))
+            wsaf_i = float(c1) / float(max(dp_tot, 1))
+            qual_i = float(_wsaf_llr_qual(c1, max(dp_tot - c1, 0), max(err_0, 0.015)))
+            if wsaf_i >= eff_indel_wsaf and qual_i >= p.indel_min_qual:
+                calls.append(dict(
+                    ctg_id=ctg_id, chrom=ctg_name, pos0=a0, pos=a0 + 1,
+                    ref=r1, alt=alt1, gt="1",
+                    qual=round(qual_i, 2), gq=min(99, max(0, int(round(qual_i)))),
+                    dp=dp_tot, ad=(rc, c1), wsaf=(round(wsaf_i, 4),),
+                    source="pileup_indel_wsaf",
+                ))
+            continue
+
         err_hom = float(min(0.24, 0.018 + 0.0040 * min(L1, 40) + 0.0085 * max(0, min(hp1, 20) - 3) + 0.5 * err_0))
 
         # Germline indel mutation rate increases strongly in homopolymer/STR tracts
@@ -1263,60 +1324,103 @@ def reassemble_active_regions_contig(
                 if n_mm <= 1:
                     pure_ll[h_i] = -0.15
 
-        pairs: list[tuple[int, int]] = []
-        pair_posts: list[float] = []
-        ln2 = math.log(2.0)
-        for h1 in range(n_h):
-            for h2 in range(h1, n_h):
-                if h1 == h2:
-                    ll_cap = float(ll_mat[:, h1].sum())
-                    ll_uncap = float(n_uncap * pure_ll[h1])
-                else:
-                    ll_cap = float(np.logaddexp(ll_mat[:, h1] - ln2, ll_mat[:, h2] - ln2).sum())
-                    ll_uncap = float(n_uncap * np.logaddexp(pure_ll[h1] - ln2, pure_ll[h2] - ln2))
-                if h1 == 0 and h2 == 0:
-                    prior = 0.0
-                elif h1 == 0:
-                    prior = math.log(p.indel_prior_het)
-                elif h1 == h2:
-                    prior = math.log(p.indel_prior_hom)
-                else:
-                    prior = math.log(p.indel_prior_12)
-                pairs.append((h1, h2))
-                pair_posts.append(ll_cap + ll_uncap + prior)
+        if str(p.ploidy).strip().lower() == "haploid":
+            eff_asm_wsaf = max(0.15, min(0.99, float(p.haploid_min_wsaf)))
+            best_per_r = np.argmax(ll_mat, axis=1)
+            sup_0 = n_uncap + int((best_per_r == 0).sum())
+            dp_est = max(int(dp_mids[w_idx]), len(sel) + n_uncap)
+            ll_ref_only = float(ll_mat[:, 0].sum() + n_uncap * pure_ll[0])
+            best_h = 0
+            best_qual = 0.0
+            best_sup_h = 0
+            best_w = 0.0
+            for h_i in range(1, n_h):
+                sup_h = int((best_per_r == h_i).sum())
+                if sup_h < 2:
+                    continue
+                w_hat = float(np.clip(sup_h / max(float(sup_0 + sup_h), 1.0), 0.01, 0.999))
+                if w_hat < eff_asm_wsaf:
+                    continue
+                lw_alt = math.log(w_hat)
+                lw_ref = math.log(max(1.0 - w_hat, 1e-9))
+                ll_mix = float(
+                    np.logaddexp(ll_mat[:, 0] + lw_ref, ll_mat[:, h_i] + lw_alt).sum()
+                    + n_uncap * float(np.logaddexp(pure_ll[0] + lw_ref, pure_ll[h_i] + lw_alt))
+                )
+                q_h = min(999.0, max(0.0, 10.0 * max(0.0, ll_mix - ll_ref_only) / LN10))
+                if q_h > best_qual:
+                    best_qual = q_h
+                    best_h = h_i
+                    best_sup_h = sup_h
+                    best_w = w_hat
+            if best_h == 0 or best_qual < p.active_min_qual:
+                continue
+            diffs = OZ.decompose_haplotype_diffs(ref_win, cand_haps[best_h], lo, ctg_seq_u8)
+            gq_h = min(99, max(0, int(round(best_qual))))
+            asm_records = [
+                dict(
+                    ctg_id=ctg_id, chrom=ctg_name, pos0=p0, pos=p0 + 1,
+                    ref=r_s, alt=a_s, gt="1", qual=round(best_qual, 2), gq=gq_h,
+                    dp=max(dp_est, sup_0 + best_sup_h), ad=(sup_0, best_sup_h),
+                    wsaf=(round(best_w, 4),), hap_side=0, source="omnitig_asm_wsaf",
+                )
+                for p0, r_s, a_s in diffs
+            ]
+        else:
+            pairs: list[tuple[int, int]] = []
+            pair_posts: list[float] = []
+            ln2 = math.log(2.0)
+            for h1 in range(n_h):
+                for h2 in range(h1, n_h):
+                    if h1 == h2:
+                        ll_cap = float(ll_mat[:, h1].sum())
+                        ll_uncap = float(n_uncap * pure_ll[h1])
+                    else:
+                        ll_cap = float(np.logaddexp(ll_mat[:, h1] - ln2, ll_mat[:, h2] - ln2).sum())
+                        ll_uncap = float(n_uncap * np.logaddexp(pure_ll[h1] - ln2, pure_ll[h2] - ln2))
+                    if h1 == 0 and h2 == 0:
+                        prior = 0.0
+                    elif h1 == 0:
+                        prior = math.log(p.indel_prior_het)
+                    elif h1 == h2:
+                        prior = math.log(p.indel_prior_hom)
+                    else:
+                        prior = math.log(p.indel_prior_12)
+                    pairs.append((h1, h2))
+                    pair_posts.append(ll_cap + ll_uncap + prior)
 
-        posts_arr = np.array(pair_posts, dtype=np.float64)
-        lz = float(logsumexp(posts_arr))
-        qual = min(999.0, max(0.0, -10.0 * (posts_arr[0] - lz) / LN10))
-        best_idx = int(np.argmax(posts_arr))
-        h1_b, h2_b = pairs[best_idx]
-        s_posts = np.sort(posts_arr)
-        gq = min(99, max(0, int(round(10.0 * (s_posts[-1] - s_posts[-2]) / LN10))))
+            posts_arr = np.array(pair_posts, dtype=np.float64)
+            lz = float(logsumexp(posts_arr))
+            qual = min(999.0, max(0.0, -10.0 * (posts_arr[0] - lz) / LN10))
+            best_idx = int(np.argmax(posts_arr))
+            h1_b, h2_b = pairs[best_idx]
+            s_posts = np.sort(posts_arr)
+            gq = min(99, max(0, int(round(10.0 * (s_posts[-1] - s_posts[-2]) / LN10))))
 
-        # Count read support per winning haplotype
-        best_per_r = np.argmax(ll_mat, axis=1)
-        sup_0 = n_uncap + int((best_per_r == 0).sum())
-        sup_1 = int((best_per_r == h2_b).sum())
-        sup_a = int((best_per_r == h1_b).sum())
-        dp_est = max(int(dp_mids[w_idx]), len(sel) + n_uncap)
+            # Count read support per winning haplotype
+            best_per_r = np.argmax(ll_mat, axis=1)
+            sup_0 = n_uncap + int((best_per_r == 0).sum())
+            sup_1 = int((best_per_r == h2_b).sum())
+            sup_a = int((best_per_r == h1_b).sum())
+            dp_est = max(int(dp_mids[w_idx]), len(sel) + n_uncap)
 
-        if h1_b == 0 and h2_b == 0:
-            # Inside explicit zoom regions (where all reads are captured), suppress low-QUAL paralog noise when 0/0 wins
-            if in_zoom_win and gq >= 25 and len(call_pos):
-                ov = (call_pos < e0) & (call_end > s0)
-                for ci_drop in np.where(ov)[0]:
-                    if pileup_calls[ci_drop]["qual"] < 60.0:
-                        drop_mask[ci_drop] = True
-            continue
+            if h1_b == 0 and h2_b == 0:
+                # Inside explicit zoom regions (where all reads are captured), suppress low-QUAL paralog noise when 0/0 wins
+                if in_zoom_win and gq >= 25 and len(call_pos):
+                    ov = (call_pos < e0) & (call_end > s0)
+                    for ci_drop in np.where(ov)[0]:
+                        if pileup_calls[ci_drop]["qual"] < 60.0:
+                            drop_mask[ci_drop] = True
+                continue
 
-        if qual < p.active_min_qual or sup_1 < 2:
-            continue
+            if qual < p.active_min_qual or sup_1 < 2:
+                continue
 
-        ad_est = (sup_0, sup_a, sup_1)
-        asm_records = _format_diploid_pair_calls(
-            ctg_id, ctg_name, ctg_seq_u8, ref_win, lo,
-            cand_haps[h1_b], cand_haps[h2_b], qual, gq, dp_est, ad_est,
-        )
+            ad_est = (sup_0, sup_a, sup_1)
+            asm_records = _format_diploid_pair_calls(
+                ctg_id, ctg_name, ctg_seq_u8, ref_win, lo,
+                cand_haps[h1_b], cand_haps[h2_b], qual, gq, dp_est, ad_est,
+            )
         if not asm_records:
             continue
 
@@ -1340,8 +1444,8 @@ def reassemble_active_regions_contig(
     return kept
 
 
-def resolve_diploid_overlaps(calls: list[dict]) -> list[dict]:
-    """Ensure diploid ploidy consistency across overlapping VCF records on a contig without inventing genotypes."""
+def resolve_diploid_overlaps(calls: list[dict], ploidy: str = "diploid") -> list[dict]:
+    """Ensure ploidy consistency across overlapping VCF records on a contig without inventing genotypes."""
     if not calls:
         return []
     # Deduplicate identical (pos0, ref, alt) keeping highest QUAL
@@ -1350,6 +1454,13 @@ def resolve_diploid_overlaps(calls: list[dict]) -> list[dict]:
         k = (c["pos0"], c["ref"], c["alt"])
         if k not in best_by_key or c["qual"] > best_by_key[k]["qual"]:
             best_by_key[k] = c
+
+    if str(ploidy).strip().lower() == "haploid":
+        # Haploid / mixed-clone mixtures can carry multiple distinct alleles across co-infecting clones;
+        # keep highest-QUAL per unique allele without forcing diploid 1/2 synthesis or 2-copy eviction.
+        out_h = list(best_by_key.values())
+        out_h.sort(key=lambda x: (x["pos0"], x["ref"], x["alt"]))
+        return out_h
 
     # Group records at identical pos0 + ref
     by_pos_ref: dict[tuple[int, str], list[dict]] = {}
@@ -1502,10 +1613,10 @@ def call_contig_diploid(
     snvs = call_diploid_snvs_contig(g, ctg_id, cand, p)
     indels, raw_ind = call_diploid_indels_contig(g, acc, ctg_id, p)
     combined = snvs + indels
-    pileup_resolved = resolve_diploid_overlaps(combined) if return_pileup_also else None
+    pileup_resolved = resolve_diploid_overlaps(combined, ploidy=p.ploidy) if return_pileup_also else None
     if p.enable_reassembly and (len(combined) > 0 or len(raw_ind) > 0 or (len(cand["clipc"]) > 0 and cand["clipc"].max() >= p.active_min_clip)):
         combined = reassemble_active_regions_contig(g, acc, ctg_id, cand, combined, raw_ind, p)
-    resolved = resolve_diploid_overlaps(combined)
+    resolved = resolve_diploid_overlaps(combined, ploidy=p.ploidy)
     if free_after:
         acc.free_contig(ctg_id)
     if return_pileup_also:
@@ -1520,7 +1631,7 @@ def write_diploid_vcf(
     sample: str = "HG002",
     contig_ids: Sequence[int] | None = None,
 ) -> int:
-    """Write standard bgzipped + tabix-indexed VCF v4.2 with GT:GQ:DP:AD."""
+    """Write standard bgzipped + tabix-indexed VCF v4.2 with GT:GQ:DP:AD:WSAF."""
     out_vcf_gz = Path(out_vcf_gz)
     out_vcf_gz.parent.mkdir(parents=True, exist_ok=True)
     tmp_vcf = out_vcf_gz.with_suffix("") if str(out_vcf_gz).endswith(".gz") else out_vcf_gz.with_name(out_vcf_gz.name + ".tmp")
@@ -1529,7 +1640,7 @@ def write_diploid_vcf(
     n_written = 0
     with open(tmp_vcf, "w") as f:
         f.write("##fileformat=VCFv4.2\n")
-        f.write("##source=VarLoop_Diploid_v1.0\n")
+        f.write("##source=FocaloopVariationLoop-0.4.0\n")
         f.write('##FILTER=<ID=PASS,Description="All filters passed">\n')
         for cid in range(len(g.names)):
             f.write(f"##contig=<ID={g.names[cid]},length={int(g.lengths[cid])}>\n")
@@ -1537,14 +1648,23 @@ def write_diploid_vcf(
         f.write('##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype Quality">\n')
         f.write('##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read Depth">\n')
         f.write('##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths for ref and alt alleles">\n')
+        f.write('##FORMAT=<ID=WSAF,Number=A,Type=Float,Description="Within-sample alternate allele fraction">\n')
         f.write(f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}\n")
         for cid in cids:
             recs = calls_by_contig.get(cid, [])
             for r in recs:
-                ad_s = ",".join(str(x) for x in r["ad"])
+                ad_vals = list(r["ad"])
+                ad_s = ",".join(str(x) for x in ad_vals)
+                if r.get("wsaf") is not None:
+                    ws_raw = r["wsaf"]
+                    ws_vals = list(ws_raw) if isinstance(ws_raw, (list, tuple)) else [float(ws_raw)]
+                else:
+                    denom = float(max(sum(int(x) for x in ad_vals), int(r.get("dp", 0)), 1))
+                    ws_vals = [min(1.0, max(0.0, float(x) / denom)) for x in ad_vals[1:]] or [0.0]
+                wsaf_s = ",".join(f"{float(w):.4f}" for w in ws_vals)
                 f.write(
                     f"{r['chrom']}\t{r['pos']}\t.\t{r['ref']}\t{r['alt']}\t{r['qual']:.2f}\tPASS\t.\t"
-                    f"GT:GQ:DP:AD\t{r['gt']}:{r['gq']}:{r['dp']}:{ad_s}\n"
+                    f"GT:GQ:DP:AD:WSAF\t{r['gt']}:{r['gq']}:{r['dp']}:{ad_s}:{wsaf_s}\n"
                 )
                 n_written += 1
 

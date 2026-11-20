@@ -246,13 +246,14 @@ def _write_vcf_gz(
         fh.write('##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype Quality">\n')
         fh.write('##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Weighted depth">\n')
         fh.write('##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Weighted ref and alt allele depths">\n')
+        fh.write('##FORMAT=<ID=WSAF,Number=A,Type=Float,Description="Within-sample alternate allele fraction">\n')
         fh.write(f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample_name}\n")
         for rec in records:
             info = f"DP={rec['dp']};AF={rec['wsaf']:.4f}"
-            fmt = f"{rec['gt']}:{rec['gq']}:{rec['dp']}:{rec['ad_ref']},{rec['ad_alt']}"
+            fmt = f"{rec['gt']}:{rec['gq']}:{rec['dp']}:{rec['ad_ref']},{rec['ad_alt']}:{rec['wsaf']:.4f}"
             fh.write(
                 f"{rec['chrom']}\t{rec['pos']}\t.\t{rec['ref']}\t{rec['alt']}\t"
-                f"{rec['qual']:.1f}\tPASS\t{info}\tGT:GQ:DP:AD\t{fmt}\n"
+                f"{rec['qual']:.1f}\tPASS\t{info}\tGT:GQ:DP:AD:WSAF\t{fmt}\n"
             )
     if vcf_gz.suffix == ".gz":
         if shutil.which("bgzip"):
@@ -283,6 +284,7 @@ def run_varloop_logan_unitigs(
     min_ka_mode: str = "adapt",
     max_ka_adapt: float = 3.0,
     min_wsaf: float = 0.25,
+    ploidy: str = "diploid",
     local_unitigs_path: Path | None = None,
     log: Callable[[str], None] = lambda msg: None,
 ) -> dict[str, Any]:
@@ -446,6 +448,7 @@ def run_varloop_logan_unitigs(
     n_indel = 0
     ctg_order = {cn: idx for idx, cn in enumerate(ctg_lens.keys())}
 
+    eff_ploidy = "haploid" if str(ploidy or "diploid").strip().lower() == "haploid" else "diploid"
     eff_min_wsaf = max(0.05, min(0.99, float(min_wsaf)))
     eff_indel_min_wsaf = max(eff_min_wsaf, 0.15)
     if not cand_df.empty:
@@ -474,7 +477,11 @@ def run_varloop_logan_unitigs(
                     continue
                 n_indel += 1
 
-            gt, gq = _genotype_and_gq(ad_ref_f, ad_alt_f, err=0.005 if kind == "SNV" else 0.015)
+            if eff_ploidy == "haploid":
+                gt = "1"
+                gq = int(min(99, max(0, round(qual))))
+            else:
+                gt, gq = _genotype_and_gq(ad_ref_f, ad_alt_f, err=0.005 if kind == "SNV" else 0.015)
             records.append(
                 {
                     "chrom": chrom,
@@ -511,6 +518,7 @@ def run_varloop_logan_unitigs(
         "drop_ka": int(prep_m.get("drop_ka", 0)),
         "drop_host": int(prep_m.get("drop_host", 0)),
         "eff_min_ka": float(prep_m.get("eff_min_ka", 1.5)),
+        "ploidy": eff_ploidy,
         "min_wsaf": float(eff_min_wsaf),
         "med_len80_ka": float(prep_m.get("med_len80_ka", -1.0)),
         "sam_records": int(pile_m.get("sam_records", 0)),

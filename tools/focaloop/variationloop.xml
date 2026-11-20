@@ -76,12 +76,17 @@ focaloop variationloop
         #end if
         --logan-mode '$input_source.logan_mode'
     #end if
+    --ploidy '$calling_model.ploidy'
+    #if str($calling_model.ploidy) == "haploid"
+        --min-wsaf $calling_model.min_wsaf
+    #else
+        --min-wsaf $streaming_options.logan_min_wsaf
+    #end if
     #if $targets_bed
         --targets-bed '$targets_bed'
     #end if
     --host-depletion-mode '$streaming_options.host_depletion_mode'
     --logan-min-ka '$streaming_options.logan_min_ka'
-    --logan-min-wsaf $streaming_options.logan_min_wsaf
     --cram-pad-bp $streaming_options.cram_pad_bp
     --subsample-fraction $streaming_options.subsample_fraction
     --mapper '$streaming_options.mapper'
@@ -213,6 +218,17 @@ ${a}	${gname}	${a}
             </when>
         </conditional>
 
+        <conditional name="calling_model">
+            <param argument="--ploidy" type="select" label="Calling model (organism ploidy)" help="Choose Haploid or mixed-clone (WSAF) for haploid organisms and polyclonal infections (such as haploid parasites, bacteria, viruses, or fungi) to call continuous within-sample allele fractions (GT=1 with per-sample FORMAT/WSAF) without imposing a 50/50 diploid genotype assumption. Choose Diploid for diploid organisms (such as human, vertebrates, or diploid eukaryotes) to emit standard 0/1, 1/1, and 1/2 genotypes alongside FORMAT/WSAF.">
+                <option value="diploid" selected="true">Diploid (0/1, 1/1, 1/2 genotypes - human, vertebrates, diploid eukaryotes)</option>
+                <option value="haploid">Haploid or mixed-clone mixture (continuous WSAF, no diploid genotypes - haploid parasites, bacteria, viruses, fungi)</option>
+            </param>
+            <when value="diploid"/>
+            <when value="haploid">
+                <param argument="--min-wsaf" type="float" min="0.05" max="0.95" value="0.25" label="Minimum within-sample allele fraction (WSAF)" help="Minimum continuous alternate allele fraction required to report a variant in haploid or mixed-clone samples (default 0.25 balances precision and clonal sensitivity). Lower to 0.10-0.15 to detect minor clones in polyclonal infections, or raise to 0.50 for major-allele-only calls."/>
+            </when>
+        </conditional>
+
         <param argument="--targets-bed" type="data" format="bed" optional="true" label="Target regions (BED, optional)" help="Optional 0-based BED intervals restricting variant calling, compressed CRAM region slicing, local haplotype reassembly, and host/off-target read pre-filtering to genes or panels of interest. Recommended for large genomes (&gt; 45 Mb) when slicing CRAMs or filtering target reads."/>
 
         <section name="streaming_options" title="Pre-filtering, streaming, and aligner options" expanded="false">
@@ -227,7 +243,7 @@ ${a}	${gname}	${a}
                 <option value="2.0">Fixed minimum ka = 2.0 (balanced)</option>
                 <option value="3.0">Fixed minimum ka = 3.0 (high-depth samples)</option>
             </param>
-            <param argument="--logan-min-wsaf" type="float" min="0.05" max="0.95" value="0.25" label="Minimum within-sample allele fraction (WSAF, Logan unitigs)" help="Minimum weighted alternate allele fraction required to report a variant from Logan unitigs (default 0.25 balances precision and clonal sensitivity across haploid and diploid genomes). Lower to 0.10-0.15 to capture minor clones in mixed haploid infections, or raise to 0.50 for major-allele-only calls."/>
+            <param name="logan_min_wsaf" type="float" min="0.05" max="0.95" value="0.25" label="Minimum within-sample allele fraction (WSAF, diploid Logan unitigs)" help="Minimum weighted alternate allele fraction required when running Logan unitigs under Diploid mode (default 0.25). In Haploid mode, use the top-level Minimum within-sample allele fraction (WSAF) setting above."/>
             <param argument="--cram-pad-bp" type="integer" min="0" max="50000" value="1000" label="Flanking padding around BED targets for CRAM slicing (bp)" help="Extra bases included on both sides of each BED interval when selecting compressed CRAM containers (applies to indexed CRAM inputs only)."/>
             <param argument="--subsample-fraction" type="float" min="0.01" max="1.0" value="1.0" label="Read subsampling fraction (raw FASTQ only, 1.0 = all reads)" help="Deterministically retains this fraction of paired FASTQ reads before alignment (ignored for BAM/CRAM and Logan unitig inputs). Leave at 1.0 to analyze every read."/>
             <param argument="--mapper" type="select" label="Read and unitig aligner" help="Auto selects the fastest working aligner installed on the server (BWA-MEM2 preferred for Logan unitigs, strobealign/minimap2/BWA-MEM2 for raw FASTQ).">
@@ -404,6 +420,55 @@ ${a}	${gname}	${a}
                 </assert_contents>
             </output>
         </test>
+        <!-- Test 4: Haploid / mixed-clone WSAF calling mode (GT=1 + per-sample FORMAT/WSAF, no diploid 0/1) -->
+        <test expect_num_outputs="4">
+            <conditional name="ref_source">
+                <param name="source" value="history"/>
+                <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
+            </conditional>
+            <conditional name="input_source">
+                <param name="source_type" value="history_paired_list"/>
+                <param name="paired_reads">
+                    <collection type="list:paired">
+                        <element name="clone_mix_1">
+                            <collection type="paired">
+                                <element name="forward" value="variationloop/sample_R1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="variationloop/sample_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
+                    </collection>
+                </param>
+            </conditional>
+            <conditional name="calling_model">
+                <param name="ploidy" value="haploid"/>
+                <param name="min_wsaf" value="0.25"/>
+            </conditional>
+            <param name="targets_bed" value="variationloop/targets.bed" ftype="bed"/>
+            <output name="variants_vcf">
+                <assert_contents>
+                    <has_text text="ID=WSAF"/>
+                    <has_text text="GT:GQ:DP:AD:WSAF"/>
+                    <not_has_text text="0/1"/>
+                    <not_has_text text="1/1"/>
+                </assert_contents>
+            </output>
+            <output name="variants_summary">
+                <assert_contents>
+                    <has_text text="wsaf"/>
+                    <has_text text="clone_mix_1"/>
+                </assert_contents>
+            </output>
+            <output name="variationloop_report">
+                <assert_contents>
+                    <has_text text="haploid"/>
+                </assert_contents>
+            </output>
+            <output name="variationloop_state">
+                <assert_contents>
+                    <has_size min="500"/>
+                </assert_contents>
+            </output>
+        </test>
     </tests>
     <help format="markdown"><![CDATA[
 **What this tool does**
@@ -484,19 +549,19 @@ sample_2	site_B	https://example.org/alignments/sample_2.cram	https://example.org
 
 **Key parameters**
 
+- **Calling model (`--ploidy`) and minimum WSAF (`--min-wsaf`):** Choose **Haploid or mixed-clone mixture** for haploid pathogens, microbes, and viruses (haploid parasites, bacteria, viruses, fungi). Calls continuous within-sample allele fractions (`WSAF`, default floor `0.25`) using a sequencing-error likelihood ratio with no 50/50 diploid assumption, emitting haploid `GT=1` and per-sample `FORMAT/WSAF` (preserved across merged multi-sample VCFs and used directly for continuous Hudson Fst in **Focaloop Query**). Lower `--min-wsaf` to `0.10-0.15` to detect minor clones in polyclonal infections, or raise to `0.50` for major-allele-only calls. Choose **Diploid** for human, vertebrate, or diploid eukaryotic genomes (`0/1`, `1/1`, `1/2` alongside `FORMAT/WSAF`).
 - **Target regions (`--targets-bed`, optional):** 0-based BED file (`chrom`, `start`, `end`). Restricts variant calling, local haplotype reassembly, compressed CRAM block slicing, and k-mer pre-filtering to your regions of interest.
 - **Pre-assembled Logan unitig streaming (`--logan-mode`):** Enabled in **Automatic** mode for public SRA/ENA accessions. Uses compact pre-assembled unitig graphs (~10-20x smaller than raw reads) when available in Logan and falls back seamlessly to raw reads otherwise.
-- **Minimum within-sample allele fraction (`--logan-min-wsaf`):** Applies to Logan unitig calls (default `0.25`). Every VCF record preserves the continuous weighted alternate allele fraction (`INFO/AF` and `FORMAT/AD`), avoiding forced diploid assumptions on haploid or polyclonal microbial/parasite samples. Lower to `0.10-0.15` to detect minor clones in mixed infections, or raise to `0.50` for major-allele calls only.
 - **Host and off-target pre-filtering (`--host-depletion-mode`):** Under **Automatic**, builds a fast 15-mer filter for Logan unitigs (up to 50 Mb target/reference) and a 31-mer filter for BED-targeted FASTQs (up to 45 Mb), while skipping pre-filtering on whole-genome FASTQ runs.
-- **Local haplotype reassembly (`--reassembly`):** Enabled by default. Reassembles active regions around indels and clustered variants before genotyping.
+- **Local haplotype reassembly (`--reassembly`):** Enabled by default. Reassembles active regions around indels and clustered variants before calling.
 - **Quality thresholds (`--min-mapq`, `--min-bq`, `--snv-min-qual`, `--indel-min-qual`):** Default MAPQ 20, Phred base quality 13, SNV QUAL 20, and indel QUAL 15 provide a balanced sensitivity/precision operating point across microbial, pathogen, and diploid eukaryotic genomes.
 
 -----
 
 **Outputs**
 
-1. **Variant calls (`variants.vcf`):** Standard VCF v4.2 file with genotypes (`GT`), genotype quality (`GQ`), read depth (`DP`), and allele depths (`AD`). Automatically merged across all samples when running a multi-sample cohort.
-2. **Variant summary table (`variants_summary.tsv`):** Flat tabular summary with one row per non-reference call (`sample_id`, `chrom`, `pos`, `ref`, `alt`, `kind`, `gt`, `gq`, `dp`, `ad_ref`, `ad_alt`, `qual`, `source`).
+1. **Variant calls (`variants.vcf`):** Standard VCF v4.2 file with genotypes (`GT`), genotype quality (`GQ`), read depth (`DP`), allelic depths (`AD`), and per-sample within-sample allele fraction (`FORMAT/WSAF`). Automatically merged across all samples when running a multi-sample cohort.
+2. **Variant summary table (`variants_summary.tsv`):** Flat tabular summary with one row per non-reference call (`sample_id`, `chrom`, `pos`, `ref`, `alt`, `kind`, `gt`, `gq`, `dp`, `ad_ref`, `ad_alt`, `wsaf`, `qual`, `source`).
 3. **HTML report:** Self-contained visual summary showing per-sample alignment/streaming telemetry, wire-bytes/duplicate statistics, variant counts, and a preview table of called variants.
 4. **State bundle (`variationloop_state.focaloop.tar.zst`):** Compact cohort state bundle ready for instant downstream population allele-frequency and Fst queries in **Focaloop Query**.
 

@@ -168,7 +168,14 @@ def _merge_vcfs_pure_python(vcf_paths: Sequence[Path], out_vcf: Path) -> None:
         for key in sorted(records, key=lambda k: (contig_order.get(k[0], 10**9), k[1], k[2], k[3])):
             chrom, pos, ref, alt = key
             rec = records[key]
-            scols = [rec["samples"].get(i, "./.:.:.:.") for i in range(len(sample_names))]
+            n_fmt = max(1, len(rec["fmt"].split(":")))
+            sample_vals = list(rec["samples"].values())
+            is_haploid = bool(sample_vals) and all(
+                ("/" not in sv.split(":", 1)[0]) and ("|" not in sv.split(":", 1)[0]) for sv in sample_vals
+            )
+            miss_gt = "." if is_haploid else "./."
+            miss_cell = ":".join([miss_gt] + ["."] * (n_fmt - 1))
+            scols = [rec["samples"].get(i, miss_cell) for i in range(len(sample_names))]
             fo.write(
                 f"{chrom}\t{pos}\t{rec['id']}\t{ref}\t{alt}\t{rec['qual']}\t{rec['flt']}\t{rec['info']}\t{rec['fmt']}\t"
                 + "\t".join(scols)
@@ -565,7 +572,7 @@ def _materialize_vcf_output(src_vcf_gz: Path, out_vcf: Path) -> None:
 
 
 def _vcf_to_dataframe(vcf_path: Path, sample_override: str | None = None) -> pd.DataFrame:
-    cols = ["sample_id", "chrom", "pos", "ref", "alt", "kind", "gt", "gq", "dp", "ad_ref", "ad_alt", "qual", "source"]
+    cols = ["sample_id", "chrom", "pos", "ref", "alt", "kind", "gt", "gq", "dp", "ad_ref", "ad_alt", "wsaf", "qual", "source"]
     opener = gzip.open if str(vcf_path).endswith(".gz") else open
     rows: list[dict[str, Any]] = []
     samples: list[str] = []
@@ -588,13 +595,34 @@ def _vcf_to_dataframe(vcf_path: Path, sample_override: str | None = None) -> pd.
                 vals = parts[9 + s_idx].split(":") if len(parts) > 9 + s_idx else []
                 fmap = dict(zip(fmt_keys, vals))
                 gt = fmap.get("GT", "./.")
-                if gt in ("0/0", "./."):
+                if gt in ("0/0", "./.", "0", ".", "0|0", ".|."):
                     continue
                 gq = int(fmap["GQ"]) if fmap.get("GQ", ".").isdigit() else np.nan
                 dp = int(fmap["DP"]) if fmap.get("DP", ".").isdigit() else np.nan
                 ad_parts = fmap.get("AD", "").split(",")
                 ad_ref = int(ad_parts[0]) if len(ad_parts) >= 1 and ad_parts[0].isdigit() else np.nan
                 ad_alt = ",".join(ad_parts[1:]) if len(ad_parts) >= 2 else ""
+                wsaf_val = np.nan
+                raw_ws = fmap.get("WSAF", "")
+                if raw_ws and raw_ws != ".":
+                    ws_toks = []
+                    for t in raw_ws.split(","):
+                        if t and t != ".":
+                            try:
+                                ws_toks.append(float(t))
+                            except ValueError:
+                                pass
+                    if ws_toks:
+                        wsaf_val = float(max(ws_toks))
+                if not np.isfinite(wsaf_val):
+                    try:
+                        alt_nums = [int(x) for x in ad_parts[1:] if x.isdigit()]
+                        if alt_nums:
+                            ref_n = int(ad_parts[0]) if ad_parts and ad_parts[0].isdigit() else 0
+                            denom = max(ref_n + sum(alt_nums), int(dp) if np.isfinite(dp) else 0, 1)
+                            wsaf_val = float(max(alt_nums)) / float(denom)
+                    except Exception:
+                        pass
                 rows.append(
                     {
                         "sample_id": sample_override or s_name,
@@ -608,6 +636,7 @@ def _vcf_to_dataframe(vcf_path: Path, sample_override: str | None = None) -> pd.
                         "dp": dp,
                         "ad_ref": ad_ref,
                         "ad_alt": ad_alt,
+                        "wsaf": round(wsaf_val, 4) if np.isfinite(wsaf_val) else np.nan,
                         "qual": float(qual_s) if qual_s not in (".", "") else np.nan,
                         "source": "variationloop",
                     }
@@ -910,15 +939,17 @@ def render_variationloop_report(
                 f"<td><code>{_esc(v.get('ref'))}</code> &rarr; <code>{_esc(v.get('alt'))}</code></td>"
                 f"<td><span class='badge b-blue'>{_esc(v.get('kind'))}</span></td>"
                 f"<td><code>{_esc(v.get('gt'))}</code></td>"
+                f"<td class='num'>{_fmt_num(v.get('wsaf'), 3)}</td>"
                 f"<td class='num'>{_fmt_num(v.get('qual'), 1)}</td>"
                 f"<td class='num'>{_esc(v.get('dp'))}</td>"
                 f"<td class='num'>{_esc(v.get('ad_ref'))},{_esc(v.get('ad_alt'))}</td>"
                 f"<td><code>{_esc(v.get('source', 'variationloop'))}</code></td></tr>"
             )
 
+        ploidy_lbl = str(summary_stats.get("ploidy", "diploid"))
         body_sections = f"""
   <div class="kpis">
-    <div class="kpi"><div class="label">Samples Analyzed</div><div class="val">{n_samp}</div><div class="sub">Mode: <code>{_esc(analysis_mode)}</code></div></div>
+    <div class="kpi"><div class="label">Samples Analyzed</div><div class="val">{n_samp}</div><div class="sub">Mode: <code>{_esc(analysis_mode)}</code> · Model: <code>{_esc(ploidy_lbl)}</code></div></div>
     <div class="kpi"><div class="label">Total Variants</div><div class="val">{n_tot:,}</div><div class="sub">{n_snv:,} SNVs · {n_indel:,} Indels</div></div>
     <div class="kpi"><div class="label">Omnitig Rescued</div><div class="val">{n_asm:,}</div><div class="sub">Multi-k local haplotype reassembly</div></div>
     <div class="kpi"><div class="label">PCR Duplicates Filtered</div><div class="val">{n_dup:,}</div><div class="sub">62-bit exact coordinate+TLEN dedup</div></div>
@@ -934,8 +965,8 @@ def render_variationloop_report(
   <div class="section">
     <h2>Variant Calls Preview ({min(len(variants_df), 50)} of {n_tot:,})</h2>
     <table>
-      <thead><tr><th>Sample</th><th>Locus</th><th>Alleles</th><th>Type</th><th>GT</th><th class="num">QUAL</th><th class="num">DP</th><th class="num">AD</th><th>Source</th></tr></thead>
-      <tbody>{''.join(var_html) or '<tr><td colspan="9">No variants called above quality thresholds.</td></tr>'}</tbody>
+      <thead><tr><th>Sample</th><th>Locus</th><th>Alleles</th><th>Type</th><th>GT</th><th class="num">WSAF</th><th class="num">QUAL</th><th class="num">DP</th><th class="num">AD</th><th>Source</th></tr></thead>
+      <tbody>{''.join(var_html) or '<tr><td colspan="10">No variants called above quality thresholds.</td></tr>'}</tbody>
     </table>
   </div>
 """
@@ -1308,6 +1339,8 @@ def run_variationloop_galaxy(
     logan_mode: str = "auto",
     logan_min_ka: str = "adapt",
     logan_min_wsaf: float = 0.25,
+    ploidy: str = "diploid",
+    min_wsaf: float | None = None,
     targets_bed: str | Path | None = None,
     cram_pad_bp: int = 1000,
     reads: Sequence[str] | None = None,
@@ -1341,6 +1374,10 @@ def run_variationloop_galaxy(
     eff_logan_mode = str(logan_mode or "auto").strip().lower()
     if eff_logan_mode not in ("auto", "logan_only", "off"):
         raise ValueError(f"Unsupported logan_mode {logan_mode!r}; expected 'auto', 'logan_only', or 'off'")
+    eff_ploidy = str(ploidy or "diploid").strip().lower()
+    if eff_ploidy not in ("haploid", "diploid"):
+        raise ValueError(f"Unsupported ploidy {ploidy!r}; expected 'haploid' or 'diploid'")
+    eff_min_wsaf = max(0.05, min(0.99, float(min_wsaf if min_wsaf is not None else logan_min_wsaf)))
 
     if host_depletion_mode is not None:
         eff_dep_mode = str(host_depletion_mode).strip().lower()
@@ -1582,6 +1619,8 @@ def run_variationloop_galaxy(
             indel_min_qual=float(indel_min_qual),
             enable_reassembly=bool(enable_reassembly),
             dedup_bits=eff_dedup_bits,
+            ploidy=eff_ploidy,
+            haploid_min_wsaf=eff_min_wsaf,
         )
         chosen_mapper: str | None = None
         sample_tels: list[dict[str, Any]] = []
@@ -1712,7 +1751,8 @@ def run_variationloop_galaxy(
                     snv_min_qual=float(snv_min_qual),
                     indel_min_qual=float(indel_min_qual),
                     min_ka_mode=str(logan_min_ka or "adapt"),
-                    min_wsaf=float(logan_min_wsaf),
+                    min_wsaf=eff_min_wsaf,
+                    ploidy=eff_ploidy,
                     local_unitigs_path=local_u,
                     log=lambda m: _log(f"  [{idx_j}/{len(jobs)}] {m}"),
                 )
@@ -1831,7 +1871,7 @@ def run_variationloop_galaxy(
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        var_cols = ["sample_id", "chrom", "pos", "ref", "alt", "kind", "gt", "gq", "dp", "ad_ref", "ad_alt", "qual", "source"]
+        var_cols = ["sample_id", "chrom", "pos", "ref", "alt", "kind", "gt", "gq", "dp", "ad_ref", "ad_alt", "wsaf", "qual", "source"]
         var_schema = pa.schema(
             [
                 ("sample_id", pa.string()),
@@ -1845,6 +1885,7 @@ def run_variationloop_galaxy(
                 ("dp", pa.float64()),
                 ("ad_ref", pa.float64()),
                 ("ad_alt", pa.string()),
+                ("wsaf", pa.float64()),
                 ("qual", pa.float64()),
                 ("source", pa.string()),
             ]
@@ -1897,6 +1938,7 @@ def run_variationloop_galaxy(
                             "dp": pd.to_numeric(df_s["dp"], errors="coerce").astype("float64"),
                             "ad_ref": pd.to_numeric(df_s["ad_ref"], errors="coerce").astype("float64"),
                             "ad_alt": df_s["ad_alt"].astype(str),
+                            "wsaf": pd.to_numeric(df_s["wsaf"], errors="coerce").astype("float64"),
                             "qual": pd.to_numeric(df_s["qual"], errors="coerce").astype("float64"),
                             "source": df_s["source"].astype(str),
                         }
@@ -1947,6 +1989,8 @@ def run_variationloop_galaxy(
 
         summary_stats = {
             "mode": eff_mode,
+            "ploidy": eff_ploidy,
+            "min_wsaf": eff_min_wsaf,
             "reference_label": ref_lbl,
             "n_samples": len(jobs),
             "n_variants": total_variants,
@@ -1977,6 +2021,8 @@ def run_variationloop_galaxy(
             "version": "0.4.0",
             "blueprint_id": "variationloop",
             "mode": eff_mode,
+            "ploidy": eff_ploidy,
+            "min_wsaf": eff_min_wsaf,
             "summary": summary_stats,
             "samples": sample_records,
         }

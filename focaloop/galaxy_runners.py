@@ -1614,8 +1614,18 @@ def run_warm_engine_query(
             if not set_a or not set_b:
                 raise ValueError(f"Both comparison groups must contain at least one sample (got {len(set_a)} vs {len(set_b)}).")
 
-            def _gt_dosage(gt: Any) -> float:
+            state_ploidy = str(meta.get("ploidy") or (meta.get("summary") or {}).get("ploidy") or "diploid").strip().lower()
+
+            def _row_allele_freq(gt: Any, wsaf: Any) -> float:
                 s = str(gt or "").replace("|", "/")
+                if state_ploidy == "haploid" or s == "1":
+                    try:
+                        w = float(wsaf)
+                        if np.isfinite(w):
+                            return float(np.clip(w, 0.0, 1.0))
+                    except (TypeError, ValueError):
+                        pass
+                    return 1.0 if s in ("1", "1/1") else (0.5 if s in ("0/1", "1/0", "1/2", "2/1") else 0.0)
                 if s in ("1/1", "1"):
                     return 1.0
                 if s in ("0/1", "1/0", "1/2", "2/1"):
@@ -1636,7 +1646,8 @@ def run_warm_engine_query(
                         vsub = vsub[(vsub["chrom"].astype(str) == ch_h) & (vsub["pos"] >= s_h) & (vsub["pos"] <= e_h)]
                     else:
                         vsub = vsub[vsub["chrom"].astype(str) == key]
-                vsub["dosage"] = vsub["gt"].map(_gt_dosage)
+                ws_col = vsub["wsaf"] if "wsaf" in vsub.columns else pd.Series([np.nan] * len(vsub), index=vsub.index)
+                vsub["dosage"] = [_row_allele_freq(g, w) for g, w in zip(vsub["gt"], ws_col)]
                 for (ch, pos, ref, alt), grp_df in vsub.groupby(["chrom", "pos", "ref", "alt"], sort=True):
                     da = grp_df.loc[grp_df["sample_id"].astype(str).isin(set_a), "dosage"].sum()
                     db = grp_df.loc[grp_df["sample_id"].astype(str).isin(set_b), "dosage"].sum()
