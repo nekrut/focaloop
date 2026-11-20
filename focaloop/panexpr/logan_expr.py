@@ -194,11 +194,14 @@ def stream_logan_expression_run(
                         break
                     wbytes += len(chunk)
                     dst_stream.write(chunk)
+            except (BrokenPipeError, OSError):
+                pass
             finally:
-                try:
-                    dst_stream.close()
-                except Exception:
-                    pass
+                for st in (dst_stream, src_stream):
+                    try:
+                        st.close()
+                    except Exception:
+                        pass
 
         with open(prep_err, "wb") as f_perr, open(aln_err, "wb") as f_aerr, open(ec_err, "wb") as f_eerr:
             if local_unitigs_path is not None:
@@ -219,8 +222,10 @@ def stream_logan_expression_run(
                 feeder = None
             else:
                 url = logan_unitigs_url(acc)
+                # Use speed-based stall detection instead of hard --max-time or in-pipe --retry
+                # so large archives finish cleanly and retries tear down/restart the full pipeline.
                 p_curl = subprocess.Popen(
-                    ["curl", "-4", "-sSL", "--fail", "--retry", "5", "--retry-delay", "2", "--max-time", "600", url],
+                    ["curl", "-4", "-sSL", "--fail", "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "120", url],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
@@ -262,15 +267,30 @@ def stream_logan_expression_run(
 
             if feeder is not None:
                 feeder.join()
-            return [p.wait() for p in procs], wbytes
+            rcs_rev = []
+            for proc in reversed(procs):
+                if proc is p_curl and proc.poll() is None:
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                rcs_rev.append(proc.wait())
+            return list(reversed(rcs_rev)), wbytes
 
     cur_aln_name, cur_aln_bin = aligner_name, aligner_bin
     rcs, wire_bytes = _run_once(cur_aln_name, cur_aln_bin)
-    # Retry once on transient mid-stream S3/curl network reset
-    if local_unitigs_path is None and len(rcs) == 5 and rcs[0] in (18, 28, 35, 52, 56, 92):
-        log(f"Transient Logan download error for {acc} (curl rc={rcs[0]}), retrying once...")
-        time.sleep(2.0)
-        rcs, wire_bytes = _run_once(cur_aln_name, cur_aln_bin)
+    # Full-pipeline retry (up to 2x) on transient mid-stream S3/curl network failure or stall
+    for retry_i in range(2):
+        if local_unitigs_path is None and len(rcs) == 5 and rcs[0] in (6, 7, 18, 28, 35, 52, 56, 92):
+            log(f"Transient Logan download error for {acc} (curl rc={rcs[0]}), retrying ({retry_i + 1}/2)...")
+            time.sleep(2.0 * (retry_i + 1))
+            rcs, wire_bytes = _run_once(cur_aln_name, cur_aln_bin)
+        else:
+            break
     # Fallback to classic bwa if bwa-mem2 exits on a negative signal
     aln_rc_idx = len(rcs) - 2
     if (

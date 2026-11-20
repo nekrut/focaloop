@@ -325,13 +325,17 @@ def run_varloop_logan_unitigs(
                         break
                     wbytes += len(chunk)
                     dst_stream.write(chunk)
+            except (BrokenPipeError, OSError):
+                pass
             finally:
-                try:
-                    dst_stream.close()
-                except Exception:
-                    pass
+                for st in (dst_stream, src_stream):
+                    try:
+                        st.close()
+                    except Exception:
+                        pass
 
         with open(prep_err, "wb") as f_perr, open(aln_err, "wb") as f_aerr, open(pile_err, "wb") as f_lerr:
+            p_curl: subprocess.Popen | None = None
             p_decomp: subprocess.Popen | None = None
             feeder: threading.Thread | None = None
             if local_unitigs_path is not None:
@@ -351,8 +355,11 @@ def run_varloop_logan_unitigs(
                     prep_stdin = open(lp, "rb")
             else:
                 url = logan_unitigs_url(acc)
+                # Never pass --max-time or --retry on a live zstd stdout pipe: large (>2 GB) archives legitimately
+                # stream >10 min, and mid-stream curl retries corrupt zstd / deadlock pipe_write. Use speed timeout
+                # plus full-pipeline outer retries below.
                 p_curl = subprocess.Popen(
-                    ["curl", "-4", "-sSL", "--fail", "--retry", "5", "--retry-delay", "2", "--max-time", "600", url],
+                    ["curl", "-4", "-sSL", "--fail", "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "120", url],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
@@ -393,14 +400,30 @@ def run_varloop_logan_unitigs(
 
             if feeder is not None:
                 feeder.join()
-            return [p.wait() for p in procs], wbytes
+            # Reap downstream processes first; terminate curl if it lingered after a broken pipe
+            rcs_rev = []
+            for proc in reversed(procs):
+                if proc is p_curl and proc.poll() is None:
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                rcs_rev.append(proc.wait())
+            return list(reversed(rcs_rev)), wbytes
 
     rcs, wire_bytes = _run_pipeline(aligner_name, aligner_bin, idx_ref)
-    # Retry once on transient curl network failure (e.g. partial transfer / timeout / reset)
-    if local_unitigs_path is None and len(rcs) == 5 and rcs[0] in (18, 28, 35, 52, 56, 92):
-        log(f"Transient Logan download error for {sample} ({acc}, curl rc={rcs[0]}), retrying once...")
-        time.sleep(2.0)
-        rcs, wire_bytes = _run_pipeline(aligner_name, aligner_bin, idx_ref)
+    # Full-pipeline retry (up to 2x) on transient curl network failure or stall
+    for retry_i in range(2):
+        if local_unitigs_path is None and len(rcs) == 5 and rcs[0] in (6, 7, 18, 28, 35, 52, 56, 92):
+            log(f"Transient Logan download error for {sample} ({acc}, curl rc={rcs[0]}), retrying ({retry_i + 1}/2)...")
+            time.sleep(2.0 * (retry_i + 1))
+            rcs, wire_bytes = _run_pipeline(aligner_name, aligner_bin, idx_ref)
+        else:
+            break
     # Fallback to classic bwa if bwa-mem2 crashes with a signal under auto mapper selection
     aln_rc_idx = len(rcs) - 2
     if (

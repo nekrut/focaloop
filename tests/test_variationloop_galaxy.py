@@ -732,3 +732,80 @@ def test_variationloop_haploid_wsaf_fastq_logan_and_query_fst(tmp_path: Path) ->
     # Exact finite-sample Hudson Fst for pa=0.80, pb=0.20, n_a=n_b=2: (0.36 - 0.16 - 0.16) / 0.68 = 0.0588
     assert abs(float(q_tbl.iloc[0]["hudson_fst"]) - (0.04 / 0.68)) < 1e-3
     assert q_res["engine"] == "variationloop"
+
+
+def test_logan_streaming_curl_flags_and_broken_pipe_no_deadlock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify Logan curl pipes use speed timeouts (never --max-time/--retry) and never deadlock on broken pipes."""
+    import subprocess
+    import sys
+    import time
+    from focaloop.malariavar import logan_var as LV
+    from focaloop.panexpr import logan_expr as LE
+
+    captured_curl_cmds: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def _mock_popen(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "curl":
+            captured_curl_cmds.append(list(cmd))
+            # Continuous stdout producer that would block forever in pipe_write if parent leaks p_curl.stdout
+            producer = [
+                sys.executable,
+                "-c",
+                "import sys\nchunk = b'X' * 65536\nfor _ in range(512):\n sys.stdout.buffer.write(chunk)\n sys.stdout.buffer.flush()\n",
+            ]
+            return real_popen(producer, *args, **kwargs)
+        if isinstance(cmd, list) and cmd and cmd[0] == "zstd":
+            # Downstream dies immediately after reading 4 bytes, triggering BrokenPipeError in _pipe_and_count
+            consumer = [sys.executable, "-c", "import sys; sys.stdin.buffer.read(4); sys.exit(1)"]
+            return real_popen(consumer, *args, **kwargs)
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(LV.subprocess, "Popen", _mock_popen)
+    monkeypatch.setattr(LE.subprocess, "Popen", _mock_popen)
+
+    ref_fa = TEST_DATA_DIR / "ref_chr20_mini.fa"
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="Logan VariationLoop stream failed"):
+        LV.run_varloop_logan_unitigs(
+            acc="SYNTH_PIPE_VAR",
+            sample="SYNTH_PIPE_VAR",
+            ref_fa=ref_fa,
+            ctg_lens={"chr20_mini": 8000},
+            out_vcf_gz=tmp_path / "var_pipe.vcf.gz",
+            work_dir=tmp_path / "w_var",
+            threads=1,
+        )
+    assert time.monotonic() - t0 < 10.0, "VariationLoop Logan pipe deadlocked on early downstream exit"
+
+    tx_fa = tmp_path / "tx.fa"
+    tx_fa.write_text(">tx1\n" + ("ACGTACGTACGT" * 20) + "\n", encoding="utf-8")
+    tx2g = tmp_path / "tx2g.tsv"
+    tx2g.write_text("tx1\tg1\n", encoding="utf-8")
+    prep_bin, ec_bin = LE.ensure_expr_logan_bins()
+    aln_name, aln_bin = LE._select_unitig_aligner()
+    LE._build_aligner_index(aln_name, aln_bin, tx_fa, lambda _: None)
+    t1 = time.monotonic()
+    with pytest.raises(RuntimeError, match="Logan unitig stream failed"):
+        LE.stream_logan_expression_run(
+            acc="SYNTH_PIPE_EXPR",
+            tx_fa=tx_fa,
+            tx2gene=tx2g,
+            out_dir=tmp_path / "w_expr",
+            prep_bin=prep_bin,
+            ec_bin=ec_bin,
+            aligner_name=aln_name,
+            aligner_bin=aln_bin,
+            threads=1,
+        )
+    assert time.monotonic() - t1 < 10.0, "ExpressionLoop Logan pipe deadlocked on early downstream exit"
+
+    assert len(captured_curl_cmds) >= 2
+    for cmd in captured_curl_cmds:
+        assert "--max-time" not in cmd
+        assert "--retry" not in cmd
+        assert "--connect-timeout" in cmd
+        assert "--speed-limit" in cmd
+        assert "--speed-time" in cmd
