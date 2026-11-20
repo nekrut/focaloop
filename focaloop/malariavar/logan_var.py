@@ -282,6 +282,7 @@ def run_varloop_logan_unitigs(
     indel_min_qual: float = 15.0,
     min_ka_mode: str = "adapt",
     max_ka_adapt: float = 3.0,
+    min_wsaf: float = 0.25,
     local_unitigs_path: Path | None = None,
     log: Callable[[str], None] = lambda msg: None,
 ) -> dict[str, Any]:
@@ -445,6 +446,8 @@ def run_varloop_logan_unitigs(
     n_indel = 0
     ctg_order = {cn: idx for idx, cn in enumerate(ctg_lens.keys())}
 
+    eff_min_wsaf = max(0.05, min(0.99, float(min_wsaf)))
+    eff_indel_min_wsaf = max(eff_min_wsaf, 0.15)
     if not cand_df.empty:
         # Collapse any duplicate (chrom, pos, ref, alt) rows and score
         for row in cand_df.itertuples(index=False):
@@ -462,12 +465,12 @@ def run_varloop_logan_unitigs(
 
             if kind == "SNV":
                 qual = _wsaf_qual(ad_alt_f, max(dp_f - ad_alt_f, 0.0), err=0.005)
-                if qual < float(snv_min_qual) or ad_alt_f < 2.0 or wsaf < 0.10:
+                if qual < float(snv_min_qual) or ad_alt_f < 2.0 or wsaf < eff_min_wsaf:
                     continue
                 n_snv += 1
             else:
                 qual = _wsaf_qual(ad_alt_f, max(dp_f - ad_alt_f, 0.0), err=0.015)
-                if qual < float(indel_min_qual) or ad_alt_f < 2.0 or wsaf < 0.15:
+                if qual < float(indel_min_qual) or ad_alt_f < 2.0 or wsaf < eff_indel_min_wsaf:
                     continue
                 n_indel += 1
 
@@ -508,6 +511,7 @@ def run_varloop_logan_unitigs(
         "drop_ka": int(prep_m.get("drop_ka", 0)),
         "drop_host": int(prep_m.get("drop_host", 0)),
         "eff_min_ka": float(prep_m.get("eff_min_ka", 1.5)),
+        "min_wsaf": float(eff_min_wsaf),
         "med_len80_ka": float(prep_m.get("med_len80_ka", -1.0)),
         "sam_records": int(pile_m.get("sam_records", 0)),
         "reads_counted": int(pile_m.get("counted_unitigs", 0)),

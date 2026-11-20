@@ -463,8 +463,9 @@ def test_variationloop_parallel_logan_cohort_workers_and_order(
     seen_tids: set[int] = set()
     lock = threading.Lock()
 
-    def _fake_run_logan(*, acc, sample, ctg_lens, out_vcf_gz, threads, **kw):
+    def _fake_run_logan(*, acc, sample, ctg_lens, out_vcf_gz, threads, min_wsaf=0.25, **kw):
         import time as _t
+        assert abs(min_wsaf - 0.25) < 1e-9
         _t.sleep(0.05)
         with lock:
             seen_threads.append(threads)

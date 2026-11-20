@@ -81,6 +81,7 @@ focaloop variationloop
     #end if
     --host-depletion-mode '$streaming_options.host_depletion_mode'
     --logan-min-ka '$streaming_options.logan_min_ka'
+    --logan-min-wsaf $streaming_options.logan_min_wsaf
     --cram-pad-bp $streaming_options.cram_pad_bp
     --subsample-fraction $streaming_options.subsample_fraction
     --mapper '$streaming_options.mapper'
@@ -226,6 +227,7 @@ ${a}	${gname}	${a}
                 <option value="2.0">Fixed minimum ka = 2.0 (balanced)</option>
                 <option value="3.0">Fixed minimum ka = 3.0 (high-depth samples)</option>
             </param>
+            <param argument="--logan-min-wsaf" type="float" min="0.05" max="0.95" value="0.25" label="Minimum within-sample allele fraction (WSAF, Logan unitigs)" help="Minimum weighted alternate allele fraction required to report a variant from Logan unitigs (default 0.25 balances precision and clonal sensitivity across haploid and diploid genomes). Lower to 0.10-0.15 to capture minor clones in mixed haploid infections, or raise to 0.50 for major-allele-only calls."/>
             <param argument="--cram-pad-bp" type="integer" min="0" max="50000" value="1000" label="Flanking padding around BED targets for CRAM slicing (bp)" help="Extra bases included on both sides of each BED interval when selecting compressed CRAM containers (applies to indexed CRAM inputs only)."/>
             <param argument="--subsample-fraction" type="float" min="0.01" max="1.0" value="1.0" label="Read subsampling fraction (raw FASTQ only, 1.0 = all reads)" help="Deterministically retains this fraction of paired FASTQ reads before alignment (ignored for BAM/CRAM and Logan unitig inputs). Leave at 1.0 to analyze every read."/>
             <param argument="--mapper" type="select" label="Read and unitig aligner" help="Auto selects the fastest working aligner installed on the server (BWA-MEM2 preferred for Logan unitigs, strobealign/minimap2/BWA-MEM2 for raw FASTQ).">
@@ -484,6 +486,7 @@ sample_2	site_B	https://example.org/alignments/sample_2.cram	https://example.org
 
 - **Target regions (`--targets-bed`, optional):** 0-based BED file (`chrom`, `start`, `end`). Restricts variant calling, local haplotype reassembly, compressed CRAM block slicing, and k-mer pre-filtering to your regions of interest.
 - **Pre-assembled Logan unitig streaming (`--logan-mode`):** Enabled in **Automatic** mode for public SRA/ENA accessions. Uses compact pre-assembled unitig graphs (~10-20x smaller than raw reads) when available in Logan and falls back seamlessly to raw reads otherwise.
+- **Minimum within-sample allele fraction (`--logan-min-wsaf`):** Applies to Logan unitig calls (default `0.25`). Every VCF record preserves the continuous weighted alternate allele fraction (`INFO/AF` and `FORMAT/AD`), avoiding forced diploid assumptions on haploid or polyclonal microbial/parasite samples. Lower to `0.10-0.15` to detect minor clones in mixed infections, or raise to `0.50` for major-allele calls only.
 - **Host and off-target pre-filtering (`--host-depletion-mode`):** Under **Automatic**, builds a fast 15-mer filter for Logan unitigs (up to 50 Mb target/reference) and a 31-mer filter for BED-targeted FASTQs (up to 45 Mb), while skipping pre-filtering on whole-genome FASTQ runs.
 - **Local haplotype reassembly (`--reassembly`):** Enabled by default. Reassembles active regions around indels and clustered variants before genotyping.
 - **Quality thresholds (`--min-mapq`, `--min-bq`, `--snv-min-qual`, `--indel-min-qual`):** Default MAPQ 20, Phred base quality 13, SNV QUAL 20, and indel QUAL 15 provide a balanced sensitivity/precision operating point across microbial, pathogen, and diploid eukaryotic genomes.

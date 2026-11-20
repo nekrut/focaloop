@@ -1307,6 +1307,7 @@ def run_variationloop_galaxy(
     sra_accessions: str | None = None,
     logan_mode: str = "auto",
     logan_min_ka: str = "adapt",
+    logan_min_wsaf: float = 0.25,
     targets_bed: str | Path | None = None,
     cram_pad_bp: int = 1000,
     reads: Sequence[str] | None = None,
@@ -1711,6 +1712,7 @@ def run_variationloop_galaxy(
                     snv_min_qual=float(snv_min_qual),
                     indel_min_qual=float(indel_min_qual),
                     min_ka_mode=str(logan_min_ka or "adapt"),
+                    min_wsaf=float(logan_min_wsaf),
                     local_unitigs_path=local_u,
                     log=lambda m: _log(f"  [{idx_j}/{len(jobs)}] {m}"),
                 )
