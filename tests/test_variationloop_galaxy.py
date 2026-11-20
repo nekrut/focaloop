@@ -415,3 +415,11 @@ def test_variationloop_multisample_paired_collection_auto_names_and_unified_mode
     assert meta_cram["summary"]["mode"] == "focused_cram"
     assert meta_cram["samples"][0]["sample"] == "patient_01"
     assert "patient_01" in out_vcf_cram.read_text(encoding="utf-8")
+
+    # Clean sample-name preservation for numbered list:paired element identifiers
+    from focaloop.runners_variation import _clean_sample_name
+    assert _clean_sample_name("sample_1") == "sample_1"
+    assert _clean_sample_name("sample_2") == "sample_2"
+    assert _clean_sample_name("patient_1.bam") == "patient_1"
+    assert _clean_sample_name("sample_R1.fastq.gz") == "sample"
+    assert _clean_sample_name("sample_1.fastq.gz") == "sample"

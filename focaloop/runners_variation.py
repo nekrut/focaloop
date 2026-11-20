@@ -53,8 +53,10 @@ def _clean_sample_name(raw: str | Path | None, fallback: str = "sample_1") -> st
     base = Path(txt).name if ("/" in txt or "\\" in txt) else txt
     if base.lower().endswith(".dat") and base.lower().startswith("dataset_"):
         return fallback
+    had_fastq_ext = bool(re.search(r"\.(?:fastqsanger|fastq|fq)(?:\.gz|\.bz2|\.zst)?$", base, re.I))
     stem = _READ_EXT_RE.sub("", base)
-    stem = _MATE_SUFFIX_RE.sub("", stem)
+    if had_fastq_ext or re.search(r"(?:_R[12]|_R[12]_001)$", stem, re.I):
+        stem = _MATE_SUFFIX_RE.sub("", stem)
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("_.")
     return cleaned or fallback
 
