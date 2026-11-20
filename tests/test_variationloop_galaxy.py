@@ -310,6 +310,8 @@ def test_variationloop_xml_iuc_standards_and_no_sieve() -> None:
         param_names.add(pname)
         assert pname in template_text, f"Orphaned param {pname!r} not referenced in <command> or <configfiles>"
     assert "sample_name" not in param_names, "Manual sample_name box should not appear in unified variationloop.xml"
+    src_opts = [o.attrib["value"] for o in root.findall(".//conditional[@name='input_source']/param[@name='source_type']/option")]
+    assert src_opts == ["history_paired_list", "history_bam", "public_sra"], f"Unexpected input_source options: {src_opts}"
 
     # Zero semicolons in user-facing XML text
     for el in root.iter():
@@ -319,7 +321,7 @@ def test_variationloop_xml_iuc_standards_and_no_sieve() -> None:
     # Test-data files exist and < 1 MB; every <test> has expect_num_outputs and no pipe syntax
     tests_el = root.find("tests")
     test_els = tests_el.findall("test")
-    assert len(test_els) >= 4
+    assert len(test_els) >= 3
     total_td_bytes = 0
     for t in test_els:
         assert "expect_num_outputs" in t.attrib

@@ -43,16 +43,6 @@ focaloop variationloop
             --manifest '$input_source.group_sheet'
         #end if
         --logan-mode 'off'
-    #elif str($input_source.source_type) == "history_paired_single"
-        --reads-r1 '$input_source.paired_read.forward'
-        --reads-r2 '$input_source.paired_read.reverse'
-        --read-ids '${str($input_source.paired_read.element_identifier or $input_source.paired_read.name).replace("'", "_")}'
-        --logan-mode 'off'
-    #elif str($input_source.source_type) == "history_fq_pair"
-        --reads-r1 '$input_source.reads_r1'
-        --reads-r2 '$input_source.reads_r2'
-        --read-ids '${str($input_source.reads_r1.element_identifier).replace("'", "_")}'
-        --logan-mode 'off'
     #elif str($input_source.source_type) == "history_bam"
         --bam
         #for $b in $input_source.bam
@@ -157,23 +147,14 @@ ${a}	${gname}	${a}
         </conditional>
 
         <conditional name="input_source">
-            <param name="source_type" type="select" label="Sequencing input source" help="Call variants across a multi-sample paired collection, a single paired sample, aligned BAM/CRAM file(s), or public SRA/ENA runs and remote cohort manifests. Sample names in VCF headers and reports are derived automatically from your Galaxy collection/dataset names, run accessions, or manifest.">
-                <option value="history_paired_list" selected="true">Galaxy History paired-end collection (list:paired) — multi-sample cohort</option>
-                <option value="history_paired_single">Galaxy History single paired-end sample (paired collection)</option>
-                <option value="history_fq_pair">Galaxy History separate forward and reverse FASTQ files (R1 and R2)</option>
+            <param name="source_type" type="select" label="Sequencing input source" help="Call variants across a paired-end FASTQ collection (one or more samples), aligned BAM/CRAM file(s), or public SRA/ENA runs and remote cohort manifests. Sample names in VCF headers and reports are derived automatically from your Galaxy collection/dataset names, run accessions, or manifest.">
+                <option value="history_paired_list" selected="true">Galaxy History paired-end FASTQ collection (list:paired)</option>
                 <option value="history_bam">Galaxy History aligned BAM or CRAM file(s)</option>
                 <option value="public_sra">Public SRA/ENA run accessions or remote cohort manifest (Logan unitigs or raw streaming)</option>
             </param>
             <when value="history_paired_list">
-                <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Paired-end FASTQ collection (list:paired)" help="Galaxy list-of-pairs collection containing one or more samples. Each pair's element identifier becomes its sample name in the merged multi-sample VCF, summary table, HTML report, and saved cohort state."/>
+                <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Paired-end FASTQ collection (list:paired)" help="Galaxy list-of-pairs collection containing one or more samples. Each pair's element identifier becomes its sample name in the VCF (merged across all samples for cohorts), summary table, HTML report, and saved state bundle."/>
                 <param name="group_sheet" type="data" format="tabular,tsv,csv" optional="true" label="Population or group metadata sheet (TSV or CSV, optional)" help="Optional table with sample_id and group (or population) columns matching collection element identifiers. Leave empty if you do not need group labels for downstream Focaloop Query comparisons."/>
-            </when>
-            <when value="history_paired_single">
-                <param name="paired_read" type="data_collection" collection_type="paired" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Paired-end FASTQ dataset pair (paired)" help="Single paired-end collection (forward and reverse mates). The collection identifier becomes the sample name automatically. You can also map this input over a list:paired collection to run separate per-sample jobs and VCFs."/>
-            </when>
-            <when value="history_fq_pair">
-                <param argument="--reads-r1" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Forward reads (R1 FASTQ)" help="Forward (R1) sequencing reads in FASTQ or gzip-compressed FASTQ format. The sample name is derived automatically from this dataset's name."/>
-                <param argument="--reads-r2" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Reverse reads (R2 FASTQ)" help="Reverse (R2) sequencing reads paired with R1."/>
             </when>
             <when value="history_bam">
                 <param argument="--bam" type="data" format="bam,cram" multiple="true" label="Aligned reads (one or more BAM or CRAM datasets)" help="Coordinate-sorted BAM or CRAM file(s) aligned to the selected reference genome (accepts a single dataset, multiple datasets, or a list collection). Dataset names become sample names automatically. Indexed CRAM inputs automatically use compressed-block region slicing."/>
@@ -329,18 +310,22 @@ ${a}	${gname}	${a}
             </output>
         </test>
 
-        <!-- Test 2: Single paired collection with explicit 31-mer target pre-filter -->
+        <!-- Test 2: Single-sample list:paired collection with explicit 31-mer target pre-filter -->
         <test expect_num_outputs="4">
             <conditional name="ref_source">
                 <param name="source" value="history"/>
                 <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
             </conditional>
             <conditional name="input_source">
-                <param name="source_type" value="history_paired_single"/>
-                <param name="paired_read">
-                    <collection type="paired">
-                        <element name="forward" value="variationloop/sample_R1.fastq.gz" ftype="fastqsanger.gz"/>
-                        <element name="reverse" value="variationloop/sample_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                <param name="source_type" value="history_paired_list"/>
+                <param name="paired_reads">
+                    <collection type="list:paired">
+                        <element name="sample_1">
+                            <collection type="paired">
+                                <element name="forward" value="variationloop/sample_R1.fastq.gz" ftype="fastqsanger.gz"/>
+                                <element name="reverse" value="variationloop/sample_R2.fastq.gz" ftype="fastqsanger.gz"/>
+                            </collection>
+                        </element>
                     </collection>
                 </param>
             </conditional>
@@ -351,12 +336,14 @@ ${a}	${gname}	${a}
             <output name="variants_vcf">
                 <assert_contents>
                     <has_text text="#CHROM"/>
+                    <has_text text="sample_1"/>
                     <has_text text="0/1"/>
                 </assert_contents>
             </output>
             <output name="variants_summary">
                 <assert_contents>
                     <has_text text="sample_id"/>
+                    <has_text text="sample_1"/>
                     <has_text text="SNV"/>
                     <has_text text="INDEL"/>
                 </assert_contents>
@@ -364,6 +351,7 @@ ${a}	${gname}	${a}
             <output name="variationloop_report">
                 <assert_contents>
                     <has_text text="Focaloop VariationLoop"/>
+                    <has_text text="sample_1"/>
                 </assert_contents>
             </output>
             <output name="variationloop_state">
@@ -414,53 +402,11 @@ ${a}	${gname}	${a}
                 </assert_contents>
             </output>
         </test>
-
-        <!-- Test 4: Separate R1/R2 History FASTQ files with auto-derived sample name -->
-        <test expect_num_outputs="4">
-            <conditional name="ref_source">
-                <param name="source" value="history"/>
-                <param name="ref_fasta" value="variationloop/ref_chr20_mini.fa" ftype="fasta"/>
-            </conditional>
-            <conditional name="input_source">
-                <param name="source_type" value="history_fq_pair"/>
-                <param name="reads_r1" value="variationloop/sample_R1.fastq.gz" ftype="fastqsanger.gz"/>
-                <param name="reads_r2" value="variationloop/sample_R2.fastq.gz" ftype="fastqsanger.gz"/>
-            </conditional>
-            <param name="targets_bed" value="variationloop/targets.bed" ftype="bed"/>
-            <section name="streaming_options">
-                <param name="host_depletion_mode" value="off"/>
-            </section>
-            <output name="variants_vcf">
-                <assert_contents>
-                    <has_text text="#CHROM"/>
-                    <has_text text="sample"/>
-                    <has_text text="0/1"/>
-                    <has_text text="1/1"/>
-                </assert_contents>
-            </output>
-            <output name="variants_summary">
-                <assert_contents>
-                    <has_text text="sample_id"/>
-                    <has_text text="SNV"/>
-                    <has_text text="INDEL"/>
-                </assert_contents>
-            </output>
-            <output name="variationloop_report">
-                <assert_contents>
-                    <has_text text="Focaloop VariationLoop"/>
-                </assert_contents>
-            </output>
-            <output name="variationloop_state">
-                <assert_contents>
-                    <has_size min="500"/>
-                </assert_contents>
-            </output>
-        </test>
     </tests>
     <help format="markdown"><![CDATA[
 **What this tool does**
 
-**Focaloop VariationLoop** calls single-nucleotide variants (SNVs) and insertions/deletions (indels) for any organism from Galaxy paired-end FASTQ collections, individual FASTQ pairs, aligned BAM/CRAM datasets, or public SRA/ENA runs (using pre-assembled Logan unitigs when available). It handles both single samples and multi-sample cohorts natively, combining streaming alignment, optional host/off-target k-mer pre-filtering, compressed-block CRAM region slicing, local haplotype reassembly, and a compact `.focaloop.tar.zst` state bundle for instant downstream queries in **Focaloop Query**.
+**Focaloop VariationLoop** calls single-nucleotide variants (SNVs) and insertions/deletions (indels) for any organism from Galaxy paired-end FASTQ collections (`list:paired`), aligned BAM/CRAM datasets, or public SRA/ENA runs (using pre-assembled Logan unitigs when available). It handles both single samples and multi-sample cohorts natively, combining streaming alignment, optional host/off-target k-mer pre-filtering, compressed-block CRAM region slicing, local haplotype reassembly, and a compact `.focaloop.tar.zst` state bundle for instant downstream queries in **Focaloop Query**.
 
 -----
 
@@ -477,9 +423,7 @@ ${a}	${gname}	${a}
 
 | Your data | Sequencing input source to choose | Sample names & output behavior |
 |---|---|---|
-| Multiple paired-end samples in your History | **Paired-end collection (list:paired) — multi-sample cohort** | Element identifiers become sample names automatically. Runs one cohort job and writes a single merged multi-sample VCF + cohort state bundle |
-| One paired-end sample (or scatter 1 job per sample) | **Single paired-end sample (paired collection)** | Collection name becomes the sample name automatically. Map over a `list:paired` collection if you prefer separate per-sample jobs and VCFs |
-| Two separate R1 and R2 FASTQ files | **Separate forward and reverse FASTQ files (R1 and R2)** | Sample name is derived automatically from the R1 dataset name |
+| One or more paired-end samples in your History | **Paired-end FASTQ collection (list:paired)** | Element identifiers become sample names automatically. Runs one job and writes a single VCF (merged multi-sample VCF for cohorts) + cohort state bundle |
 | One or more aligned BAM or CRAM datasets | **Aligned BAM or CRAM file(s)** | Dataset names become sample names automatically. Indexed CRAM files automatically slice only the compressed containers overlapping your BED targets |
 | Public SRA/ENA runs or remote CRAM/FASTQ URLs | **Public SRA/ENA run accessions or remote cohort manifest** | Enter a flat accession list, organize accessions into population/condition groups inline, or upload a TSV/CSV manifest. Streams compact Logan unitigs automatically when available |
 
@@ -497,8 +441,8 @@ Choose your reference genome using one of three sources:
 
 You never need to type a manual sample name. VariationLoop derives clean, VCF-compatible sample names automatically:
 
-- From each pair's **element identifier** in a `list:paired` collection or single `paired` collection
-- From the **dataset name** of your forward (R1) FASTQ or BAM/CRAM file (automatically stripping `.fastq.gz`, `_R1`, `.bam`, and `.cram` suffixes)
+- From each pair's **element identifier** in a `list:paired` collection
+- From the **dataset name** of each BAM/CRAM file (automatically stripping `.bam` and `.cram` suffixes)
 - From the **run accession** when using the flat accession list or inline group builder
 - From the **`sample_id`** column when supplying a cohort TSV/CSV manifest
 
@@ -557,7 +501,7 @@ sample_2	site_B	https://example.org/alignments/sample_2.cram	https://example.org
 
 **Tips and troubleshooting**
 
-- **Single merged VCF vs. separate per-sample VCFs:** Choose **Paired-end collection (`list:paired`)** to call an entire cohort in one job with a merged multi-sample VCF and shared cohort state bundle. Choose **Single paired-end sample (`paired`)** and map it over a `list:paired` collection when you want Galaxy to scatter one job and one VCF per sample.
+- **Single sample in a `list:paired` collection:** Use Galaxy's **Build List of Dataset Pairs** action to wrap one or more R1/R2 sample pairs into a `list:paired` collection before running VariationLoop.
 - **Target pre-filter memory cap exceeded:** The 31-mer raw-FASTQ pre-filter supports target spans up to 45 Mb. For large whole genomes, either provide a BED file covering your genes/panels of interest or leave **Host and off-target pre-filtering** on **Automatic** or **Off**.
 - **Logan unitigs unavailable for a newly deposited run:** Keep **Pre-assembled Logan unitig streaming** on **Automatic** so VariationLoop streams raw reads cleanly for any run not yet indexed in Logan.
 - **Reference contig naming:** Ensure contig names in your optional BED file and BAM/CRAM header match the selected reference genome (for example, `chr1` vs. `1`).
