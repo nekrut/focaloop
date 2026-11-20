@@ -285,7 +285,7 @@ def run_varloop_logan_unitigs(
     aligner_name, aligner_bin = _select_var_aligner(mapper)
     idx_ref = ensure_var_aligner_index(aligner_name, aligner_bin, ref_fa, work_dir, log)
 
-    sample_work = work_dir / f"logan_var_{sample}"
+    sample_work = work_dir / f"logan_var_{out_vcf_gz.stem}"
     sample_work.mkdir(parents=True, exist_ok=True)
     cand_tsv = sample_work / "candidates.tsv"
     prep_err = sample_work / "prep.err"
@@ -454,6 +454,7 @@ def run_varloop_logan_unitigs(
 
     records.sort(key=lambda r: (ctg_order.get(r["chrom"], 10**9), r["pos"], r["ref"], r["alt"]))
     _write_vcf_gz(out_vcf_gz, sample, ctg_lens, records)
+    shutil.rmtree(sample_work, ignore_errors=True)
     wall_s = round(time.time() - t0, 2)
 
     return {

@@ -423,3 +423,85 @@ def test_variationloop_multisample_paired_collection_auto_names_and_unified_mode
     assert _clean_sample_name("patient_1.bam") == "patient_1"
     assert _clean_sample_name("sample_R1.fastq.gz") == "sample"
     assert _clean_sample_name("sample_1.fastq.gz") == "sample"
+
+
+def test_variationloop_parallel_logan_cohort_workers_and_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify multi-sample Logan cohorts split across threads//4 concurrent workers and preserve order."""
+    import threading
+    from focaloop.malariavar import logan_var as LV
+    from focaloop import logan as LG
+
+    manifest = tmp_path / "cohort.tsv"
+    manifest.write_text(
+        "sample_id\tgroup\tsource\n"
+        "pv_01\tAF\tERR100001\n"
+        "pv_02\tAF\tERR100002\n"
+        "pv_03\tESEA\tERR100003\n"
+        "pv_04\tESEA\tERR100004\n"
+        "pv_05\tLAM\tERR100005\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        LG,
+        "probe_logan_runs",
+        lambda accs, kind="unitigs", **kw: {
+            "logan_runs": list(accs),
+            "fallback_runs": [],
+            "probes": {a: {"available": True, "content_length": 1024} for a in accs},
+            "total_logan_bytes": 1024 * len(accs),
+        },
+    )
+    monkeypatch.setattr(LV, "ensure_var_logan_bins", lambda: (Path("/bin/true"), Path("/bin/true")))
+    monkeypatch.setattr(LV, "_select_var_aligner", lambda mapper: ("bwa-mem2", "/bin/true"))
+    monkeypatch.setattr(LV, "ensure_var_aligner_index", lambda *a, **k: TEST_DATA_DIR / "ref_chr20_mini.fa")
+    monkeypatch.setattr(LV, "build_k15_reference_bitset", lambda *a, **k: tmp_path / "k15.bit")
+
+    seen_threads: list[int] = []
+    seen_tids: set[int] = set()
+    lock = threading.Lock()
+
+    def _fake_run_logan(*, acc, sample, ctg_lens, out_vcf_gz, threads, **kw):
+        import time as _t
+        _t.sleep(0.05)
+        with lock:
+            seen_threads.append(threads)
+            seen_tids.add(threading.get_ident())
+        out_vcf_gz.parent.mkdir(parents=True, exist_ok=True)
+        vcf_txt = (
+            "##fileformat=VCFv4.2\n"
+            "##contig=<ID=chr20_mini,length=8000>\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+            '##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype Quality">\n'
+            '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read Depth">\n'
+            '##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">\n'
+            f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}\n"
+            f"chr20_mini\t2201\t.\tC\tT\t99.0\tPASS\t.\tGT:GQ:DP:AD\t1/1:99:40:0,40\n"
+        )
+        out_vcf_gz.write_bytes(gzip.compress(vcf_txt.encode("utf-8")))
+        return {"sample": sample, "accession": acc, "source": "logan_unitigs", "n_variants": 1, "n_snv": 1, "n_indel": 0, "wire_bytes": 1024, "wall_s": 0.05}
+
+    monkeypatch.setattr(LV, "run_varloop_logan_unitigs", _fake_run_logan)
+
+    out_vcf = tmp_path / "pv.vcf"
+    out_var = tmp_path / "pv.tsv"
+    out_rep = tmp_path / "pv.html"
+    meta = run_variationloop_galaxy(
+        analysis_mode="auto",
+        manifest_path=manifest,
+        ref_fasta=TEST_DATA_DIR / "ref_chr20_mini.fa",
+        logan_mode="auto",
+        threads=20,
+        state_dir=tmp_path / "st_pv",
+        out_variants=out_var,
+        out_vcf=out_vcf,
+        out_report=out_rep,
+    )
+    assert meta["summary"]["n_samples"] == 5
+    assert meta["summary"]["mode"] == "logan_unitigs"
+    assert seen_threads == [4, 4, 4, 4, 4]
+    assert len(seen_tids) >= 2
+    chrom_line = [ln for ln in out_vcf.read_text(encoding="utf-8").splitlines() if ln.startswith("#CHROM")][0]
+    assert chrom_line.split("\t")[9:] == ["pv_01", "pv_02", "pv_03", "pv_04", "pv_05"]

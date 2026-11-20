@@ -72,6 +72,45 @@ def _dedup_sample_names(names: Sequence[str]) -> list[str]:
     return out
 
 
+def _bcftools_merge_batched(
+    vcf_paths: Sequence[Path],
+    merged_gz: Path,
+    work_dir: Path,
+    threads: int = 4,
+    batch_size: int = 150,
+) -> None:
+    """Hierarchically merge bgzipped+tabix VCFs in batches <= batch_size to avoid ulimit -n exhaustion."""
+    cur = [Path(p) for p in vcf_paths]
+    merge_threads = str(max(1, min(int(threads), 8)))
+    round_idx = 0
+    while len(cur) > batch_size:
+        round_idx += 1
+        next_round: list[Path] = []
+        bdir = work_dir / f"merge_r{round_idx}"
+        bdir.mkdir(parents=True, exist_ok=True)
+        for bi in range(0, len(cur), batch_size):
+            chunk = cur[bi : bi + batch_size]
+            if len(chunk) == 1:
+                next_round.append(chunk[0])
+                continue
+            fofn = bdir / f"batch_{bi // batch_size:04d}.fofn"
+            fofn.write_text("\n".join(str(p) for p in chunk) + "\n", encoding="utf-8")
+            out_b = bdir / f"batch_{bi // batch_size:04d}.vcf.gz"
+            subprocess.run(
+                ["bcftools", "merge", "--threads", merge_threads, "-l", str(fofn), "-Oz", "-o", str(out_b)],
+                check=True,
+            )
+            subprocess.run(["tabix", "-f", "-p", "vcf", str(out_b)], check=True)
+            next_round.append(out_b)
+        cur = next_round
+    fofn_final = work_dir / "merge_final.fofn"
+    fofn_final.write_text("\n".join(str(p) for p in cur) + "\n", encoding="utf-8")
+    subprocess.run(
+        ["bcftools", "merge", "--threads", merge_threads, "-l", str(fofn_final), "-Oz", "-o", str(merged_gz)],
+        check=True,
+    )
+
+
 def _merge_vcfs_pure_python(vcf_paths: Sequence[Path], out_vcf: Path) -> None:
     """Merge per-sample VCF(.gz) files into one multi-sample VCF when bcftools/tabix are absent."""
     meta_lines: list[str] = []
@@ -1559,7 +1598,7 @@ def run_variationloop_galaxy(
                 if is_insdc_run(j["src"]) and j["src"] not in local_map and j["sample"] not in local_map
             ]
             if cand_accs:
-                lprobe = probe_logan_runs(cand_accs, kind="unitigs")
+                lprobe = probe_logan_runs(cand_accs, kind="unitigs", max_workers=min(32, max(8, int(threads))))
                 logan_avail = set(lprobe["logan_runs"])
                 _log(
                     f"Logan probe: {len(logan_avail)}/{len(lprobe['probes'])} accessions available on logan-pub/u/ "
@@ -1572,7 +1611,12 @@ def run_variationloop_galaxy(
                         "Switch Logan mode to Automatic to fall back to raw read streaming."
                     )
             if logan_avail or analysis_mode == "logan_unitigs":
+                from .malariavar.logan_var import _select_var_aligner, ensure_var_aligner_index
+
                 prep_bin, _ = ensure_var_logan_bins()
+                # Pre-build shared aligner index once before concurrent Logan workers start
+                _aln_name, _aln_bin = _select_var_aligner(mapper)
+                ensure_var_aligner_index(_aln_name, _aln_bin, eff_ref, work_dir, _log)
                 logan_span = sum(max(0, e - s) for _, s, e in bed_regions) if bed_regions else total_genome_bp
                 want_k15 = (eff_dep_mode == "on") or (eff_dep_mode == "auto" and logan_span <= 50_000_000)
                 if want_k15:
@@ -1613,18 +1657,41 @@ def run_variationloop_galaxy(
                 kset_tab, kmeta = VG.build_target_kset(g, regs_k, bits=bits_k)
                 _log(f"Built target 31-mer pre-filter table ({kmeta['inserted_kmers']:,} k-mers across {target_span / 1e6:.2f} Mb)")
 
+        logan_indexed: list[tuple[int, dict[str, Any], Path]] = []
+        other_indexed: list[tuple[int, dict[str, Any], Path]] = []
         for idx_j, job in enumerate(jobs, 1):
             sid = job["sample"]
             src = job["src"]
-            s_vcf_gz = work_dir / "vcfs" / f"{idx_j:03d}_{re.sub(r'[^A-Za-z0-9_.-]', '_', sid)}.vcf.gz"
+            s_vcf_gz = work_dir / "vcfs" / f"{idx_j:04d}_{re.sub(r'[^A-Za-z0-9_.-]', '_', sid)}.vcf.gz"
             src_u = src.strip().upper()
             use_logan_for_job = (
                 (src_u in logan_avail and src not in local_map and sid not in local_map)
                 or (analysis_mode == "logan_unitigs" and Path(src).is_file())
             )
             if use_logan_for_job:
-                from .malariavar.logan_var import run_varloop_logan_unitigs
+                logan_indexed.append((idx_j, job, s_vcf_gz))
+            else:
+                other_indexed.append((idx_j, job, s_vcf_gz))
 
+        results_by_idx: dict[int, tuple[dict[str, Any], Path, pd.DataFrame]] = {}
+        log_lock = threading.Lock()
+
+        if logan_indexed:
+            from .malariavar.logan_var import run_varloop_logan_unitigs
+
+            logan_workers = min(len(logan_indexed), max(1, int(threads) // 4))
+            logan_per_threads = max(1, int(threads) // logan_workers)
+            if logan_workers > 1:
+                _log(
+                    f"Running {len(logan_indexed)} Logan samples across {logan_workers} concurrent workers "
+                    f"({logan_per_threads} aligner threads/worker)"
+                )
+
+            def _run_logan_item(item: tuple[int, dict[str, Any], Path]) -> tuple[int, dict[str, Any], Path, pd.DataFrame]:
+                idx_j, job, s_vcf_gz = item
+                sid = job["sample"]
+                src = job["src"]
+                src_u = src.strip().upper()
                 local_u = Path(src) if (analysis_mode == "logan_unitigs" and Path(src).is_file()) else None
                 tel = run_varloop_logan_unitigs(
                     acc=src_u,
@@ -1636,24 +1703,35 @@ def run_variationloop_galaxy(
                     targets_bed=Path(targets_bed) if targets_bed else None,
                     k15_bit=k15_bit_path,
                     mapper=mapper,
-                    threads=max(1, threads),
+                    threads=logan_per_threads,
                     min_mapq=int(min_mapq),
                     snv_min_qual=float(snv_min_qual),
                     indel_min_qual=float(indel_min_qual),
                     min_ka_mode=str(logan_min_ka or "adapt"),
                     local_unitigs_path=local_u,
-                    log=_log,
+                    log=lambda m: None,
                 )
-                used_engines.add("logan_unitigs")
-                sample_tels.append(tel)
-                per_sample_vcfs.append(s_vcf_gz)
-                var_frames.append(_vcf_to_dataframe(s_vcf_gz, sample_override=sid))
-                _log(
-                    f"  [{idx_j}/{len(jobs)}] {sid} (Logan): {tel.get('n_variants', 0)} variants, "
-                    f"{tel.get('wire_bytes', 0) / 1e6:.2f} MB wire ({tel.get('wall_s', 0):.2f}s)"
-                )
-                continue
+                df_s = _vcf_to_dataframe(s_vcf_gz, sample_override=sid)
+                with log_lock:
+                    _log(
+                        f"  [{idx_j}/{len(jobs)}] {sid} (Logan): {tel.get('n_variants', 0)} variants, "
+                        f"{tel.get('wire_bytes', 0) / 1e6:.2f} MB wire ({tel.get('wall_s', 0):.2f}s)"
+                    )
+                return idx_j, tel, s_vcf_gz, df_s
 
+            if logan_workers > 1:
+                with ThreadPoolExecutor(max_workers=logan_workers) as ex:
+                    for idx_j, tel, s_vcf_gz, df_s in ex.map(_run_logan_item, logan_indexed):
+                        results_by_idx[idx_j] = (tel, s_vcf_gz, df_s)
+            else:
+                for item in logan_indexed:
+                    idx_j, tel, s_vcf_gz, df_s = _run_logan_item(item)
+                    results_by_idx[idx_j] = (tel, s_vcf_gz, df_s)
+            used_engines.add("logan_unitigs")
+
+        for idx_j, job, s_vcf_gz in other_indexed:
+            sid = job["sample"]
+            src = job["src"]
             src_clean = src.split("?", 1)[0].lower()
             aln_fmt = None
             if src_clean.endswith(".cram"):
@@ -1743,10 +1821,14 @@ def run_variationloop_galaxy(
                     mapper_name=chosen_mapper,
                 )
 
+            results_by_idx[idx_j] = (tel, s_vcf_gz, _vcf_to_dataframe(s_vcf_gz, sample_override=sid))
+            _log(f"  [{idx_j}/{len(jobs)}] {sid}: {tel.get('n_variants', 0)} variants ({tel.get('total_wall_s', tel.get('wall_s', 0)):.2f}s)")
+
+        for idx_j in range(1, len(jobs) + 1):
+            tel, s_vcf_gz, df_s = results_by_idx[idx_j]
             sample_tels.append(tel)
             per_sample_vcfs.append(s_vcf_gz)
-            var_frames.append(_vcf_to_dataframe(s_vcf_gz, sample_override=sid))
-            _log(f"  [{idx_j}/{len(jobs)}] {sid}: {tel.get('n_variants', 0)} variants ({tel.get('total_wall_s', tel.get('wall_s', 0)):.2f}s)")
+            var_frames.append(df_s)
 
         eff_mode = (
             analysis_mode
@@ -1763,7 +1845,7 @@ def run_variationloop_galaxy(
                 _materialize_vcf_output(per_sample_vcfs[0], out_vcf_p)
             elif shutil.which("bcftools") and all(Path(str(p) + ".tbi").is_file() for p in per_sample_vcfs):
                 merged_gz = work_dir / "merged.vcf.gz"
-                subprocess.run(["bcftools", "merge", "-Oz", "-o", str(merged_gz), *[str(p) for p in per_sample_vcfs]], check=True)
+                _bcftools_merge_batched(per_sample_vcfs, merged_gz, work_dir, threads=threads)
                 _materialize_vcf_output(merged_gz, out_vcf_p)
             else:
                 _merge_vcfs_pure_python(per_sample_vcfs, out_vcf_p)
