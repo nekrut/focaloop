@@ -60,6 +60,7 @@ def compile_c_lib(name: str, c_path: str | Path, extra_flags: list[str] | None =
         lib_name = f"lib{name}_{digest}{ext}"
         for pre_dir in (
             os.environ.get("FOCALOOP_NATIVE_CACHE"),
+            str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
             "/opt/focaloop/native_cache",
             os.environ.get("PANEXPR_CACHE_DIR"),
         ):

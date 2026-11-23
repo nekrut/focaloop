@@ -170,9 +170,13 @@ GLCORE_BIN = Path(os.environ.get("GLCORE_BIN", str(Path(__file__).parent / "glco
 
 
 def _glcore_pre_dirs() -> tuple[str | None, ...]:
+    import sys
+
     return (
+        shutil.which("glcore") and str(Path(shutil.which("glcore")).parent),
         os.environ.get("FOCALOOP_NATIVE_CACHE"),
         os.environ.get("FOCALOOP_NATIVE_DIR"),
+        str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
         "/opt/focaloop/native_cache",
     )
 

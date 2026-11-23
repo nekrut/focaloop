@@ -27,7 +27,7 @@ focaloop query
         #if str($query_type.design).strip()
             --design '$query_type.design'
         #end if
-    #elif str($query_type.mode) == "fst"
+    #else
         --mode fst
         --contrast '${query_type.group_column}=${query_type.group_a}:${query_type.group_b}'
         #if str($query_type.subset).strip()
@@ -35,18 +35,6 @@ focaloop query
         #end if
         #if str($query_type.hypothesis).strip()
             --hypothesis '$query_type.hypothesis'
-        #end if
-    #else
-        --mode auto
-        --contrast '$query_type.contrast'
-        #if str($query_type.subset).strip()
-            --subset '$query_type.subset'
-        #end if
-        #if str($query_type.hypothesis).strip()
-            --hypothesis '$query_type.hypothesis'
-        #end if
-        #if str($query_type.design).strip()
-            --design '$query_type.design'
         #end if
     #end if
     --actor 'human'
@@ -61,10 +49,9 @@ focaloop query
         <param argument="--state" type="data" format="data" label="Saved Focaloop state bundle (.focaloop.tar.zst)" help="State archive produced by Focaloop ExpressionLoop, Focaloop VariationLoop (multi-group cohort), or a previous Focaloop Query run. GeneLoop state bundles cannot be queried here."/>
 
         <conditional name="query_type">
-            <param argument="--mode" type="select" label="Comparison type" help="Choose differential expression testing for an ExpressionLoop state, population allele-frequency and Fst comparison for a VariationLoop cohort state, or auto-detect.">
+            <param argument="--mode" type="select" label="Comparison type" help="Choose differential expression testing for an ExpressionLoop state or population allele-frequency and Fst comparison for a VariationLoop cohort state.">
                 <option value="contrast" selected="true">Differential expression contrast (ExpressionLoop state)</option>
                 <option value="fst">Population allele-frequency and Fst comparison (VariationLoop state)</option>
-                <option value="auto">Auto-detect from saved state (free-form contrast string)</option>
             </param>
             <when value="contrast">
                 <param name="factor_name" type="text" value="condition" label="Grouping column in original sample sheet" help="Name of the metadata column containing the groups you want to compare (for example, condition or treatment).">
@@ -106,25 +93,6 @@ focaloop query
                 </param>
                 <param argument="--hypothesis" type="text" value="" label="Specific chromosome or genomic interval to focus on (optional)" help="Optional chromosome name (for example, chr1) or interval (chr1:1000-5000) to restrict the comparison. Leave blank for all called sites.">
                     <validator type="regex" message="Use letters, digits, underscores, colons, dots, hyphens, or equals signs only">^[A-Za-z0-9_:.=-]*$</validator>
-                </param>
-            </when>
-            <when value="auto">
-                <param argument="--contrast" type="text" value="condition:treated:control" label="Comparison specification" help="Written as groupA:groupB or factor:groupA:groupB for expression states, or column=groupA:groupB for variant cohorts.">
-                    <validator type="regex" message="Use groupA:groupB, factor:groupA:groupB, or column=groupA:groupB">^([A-Za-z0-9_]+[:=])?[A-Za-z0-9_,.-]+:[A-Za-z0-9_,.-]+$</validator>
-                </param>
-                <param argument="--subset" type="text" value="" label="Filter samples to a subset (optional)" help="Optional space-separated metadata filters such as plate_id=plate1 timepoint=60m to restrict the query to a subgroup of samples.">
-                    <validator type="regex" message="Use space-separated column=val1,val2 clauses (letters, digits, underscores, dots, hyphens, commas, equals)">^($|[A-Za-z0-9_]+=[A-Za-z0-9_,.-]+(\s+[A-Za-z0-9_]+=[A-Za-z0-9_,.-]+)*)$</validator>
-                </param>
-                <param argument="--hypothesis" type="text" value="" label="Specific gene ID or genomic region to test (optional)" help="Leave blank to test the top discovery hit or genome-wide comparison automatically.">
-                    <validator type="regex" message="Use letters, digits, underscores, colons, dots, hyphens, or equals signs only">^[A-Za-z0-9_:.=-]*$</validator>
-                </param>
-                <param argument="--design" type="text" value="" label="Override statistical model formula (ExpressionLoop only, optional)" help="Optional formula such as ~batch + condition when querying an ExpressionLoop state.">
-                    <sanitizer>
-                        <valid initial="default">
-                            <add value="~"/>
-                        </valid>
-                    </sanitizer>
-                    <validator type="regex" message="Formula must start with ~ followed by valid column names">^($|~\s*[A-Za-z0-9_]+(\s*[+*:]\s*[A-Za-z0-9_]+)*)$</validator>
                 </param>
             </when>
         </conditional>
@@ -227,7 +195,6 @@ focaloop query
 |---|---|---|
 | **Focaloop ExpressionLoop** | **Differential expression contrast** | Column `condition`, Test group `dose_high`, Reference group `control` |
 | **Focaloop VariationLoop** (multi-group cohort) | **Population allele-frequency and Fst comparison** | Column `site`, First group `north`, Second group `south` |
-| Either (or scripted workflows) | **Auto-detect from saved state** | `condition:treated:control` or `site=north:south` |
 
 -----
 

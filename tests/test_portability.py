@@ -526,3 +526,59 @@ def test_ncbi_related_strain_dedup_and_multi_ref_expressionloop(tmp_path, monkey
     de_txt = (tmp_path / "de.tsv").read_text(encoding="utf-8")
     assert "v2:LEGACY_001458" in de_txt
     assert "GCF_000000001.1:LEGACY_001458" in de_txt
+
+
+def test_makefile_build_native_and_trimmed_geneloop_query_ui(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    import xml.etree.ElementTree as ET
+
+    # 1. Verify Makefile install-native builds all 16 C/OpenMP artifacts and 5 CLI helpers
+    prefix = tmp_path / "conda_prefix"
+    subprocess.run(
+        ["make", "install-native", f"PREFIX={prefix}", f"PYTHON={sys.executable}"],
+        cwd=str(REPO_ROOT),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    cache_dir = prefix / "share" / "focaloop" / "native_cache"
+    bin_dir = prefix / "bin"
+    assert len(list(cache_dir.iterdir())) == 16
+    for exe_name in ("glcore", "prep_unitigs_filt_adapt", "logan_var_pileup", "prep_expr_unitigs", "expr_sam_ec_v2"):
+        p = bin_dir / exe_name
+        assert p.is_file() and os.access(p, os.X_OK)
+
+    # 2. Verify sys.prefix auto-discovery works without FOCALOOP_NATIVE_CACHE or CC (BioContainer mode)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    for env_var in ("FOCALOOP_NATIVE_CACHE", "FOCALOOP_NATIVE_DIR", "FOCALOOP_BIN_CACHE", "FOCALOOP_BUILD_NATIVE_DIR", "GLCORE_BIN", "ORF_SCOUT_LIB"):
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setenv("CC", "/nonexistent_cc_binary")
+
+    from focaloop.galaxy_runners import prebuild_all_native_libs
+    import focaloop.panexpr._fast_c as fc
+    import focaloop.panexpr._medvedev_compile as mc
+
+    monkeypatch.setattr(fc, "_TRIED", False)
+    monkeypatch.setattr(fc, "_LIB", None)
+    monkeypatch.setattr(mc, "_LOADED", {})
+    built = prebuild_all_native_libs()
+    assert len(built) == 16
+
+    # 3. Verify trimmed orthogonal UI choices in GeneLoop and Focaloop Query XMLs
+    gl_root = ET.parse(REPO_ROOT / "tools" / "focaloop" / "geneloop.xml").getroot()
+    rna_opts = [
+        o.attrib["value"]
+        for c in gl_root.findall(".//conditional[@name='rna_source']/param[@name='source_type']/option")
+        for o in [c]
+    ]
+    assert rna_opts == ["history_paired", "history_long", "history_bams", "public_sra", "none"]
+
+    q_root = ET.parse(REPO_ROOT / "tools" / "focaloop" / "focaloop_query.xml").getroot()
+    q_opts = [
+        o.attrib["value"]
+        for o in q_root.findall(".//conditional[@name='query_type']/param[@argument='--mode']/option")
+    ]
+    assert q_opts == ["contrast", "fst"]

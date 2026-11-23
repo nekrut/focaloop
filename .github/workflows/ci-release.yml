@@ -16,10 +16,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install package and test dependencies
+      - name: Install system and Python test dependencies
         run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            bwa minimap2 samtools bcftools zstd make gcc libc6-dev libgomp1
           python -m pip install --upgrade pip
-          pip install ".[test]"
+          pip install ".[engines,test]"
       - name: Run portability and core unit tests
         run: |
           pytest -q \
@@ -56,7 +58,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=0.3.0,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=0.4.0,enable=${{ github.event_name == 'workflow_dispatch' }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build and push container image

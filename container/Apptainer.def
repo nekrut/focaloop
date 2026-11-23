@@ -36,6 +36,8 @@ Stage: runtime
     container/environment.yml /opt/focaloop/environment.yml
     pyproject.toml /opt/focaloop/src/pyproject.toml
     README.md /opt/focaloop/src/README.md
+    Makefile /opt/focaloop/src/Makefile
+    scripts /opt/focaloop/src/scripts
     focaloop /opt/focaloop/src/focaloop
     blueprints/panexpr/blueprint.focaloop.yml /opt/focaloop/blueprints/panexpr/blueprint.focaloop.yml
     blueprints/malariavar/blueprint.focaloop.yml /opt/focaloop/blueprints/malariavar/blueprint.focaloop.yml
@@ -59,7 +61,7 @@ Stage: runtime
     set -eux
     export DEBIAN_FRONTEND=noninteractive
     apt-get update && apt-get install -y --no-install-recommends \
-        iproute2 ca-certificates curl git gcc libc6-dev libgomp1
+        iproute2 ca-certificates curl git gcc make libc6-dev libgomp1
     rm -rf /var/lib/apt/lists/*
 
     chmod 0755 /usr/local/bin/xsra
@@ -111,6 +113,7 @@ Stage: runtime
 
     # Install Focaloop 0.4.0 and precompile all portable (-msse4.2 -mpopcnt) C99/OpenMP binaries & libs
     mkdir -p /opt/focaloop/native_cache
+    (cd /opt/focaloop/src && FOCALOOP_PORTABLE_ISA=1 make install-native PREFIX=/opt/conda PYTHON=python)
     python -m pip install --no-deps --no-cache-dir /opt/focaloop/src
 
     export FOCALOOP_PORTABLE_ISA="1"

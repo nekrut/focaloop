@@ -41,7 +41,11 @@ def ensure_shared_lib(
     arch = platform.machine().lower()
     fname = f"{lib_stem}_{sys.platform}_{arch}{ext}"
 
-    for pre_dir in (os.environ.get("FOCALOOP_NATIVE_CACHE"), "/opt/focaloop/native_cache"):
+    for pre_dir in (
+        os.environ.get("FOCALOOP_NATIVE_CACHE"),
+        str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
+        "/opt/focaloop/native_cache",
+    ):
         if pre_dir:
             pre_cand = Path(pre_dir) / fname
             if pre_cand.exists():

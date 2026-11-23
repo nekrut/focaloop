@@ -175,7 +175,7 @@ def _ipv4_session():
 
     _conn.allowed_gai_family = lambda: socket.AF_INET  # type: ignore[assignment]
     s = requests.Session()
-    s.headers["User-Agent"] = "focaloop/0.3.0"
+    s.headers["User-Agent"] = "focaloop/0.4.0"
     return s
 
 

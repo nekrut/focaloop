@@ -32,7 +32,7 @@ focaloop geneloop
             --exclude-genus '$advanced_options.exclude_genus'
         #end if
     #end if
-    #if str($rna_source.source_type) == "manifest_insdc"
+    #if str($rna_source.source_type) == "public_sra"
         #if str($rna_source.insdc_input.input_type) == "accessions"
             --sra-accessions '${str($rna_source.insdc_input.sra_accessions).strip()}'
         #else
@@ -52,16 +52,16 @@ focaloop geneloop
         #for $pair in $rna_source.paired_reads
             '${str($pair.element_identifier).replace("'", "_")}'
         #end for
-        --logan-mode 'off'
-    #elif str($rna_source.source_type) == "history_single"
-        --short-reads-1
-        #for $r in $rna_source.single_reads
-            '$r'
-        #end for
-        --short-read-ids
-        #for $r in $rna_source.single_reads
-            '${str($r.element_identifier).replace("'", "_")}'
-        #end for
+        #if $rna_source.long_reads
+            --long-reads
+            #for $lr in $rna_source.long_reads
+                '$lr'
+            #end for
+            --long-read-ids
+            #for $lr in $rna_source.long_reads
+                '${str($lr.element_identifier).replace("'", "_")}'
+            #end for
+        #end if
         --logan-mode 'off'
     #elif str($rna_source.source_type) == "history_long"
         --long-reads
@@ -74,58 +74,8 @@ focaloop geneloop
         #end for
         --logan-mode 'off'
     #elif str($rna_source.source_type) == "history_bams"
-        #if str($rna_source.bam_kind.kind) in ("short", "both")
-            --short-bams
-            #for $sb in $rna_source.bam_kind.short_bams
-                '$sb'
-            #end for
-            --short-bam-ids
-            #for $sb in $rna_source.bam_kind.short_bams
-                '${str($sb.element_identifier).replace("'", "_")}'
-            #end for
-        #end if
-        #if str($rna_source.bam_kind.kind) in ("long", "both")
-            --long-bams
-            #for $lb in $rna_source.bam_kind.long_bams
-                '$lb'
-            #end for
-            --long-bam-ids
-            #for $lb in $rna_source.bam_kind.long_bams
-                '${str($lb.element_identifier).replace("'", "_")}'
-            #end for
-        #end if
-        --logan-mode 'off'
-    #elif str($rna_source.source_type) == "combined"
-        #if $rna_source.rna_manifest
-            --rna-manifest '$rna_source.rna_manifest'
-        #end if
-        #if str($rna_source.sra_accessions).strip()
-            --sra-accessions '${str($rna_source.sra_accessions).strip()}'
-        #end if
-        --logan-mode '$rna_source.logan_mode'
-        #if $rna_source.paired_reads
-            --short-reads-1
-            #for $pair in $rna_source.paired_reads
-                '$pair.forward'
-            #end for
-            --short-reads-2
-            #for $pair in $rna_source.paired_reads
-                '$pair.reverse'
-            #end for
-            --short-read-ids
-            #for $pair in $rna_source.paired_reads
-                '${str($pair.element_identifier).replace("'", "_")}'
-            #end for
-        #end if
-        #if $rna_source.long_reads
-            --long-reads
-            #for $lr in $rna_source.long_reads
-                '$lr'
-            #end for
-            --long-read-ids
-            #for $lr in $rna_source.long_reads
-                '${str($lr.element_identifier).replace("'", "_")}'
-            #end for
+        #if not $rna_source.short_bams and not $rna_source.long_bams
+            echo "Select at least one pre-aligned short-read or long-read BAM dataset." >&2 && exit 1 &&
         #end if
         #if $rna_source.short_bams
             --short-bams
@@ -147,11 +97,12 @@ focaloop geneloop
                 '${str($lb.element_identifier).replace("'", "_")}'
             #end for
         #end if
+        --logan-mode 'off'
     #else
         --logan-mode 'off'
     #end if
     #if str($streaming_options.streaming_budget.preset) == "auto"
-        #if str($rna_source.source_type) == "manifest_insdc" or (str($rna_source.source_type) == "combined" and ($rna_source.rna_manifest or str($rna_source.sra_accessions).strip()))
+        #if str($rna_source.source_type) == "public_sra"
             --max-frac-spots 0.35
         #else
             --max-frac-spots 1.0
@@ -247,44 +198,25 @@ focaloop geneloop
         </conditional>
 
         <conditional name="rna_source">
-            <param name="source_type" type="select" label="RNA-seq transcript evidence" help="Supply RNA-seq reads from your Galaxy History, stream public SRA/ENA accessions adaptively, combine multiple sources, or annotate from genome and proteins alone.">
-                <option value="history_paired" selected="true">Galaxy History paired-end short-read collection (list:paired)</option>
-                <option value="history_single">Galaxy History single-end short-read FASTQ files</option>
+            <param name="source_type" type="select" label="RNA-seq transcript evidence" help="Supply paired-end or long-read RNA-seq from your Galaxy History, provide pre-aligned BAMs, stream public SRA/ENA accessions via Logan contigs or adaptive waves, or annotate from genome and proteins alone.">
+                <option value="history_paired" selected="true">Galaxy History paired-end collection (list:paired, optional long reads)</option>
                 <option value="history_long">Galaxy History long-read RNA-seq FASTQ files (PacBio Iso-Seq or ONT)</option>
                 <option value="history_bams">Galaxy History pre-aligned RNA-seq BAM files</option>
-                <option value="manifest_insdc">Public SRA/ENA run accessions (adaptive streaming manifest)</option>
-                <option value="combined">Combine multiple RNA-seq sources</option>
-                <option value="none">None (protein homology and/or ab initio seed only)</option>
+                <option value="public_sra">Public SRA/ENA run accessions (Logan contigs or adaptive streaming)</option>
+                <option value="none">None (protein homology and/or deep-learning seed only)</option>
             </param>
             <when value="history_paired">
                 <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" label="Paired-end RNA-seq collection (list:paired)" help="Short-read paired-end RNA-seq libraries from your Galaxy History."/>
-            </when>
-            <when value="history_single">
-                <param name="single_reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" label="Single-end RNA-seq FASTQ files" help="One or more single-end short-read RNA-seq FASTQ(.gz) datasets from your Galaxy History."/>
+                <param argument="--long-reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Supplemental long-read RNA-seq FASTQ files (optional)" help="Optional PacBio Iso-Seq or Oxford Nanopore full-length transcript FASTQ datasets to combine with your short-read collection."/>
             </when>
             <when value="history_long">
                 <param argument="--long-reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" label="Long-read RNA-seq FASTQ files (Iso-Seq or ONT)" help="Full-length cDNA or direct-RNA long-read datasets aligned across splice junctions and assembled into transcripts."/>
             </when>
             <when value="history_bams">
-                <conditional name="bam_kind">
-                    <param name="kind" type="select" label="Aligned BAM read type" help="Select whether your pre-aligned RNA-seq BAM files contain short reads, long reads, or both.">
-                        <option value="short" selected="true">Short-read RNA-seq BAMs</option>
-                        <option value="long">Long-read RNA-seq BAMs (Iso-Seq or ONT)</option>
-                        <option value="both">Both short-read and long-read BAMs</option>
-                    </param>
-                    <when value="short">
-                        <param argument="--short-bams" type="data" format="bam" multiple="true" label="Pre-aligned short-read RNA-seq BAMs" help="Coordinate-sorted short-read RNA-seq BAM files. Splice junctions and coverage are extracted directly without re-alignment."/>
-                    </when>
-                    <when value="long">
-                        <param argument="--long-bams" type="data" format="bam" multiple="true" label="Pre-aligned long-read RNA-seq BAMs" help="Coordinate-sorted PacBio Iso-Seq or Oxford Nanopore RNA-seq BAM files."/>
-                    </when>
-                    <when value="both">
-                        <param argument="--short-bams" type="data" format="bam" multiple="true" label="Pre-aligned short-read RNA-seq BAMs" help="Coordinate-sorted short-read RNA-seq BAM files."/>
-                        <param argument="--long-bams" type="data" format="bam" multiple="true" label="Pre-aligned long-read RNA-seq BAMs" help="Coordinate-sorted long-read RNA-seq BAM files."/>
-                    </when>
-                </conditional>
+                <param argument="--short-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned short-read RNA-seq BAMs (optional)" help="Coordinate-sorted short-read RNA-seq BAM files. Splice junctions and coverage are extracted directly without re-alignment."/>
+                <param argument="--long-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned long-read RNA-seq BAMs (optional)" help="Coordinate-sorted PacBio Iso-Seq or Oxford Nanopore RNA-seq BAM files. Provide short-read BAMs, long-read BAMs, or both."/>
             </when>
-            <when value="manifest_insdc">
+            <when value="public_sra">
                 <conditional name="insdc_input">
                     <param name="input_type" type="select" label="Public SRA/ENA run input" help="Enter public SRA/ENA accessions directly, or upload a run manifest table.">
                         <option value="accessions" selected="true">Enter public SRA/ENA run accession(s)</option>
@@ -305,21 +237,6 @@ focaloop geneloop
                     <option value="logan_only">Logan contigs only (skip raw short-read SRA streaming)</option>
                     <option value="off">Off (always stream raw short reads)</option>
                 </param>
-            </when>
-            <when value="combined">
-                <param argument="--rna-manifest" type="data" format="tabular,tsv,csv,txt" optional="true" label="Public SRA/ENA run manifest (optional)" help="Optional TSV/CSV or one-per-line list of public SRA/ENA run accessions."/>
-                <param argument="--sra-accessions" type="text" value="" optional="true" label="Public SRA/ENA run accession(s) (optional)" help="Optional comma or space-separated public SRA/ENA short-read run accessions (SRR, ERR, or DRR prefix).">
-                    <validator type="regex" message="Enter valid SRR, ERR, or DRR accessions separated by commas or spaces.">^( *| *[SEDsed][Rr][Rr][0-9]+([, ]+[SEDsed][Rr][Rr][0-9]+)* *)$</validator>
-                </param>
-                <param argument="--logan-mode" type="select" label="Pre-assembled Logan transcript contigs (for SRA/ENA runs)" help="Streams compact pre-assembled transcript contigs from the public Logan archive for short-read SRA/ENA runs.">
-                    <option value="auto" selected="true">Automatic (use Logan contigs when available, fall back to raw reads otherwise)</option>
-                    <option value="logan_only">Logan contigs only (skip raw short-read SRA streaming)</option>
-                    <option value="off">Off (always stream raw short reads)</option>
-                </param>
-                <param name="paired_reads" type="data_collection" collection_type="list:paired" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" optional="true" label="Paired-end RNA-seq collection (optional)" help="Optional Galaxy list-of-pairs short-read RNA-seq collection."/>
-                <param argument="--long-reads" type="data" format="fastqsanger,fastqsanger.gz,fastq,fastq.gz" multiple="true" optional="true" label="Long-read RNA-seq FASTQ files (optional)" help="Optional full-length cDNA or direct-RNA long-read FASTQ(.gz) datasets."/>
-                <param argument="--short-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned short-read BAMs (optional)" help="Optional coordinate-sorted short-read RNA-seq BAM datasets."/>
-                <param argument="--long-bams" type="data" format="bam" multiple="true" optional="true" label="Pre-aligned long-read BAMs (optional)" help="Optional coordinate-sorted long-read RNA-seq BAM datasets."/>
             </when>
             <when value="none"/>
         </conditional>

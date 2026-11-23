@@ -72,7 +72,12 @@ def build_orf_scout(force: bool = False) -> Path:
     arch = platform.machine().lower()
     portable_name = f"liborf_scout_{sys.platform}_{arch}{_LIB_EXT}"
     if not force:
-        for pre_dir in (os.environ.get("FOCALOOP_NATIVE_CACHE"), os.environ.get("FOCALOOP_NATIVE_DIR"), "/opt/focaloop/native_cache"):
+        for pre_dir in (
+            os.environ.get("FOCALOOP_NATIVE_CACHE"),
+            os.environ.get("FOCALOOP_NATIVE_DIR"),
+            str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
+            "/opt/focaloop/native_cache",
+        ):
             if pre_dir:
                 for cand_name in (portable_name, f"liborf_scout{_LIB_EXT}"):
                     cand = Path(pre_dir) / cand_name

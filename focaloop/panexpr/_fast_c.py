@@ -1052,7 +1052,11 @@ def get_fast_lib() -> ctypes.CDLL | None:
         digest = hashlib.sha256(_C_SOURCE.encode("utf-8")).hexdigest()[:16]
         ext = ".dylib" if sys.platform == "darwin" else ".so"
         fname = f"panexpr_fast_{digest}{ext}"
-        for pre_dir in (os.environ.get("FOCALOOP_NATIVE_CACHE"), "/opt/focaloop/native_cache"):
+        for pre_dir in (
+            os.environ.get("FOCALOOP_NATIVE_CACHE"),
+            str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
+            "/opt/focaloop/native_cache",
+        ):
             if pre_dir:
                 cand = Path(pre_dir) / fname
                 if cand.exists():

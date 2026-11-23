@@ -33,7 +33,7 @@ ARG TIBERIUS_TAG=v2.0.9
 
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        iproute2 ca-certificates curl git gcc libc6-dev libgomp1 \
+        iproute2 ca-certificates curl git gcc make libc6-dev libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /opt/Tiberius /opt/themisto /opt/focaloop/native_cache /opt/focaloop/tiberius_weights /data \
     && chown -R $MAMBA_USER:$MAMBA_USER /opt/Tiberius /opt/themisto /opt/focaloop /data
@@ -91,9 +91,11 @@ RUN set -eu; \
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/diatoms_unmasked.tar.gz" "diatoms_weights"
 
 # Install Focaloop 0.4.0 and precompile all portable (-msse4.2 -mpopcnt) C99/OpenMP binaries & libs
-COPY --chown=$MAMBA_USER:$MAMBA_USER pyproject.toml README.md /opt/focaloop/src/
+COPY --chown=$MAMBA_USER:$MAMBA_USER pyproject.toml README.md Makefile /opt/focaloop/src/
+COPY --chown=$MAMBA_USER:$MAMBA_USER scripts /opt/focaloop/src/scripts
 COPY --chown=$MAMBA_USER:$MAMBA_USER focaloop /opt/focaloop/src/focaloop
-RUN python -m pip install --no-deps --no-cache-dir /opt/focaloop/src \
+RUN (cd /opt/focaloop/src && FOCALOOP_PORTABLE_ISA=1 make install-native PREFIX=/opt/conda PYTHON=python) \
+    && python -m pip install --no-deps --no-cache-dir /opt/focaloop/src \
     && FOCALOOP_PORTABLE_ISA=1 \
        FOCALOOP_BUILD_NATIVE_DIR=/opt/focaloop/native_cache \
        FOCALOOP_NATIVE_CACHE=/opt/focaloop/native_cache \

@@ -363,7 +363,7 @@ def _ipv4_session():
 
     _conn.allowed_gai_family = lambda: socket.AF_INET  # type: ignore[assignment]
     s = requests.Session()
-    s.headers["User-Agent"] = "focaloop/0.3.0"
+    s.headers["User-Agent"] = "focaloop/0.4.0"
     return s
 
 
@@ -653,7 +653,7 @@ def _write_pathogen_vcf(
     samples = sorted(calls_df["sample_id"].astype(str).unique().tolist()) if not calls_df.empty else ["SAMPLE"]
     lines: list[str] = [
         "##fileformat=VCFv4.2",
-        "##source=Focaloop_VariationLoop_v0.3.0",
+        "##source=Focaloop_VariationLoop_v0.4.0",
         '##FILTER=<ID=PASS,Description="All filters passed">',
     ]
     for cid in range(len(g.names)):
@@ -1302,7 +1302,7 @@ def _run_pf3d7_surveillance(
     drm_df.to_parquet(state_root / "drm_calls.parquet", index=False)
     state_meta = {
         "engine": "malariavar",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "blueprint_id": "malariavar",
         "mode": eff_mode,
         "summary": summary_stats,
