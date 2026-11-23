@@ -154,7 +154,7 @@ tiles = [ln for ln in r.stdout.splitlines() if ln.startswith('>')]
 assert len(tiles) >= 16 and 'c' in tiles[0], tiles[:3]
 print('FOCALOOP_040_SIF_VERIFIED_OK', len(found), prep, len(tiles))
 "
-    (bwa 2>&1 | grep -q '^Version: 0.7')
+    ((bwa 2>&1 || true) | grep -q '^Version: 0.7')
     bwa-mem2 version
     strobealign --version
     minimap2 --version

@@ -137,7 +137,7 @@ r = subprocess.run([str(prep),'1.5','0','-','0','0','3.0'], input='>0 ka:f:12.0'
 tiles = [ln for ln in r.stdout.splitlines() if ln.startswith('>')]; \
 assert len(tiles) >= 16 and 'c' in tiles[0], tiles[:3]; \
 print('FOCALOOP_040_DOCKER_VERIFIED_OK', len(found), prep, len(tiles))" \
-    && (bwa 2>&1 | grep -q '^Version: 0.7') && bwa-mem2 version && strobealign --version \
+    && ((bwa 2>&1 || true) | grep -q '^Version: 0.7') && bwa-mem2 version && strobealign --version \
     && minimap2 --version && bowtie2 --version && hisat2 --version \
     && salmon --version && piscem --version && kallisto version \
     && samtools --version && bcftools --version \
