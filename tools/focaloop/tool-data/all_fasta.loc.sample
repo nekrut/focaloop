@@ -1,0 +1,8 @@
+#This file lists the locations and dbkeys of all the fasta files
+#under the "genome" directory (a directory that contains a directory
+#for each build). This file has the format (white space characters
+#are TAB characters):
+#
+#<unique_build_id>	<dbkey>	<display_name>	<file_path>
+#
+#hg38	hg38	Human (Homo sapiens): hg38	/path/to/genome/hg38/hg38.fa

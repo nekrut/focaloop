@@ -455,6 +455,9 @@ def run_geneloop_galaxy(
     *,
     genome_fasta: str | Path | None = None,
     ncbi_accession: str | None = None,
+    genome_dbkey: str = "",
+    genome_name: str = "",
+    genome_value: str = "",
     out_gff3: str | Path,
     out_proteins: str | Path,
     out_gtf: str | Path,
@@ -463,6 +466,10 @@ def run_geneloop_galaxy(
     state_dir: str | Path,
     state_archive: str | Path | None = None,
     proteins_fasta: str | Path | None = None,
+    protein_source: str = "",
+    protein_query: str = "",
+    protein_max_species: int = 0,
+    orthodb_mode: str = "representatives",
     exclude_genus: str = "",
     clade: str = "vertebrates",
     mode: str = "auto",
@@ -517,15 +524,55 @@ def run_geneloop_galaxy(
             raise FileNotFoundError(f"Target genome FASTA not found: {genome_fasta}")
 
         prot_p: Path | None = None
-        if proteins_fasta:
+        homology_meta: dict[str, Any] = {"source": "none"}
+        psrc = str(protein_source or "").strip().lower()
+        import sys
+
+        if psrc in ("ncbi", "orthodb"):
+            from .geneloop.homology_fetch import (
+                fetch_ncbi_related_proteomes,
+                fetch_orthodb_clade_proteins,
+                infer_target_context,
+            )
+
+            target_ctx = infer_target_context(
+                ncbi_accession=str(ncbi_accession or ""),
+                genome_dbkey=genome_dbkey,
+                genome_name=genome_name,
+                genome_value=genome_value,
+            )
+            log_fn = lambda msg: print(msg, file=sys.stderr, flush=True)
+            if psrc == "ncbi":
+                homology_meta = fetch_ncbi_related_proteomes(
+                    clade=clade,
+                    dest_dir=work_root / "homology_ncbi",
+                    protein_query=protein_query,
+                    max_species=(protein_max_species if protein_max_species > 0 else 3),
+                    target_ctx=target_ctx,
+                    exclude_genus=exclude_genus,
+                    log=log_fn,
+                )
+            else:
+                homology_meta = fetch_orthodb_clade_proteins(
+                    clade=clade,
+                    dest_dir=work_root / "homology_orthodb",
+                    protein_query=protein_query,
+                    max_species=(protein_max_species if protein_max_species > 0 else 5),
+                    orthodb_mode=orthodb_mode,
+                    target_ctx=target_ctx,
+                    exclude_genus=exclude_genus,
+                    log=log_fn,
+                )
+            prot_p = Path(homology_meta["proteins_fasta"]).resolve()
+        elif proteins_fasta and psrc != "none":
             prot_p = Path(proteins_fasta).resolve()
             if not prot_p.is_file():
                 raise FileNotFoundError(f"Homology protein FASTA not found: {proteins_fasta}")
+            homology_meta = {"source": "history", "proteins_fasta": str(prot_p)}
 
         mode_info = resolve_execution_mode(
             mode, clade, tiberius_weights=tiberius_weights, has_proteins=(prot_p is not None)
         )
-        import sys
         _safe_reason = re.sub(r"(error|exception)\s*:", r"\1 -", str(mode_info["reason"]), flags=re.IGNORECASE)
         print(f"[focaloop-geneloop] mode={mode_info['effective_mode']}: {_safe_reason}", file=sys.stderr, flush=True)
 
@@ -690,6 +737,7 @@ def run_geneloop_galaxy(
             "blueprint_id": "geneloop",
             "clade": clade,
             "effective_mode": mode_info["effective_mode"],
+            "homology_source": str(homology_meta.get("source", "none")),
             "genome_meta": gr.meta,
             "seed_summary": seed_summary,
             "biotypes": biotypes,

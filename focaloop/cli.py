@@ -282,6 +282,9 @@ def cmd_geneloop(a: argparse.Namespace) -> int:
         meta = run_geneloop_galaxy(
             genome_fasta=a.genome,
             ncbi_accession=a.ncbi_accession,
+            genome_dbkey=a.genome_dbkey,
+            genome_name=a.genome_name,
+            genome_value=a.genome_value,
             out_gff3=a.out_gff3,
             out_proteins=a.out_proteins,
             out_gtf=a.out_gtf,
@@ -290,6 +293,10 @@ def cmd_geneloop(a: argparse.Namespace) -> int:
             state_dir=a.state_dir,
             state_archive=a.state_archive,
             proteins_fasta=a.proteins,
+            protein_source=a.protein_source,
+            protein_query=a.protein_query,
+            protein_max_species=a.protein_max_species,
+            orthodb_mode=a.orthodb_mode,
             exclude_genus=a.exclude_genus,
             clade=a.clade,
             mode=a.mode,
@@ -559,9 +566,16 @@ def build_parser() -> argparse.ArgumentParser:
     gl = sub.add_parser("geneloop", help="adaptive eukaryotic structural genome annotation")
     gl.add_argument("--genome", help="target genome assembly FASTA(.gz)")
     gl.add_argument("--ncbi-accession", help="optional NCBI assembly accession (GCF_.../GCA_...) to fetch target genome FASTA")
+    gl.add_argument("--genome-dbkey", default="", help="optional Galaxy cached genome dbkey for taxon inference")
+    gl.add_argument("--genome-name", default="", help="optional Galaxy cached genome display name for taxon inference")
+    gl.add_argument("--genome-value", default="", help="optional Galaxy cached genome value for taxon inference")
     gl.add_argument("--clade", default="vertebrates", help="organism clade preset")
     gl.add_argument("--mode", choices=("auto", "fast_evidence", "cpu_tiberius", "gpu_tiberius"), default="auto")
     gl.add_argument("--proteins", help="optional related-species homology protein FASTA(.gz)")
+    gl.add_argument("--protein-source", choices=("", "none", "history", "ncbi", "orthodb"), default="", help="homology protein source mode")
+    gl.add_argument("--protein-query", default="", help="optional taxonomic group or NCBI assembly accession(s) for auto-fetched homology proteins")
+    gl.add_argument("--protein-max-species", type=int, default=0, help="maximum distinct species proteomes to auto-fetch from NCBI or OrthoDB")
+    gl.add_argument("--orthodb-mode", choices=("representatives", "full_partition"), default="representatives", help="OrthoDB v12 retrieval strategy")
     gl.add_argument("--exclude-genus", default="", help="optional genus to strip from homology proteins")
     gl.add_argument("--tiberius-weights", help="optional Tiberius weights directory or .tar.gz archive")
     gl.add_argument("--rna-manifest", help="optional SRA/ENA RNA-seq run manifest")

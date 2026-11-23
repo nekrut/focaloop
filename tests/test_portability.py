@@ -582,3 +582,103 @@ def test_makefile_build_native_and_trimmed_geneloop_query_ui(tmp_path, monkeypat
         for o in q_root.findall(".//conditional[@name='query_type']/param[@argument='--mode']/option")
     ]
     assert q_opts == ["contrast", "fst"]
+
+
+def test_geneloop_ncbi_and_orthodb_homology_auto_fetch(tmp_path, monkeypatch):
+    import gzip
+    import xml.etree.ElementTree as ET
+    from focaloop.geneloop import homology_fetch as hf
+
+    # 1. Verify XML exposes all 4 orthogonal protein_source choices (ncbi, orthodb, history, none)
+    gl_root = ET.parse(REPO_ROOT / "tools" / "focaloop" / "geneloop.xml").getroot()
+    prot_opts = [
+        o.attrib["value"]
+        for o in gl_root.findall(".//conditional[@name='protein_source']/param[@name='source_type']/option")
+    ]
+    assert prot_opts == ["ncbi", "orthodb", "history", "none"]
+
+    # 2. Verify NCBI related-species RefSeq proteome discovery (genus-diverse + target exclusion + unique ID prefixing)
+    fake_reports = {
+        "reports": [
+            {
+                "accession": "GCF_000001215.4",
+                "assembly_info": {"assembly_level": "Chromosome", "refseq_category": "reference genome"},
+                "organism": {"organism_name": "Drosophila melanogaster"},
+            },
+            {
+                "accession": "GCF_009650485.2",
+                "assembly_info": {"assembly_level": "Chromosome", "refseq_category": "representative genome"},
+                "organism": {"organism_name": "Drosophila albomicans"},
+            },
+            {
+                "accession": "GCF_013141755.1",
+                "assembly_info": {"assembly_level": "Chromosome", "refseq_category": "representative genome"},
+                "organism": {"organism_name": "Scaptodrosophila lebanonensis"},
+            },
+        ]
+    }
+    monkeypatch.setattr(hf, "_fetch_json", lambda url, params=None, **kw: fake_reports)
+    monkeypatch.setattr(hf, "resolve_ncbi_assembly_dir", lambda acc: (f"{acc}_ASM", f"mock://{acc}"))
+
+    def _fake_dl(url: str, dest: pathlib.Path, **kw):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if str(dest).endswith(".faa.gz"):
+            with gzip.open(dest, "wt", encoding="utf-8") as fh:
+                fh.write(">XP_001.1 hypothetical protein [Species]\nMKTLLLTLVV\n\n>XP_002.1 kinase\nMAAAKKK\n")
+        else:
+            dest.write_text('>7291_1:0001 {"organism":"Drosophila albomicans"}\nMKTLLLTLVV\n\n>7291_1:0002 {"organism":"Drosophila albomicans"}\nMAAAKKK\n', encoding="utf-8")
+        return dest
+
+    monkeypatch.setattr(hf, "_download_file", _fake_dl)
+    monkeypatch.delenv("FOCALOOP_NCBI_CACHE_DIR", raising=False)
+
+    res_ncbi = hf.fetch_ncbi_related_proteomes(
+        clade="insecta",
+        dest_dir=tmp_path / "ncbi_prot",
+        max_species=2,
+        target_ctx={"accession": "GCF_000001215.4", "species_name": "Drosophila melanogaster", "family_taxid": "7214"},
+    )
+    assert res_ncbi["n_species"] == 2
+    picked_sp = [s["species_name"] for s in res_ncbi["species"]]
+    assert "Drosophila melanogaster" not in picked_sp
+    assert "Scaptodrosophila lebanonensis" in picked_sp
+    faa_txt = res_ncbi["proteins_fasta"].read_text(encoding="utf-8")
+    assert "\n\n" not in faa_txt
+    assert ">GCF_013141755.1|XP_001.1" in faa_txt
+
+    # 3. Verify OrthoDB v12 representative fetch + blank-line stripping + cached partition fast-path
+    class _FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "data": [
+                    {"sciname": "Drosophila melanogaster", "taxon_id": "7227_0", "organism_id": "GCF_000001215.4"},
+                    {"sciname": "Scaptodrosophila lebanonensis", "taxon_id": "7260_0", "organism_id": "GCF_013141755.1"},
+                    {"sciname": "Chymomyza costata", "taxon_id": "7244_0", "organism_id": "GCA_018152265.1"},
+                ]
+            }
+
+    class _FakeSess:
+        def get(self, url, params=None, timeout=45.0):
+            return _FakeResp()
+
+    monkeypatch.setattr(hf, "_ipv4_session", lambda: _FakeSess())
+    monkeypatch.delenv("FOCALOOP_ORTHODB_CACHE_DIR", raising=False)
+    res_odb = hf.fetch_orthodb_clade_proteins(
+        clade="insecta",
+        dest_dir=tmp_path / "odb_prot",
+        max_species=2,
+        target_ctx={"accession": "GCF_000001215.4", "species_name": "Drosophila melanogaster", "family_taxid": "7214"},
+    )
+    assert res_odb["source"] == "orthodb_v12_representatives"
+    assert res_odb["n_species"] == 2
+    assert "\n\n" not in res_odb["proteins_fasta"].read_text(encoding="utf-8")
+
+    cache_d = tmp_path / "odb_cache"
+    cache_d.mkdir()
+    (cache_d / "Arthropoda.fa.gz").write_bytes(b"nonempty")
+    monkeypatch.setenv("FOCALOOP_ORTHODB_CACHE_DIR", str(cache_d))
+    res_cached = hf.fetch_orthodb_clade_proteins(clade="insecta", dest_dir=tmp_path / "odb_cached")
+    assert res_cached["source"] == "orthodb_cached:Arthropoda"

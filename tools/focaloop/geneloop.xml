@@ -15,6 +15,9 @@
 focaloop geneloop
     #if str($genome_source.source) == "cached"
         --genome '$genome_source.cached_fasta.fields.path'
+        --genome-dbkey '${str($genome_source.cached_fasta.fields.dbkey).replace("'", "_")}'
+        --genome-name '${str($genome_source.cached_fasta.fields.name).replace("'", "_")}'
+        --genome-value '${str($genome_source.cached_fasta.fields.value).replace("'", "_")}'
     #elif str($genome_source.source) == "history"
         --genome '$genome_source.genome'
     #else
@@ -26,11 +29,25 @@ focaloop geneloop
         --clade '$organism_group.group'
     #end if
     --mode '$refinement_options.mode'
-    #if str($protein_source.source_type) == "history"
-        --proteins '$protein_source.proteins'
-        #if str($advanced_options.exclude_genus).strip()
-            --exclude-genus '$advanced_options.exclude_genus'
+    --protein-source '$protein_source.source_type'
+    #if str($protein_source.source_type) == "ncbi"
+        #if str($protein_source.protein_query).strip()
+            --protein-query '${str($protein_source.protein_query).strip()}'
         #end if
+        --protein-max-species $protein_source.max_species
+    #elif str($protein_source.source_type) == "orthodb"
+        --orthodb-mode '$protein_source.orthodb_scope.orthodb_mode'
+        #if str($protein_source.orthodb_scope.orthodb_mode) == "representatives"
+            --protein-max-species $protein_source.orthodb_scope.max_species
+        #end if
+        #if str($protein_source.protein_query).strip()
+            --protein-query '${str($protein_source.protein_query).strip()}'
+        #end if
+    #elif str($protein_source.source_type) == "history"
+        --proteins '$protein_source.proteins'
+    #end if
+    #if str($protein_source.source_type) != "none" and str($advanced_options.exclude_genus).strip()
+        --exclude-genus '$advanced_options.exclude_genus'
     #end if
     #if str($rna_source.source_type) == "public_sra"
         #if str($rna_source.insdc_input.input_type) == "accessions"
@@ -187,10 +204,33 @@ focaloop geneloop
         </conditional>
 
         <conditional name="protein_source">
-            <param name="source_type" type="select" label="Related-species protein homology evidence" help="Providing curated proteins from related species in the same clade (for example, NCBI RefSeq or OrthoDB) strongly improves exon boundaries and single-exon gene accuracy.">
-                <option value="history" selected="true">Clade protein FASTA from Galaxy History (recommended)</option>
+            <param name="source_type" type="select" label="Related-species protein homology evidence" help="Curated proteins from related species strongly improve splice boundaries and single-exon gene accuracy. Fetch sister-species RefSeq proteomes from NCBI, fetch clade proteins from OrthoDB v12, supply a custom FASTA from your Galaxy History, or run without homology proteins.">
+                <option value="ncbi" selected="true">Auto-fetch related RefSeq proteomes from NCBI (recommended)</option>
+                <option value="orthodb">Auto-fetch OrthoDB v12 clade proteins</option>
+                <option value="history">Protein FASTA from Galaxy History</option>
                 <option value="none">None (deep learning and/or RNA-seq only)</option>
             </param>
+            <when value="ncbi">
+                <param argument="--protein-query" type="text" value="" optional="true" label="Taxonomic group or RefSeq assembly accessions (optional)" help="Leave empty to infer your target species family or clade automatically from Built-in Galaxy genomes, NCBI accessions, or Organism group. Or enter a taxonomic name (for example Drosophilidae, Brassicaceae, or Saccharomycetales), an NCBI Taxonomy ID, or space/comma-separated RefSeq GCF_ accessions.">
+                    <validator type="regex" message="Use letters, digits, spaces, commas, underscores, dots, or hyphens only">^[A-Za-z0-9 _,.-]*$</validator>
+                </param>
+                <param argument="--protein-max-species" name="max_species" type="integer" min="1" max="10" value="3" label="Number of related RefSeq species proteomes to fetch" help="Selects up to this many distinct, annotated RefSeq species (prioritizing reference and complete genomes across distinct genera and excluding the target assembly itself)."/>
+            </when>
+            <when value="orthodb">
+                <conditional name="orthodb_scope">
+                    <param argument="--orthodb-mode" type="select" label="OrthoDB v12 retrieval strategy" help="Representative species downloads a compact, genus-diverse OrthoDB v12 protein set (~15-100 MB, uses server-cached clade packs automatically if staged). Full clade partition downloads the complete BRAKER3/Tiberius OrthoDB v12 clade archive (0.4-7.7 GB unless cached on the server).">
+                        <option value="representatives" selected="true">Representative clade proteomes via OrthoDB v12 API (fast, recommended)</option>
+                        <option value="full_partition">Full OrthoDB v12 partitioned clade archive (Vertebrata, Arthropoda, Viridiplantae, Fungi, Stramenopiles)</option>
+                    </param>
+                    <when value="representatives">
+                        <param argument="--protein-max-species" name="max_species" type="integer" min="1" max="15" value="5" label="Number of diverse OrthoDB species proteomes to fetch" help="Selects up to this many distinct species across diverse genera from OrthoDB v12 (prioritizing RefSeq assemblies)."/>
+                    </when>
+                    <when value="full_partition"/>
+                </conditional>
+                <param argument="--protein-query" type="text" value="" optional="true" label="Taxonomic clade or OrthoDB partition override (optional)" help="Leave empty to match your target family or selected Organism group automatically, or enter a clade name (for example Diptera, Solanaceae, Alveolata, or Metazoa).">
+                    <validator type="regex" message="Use letters, digits, spaces, underscores, dots, or hyphens only">^[A-Za-z0-9 _.-]*$</validator>
+                </param>
+            </when>
             <when value="history">
                 <param argument="--proteins" type="data" format="fasta,fasta.gz" label="Related-species proteins (FASTA)" help="Protein sequences from related species in the same taxonomic group (uncompressed or gzip-compressed)."/>
             </when>
@@ -450,7 +490,7 @@ The `.focaloop.tar.zst` archive stores compact locus, splice-junction, coverage-
 **Inputs and manifest format**
 
 - **Target genome assembly source:** Choose a built-in Galaxy genome (CVMFS cache, default), upload a eukaryotic FASTA assembly (`.fasta` or `.fasta.gz`) from your Galaxy History, or enter an NCBI assembly accession (`GCF_` or `GCA_` prefix) to download automatically. For mammals, select whether repeats are soft-masked in lowercase or unmasked so the right model weights are used.
-- **Related-species proteins (FASTA):** Recommended. Supply curated protein sequences from related species in the same clade (such as NCBI RefSeq or OrthoDB clade sets).
+- **Related-species protein homology evidence:** Defaults to **Auto-fetch related RefSeq proteomes from NCBI**, which automatically discovers and merges annotated RefSeq proteomes from sister species in the same family or clade (`~15-80 MB`). You can also choose **Auto-fetch OrthoDB v12 clade proteins** (representative clade proteomes or full partitioned OrthoDB v12 packs), upload a custom **Protein FASTA from Galaxy History**, or choose **None**.
 - **Public SRA/ENA run manifest (for remote streaming):** Upload either a plain list of one run accession per line (`SRR`, `ERR`, or `DRR` prefix) or a tab-separated table:
 
 | Column | Required | Description |
