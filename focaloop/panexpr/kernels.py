@@ -2033,18 +2033,28 @@ def map_pooled(kernel: "Kernel", batches: list[tuple[str, list[Read], list[Read]
     if any((b[2] is not None) != paired for b in batches):
         raise ValueError("map_pooled needs batches of one layout")
     if not kernel.supports_pooling or len(batches) == 1:
-        if len(batches) >= 2 and hasattr(kernel, "clone_with_threads") and kernel.threads >= 4:
-            n_w = min(len(batches), max(2, min(4, kernel.threads // 2)))
-            sub_t = max(1, kernel.threads // n_w)
+        if len(batches) >= 2 and hasattr(kernel, "clone_with_threads") and kernel.threads >= 2:
+            from .regime import available_ram_bytes
 
-            def _map_one(item):
-                sid, r1, r2, cal = item
-                return sid, kernel.clone_with_threads(sub_t).map_batch(r1, r2, cal)
+            avail_ram = available_ram_bytes()
+            if avail_ram < (16 << 30):
+                mem_cap_w = 1
+            elif avail_ram < (32 << 30):
+                mem_cap_w = 2
+            else:
+                mem_cap_w = 4
+            n_w = min(len(batches), mem_cap_w, max(1, min(4, kernel.threads // 2)))
+            if n_w >= 2:
+                sub_t = max(1, kernel.threads // n_w)
 
-            with ThreadPoolExecutor(max_workers=n_w) as ex:
-                for sid, res in ex.map(_map_one, batches):
-                    out[sid] = res
-            return out
+                def _map_one(item):
+                    sid, r1, r2, cal = item
+                    return sid, kernel.clone_with_threads(sub_t).map_batch(r1, r2, cal)
+
+                with ThreadPoolExecutor(max_workers=n_w) as ex:
+                    for sid, res in ex.map(_map_one, batches):
+                        out[sid] = res
+                return out
         for sid, r1, r2, cal in batches:
             out[sid] = kernel.map_batch(r1, r2, cal)
         return out

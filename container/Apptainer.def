@@ -55,6 +55,7 @@ Stage: runtime
     export TIBERIUS_WEIGHTS_DIR="/opt/focaloop/tiberius_weights"
     export TF_USE_LEGACY_KERAS="0"
     export PANEXPR_DESEQ2_CPUS="1"
+    export MPLCONFIGDIR="/tmp/matplotlib"
     export PYTHONDONTWRITEBYTECODE="1"
 
 %post

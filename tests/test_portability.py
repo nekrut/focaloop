@@ -682,3 +682,89 @@ def test_geneloop_ncbi_and_orthodb_homology_auto_fetch(tmp_path, monkeypatch):
     monkeypatch.setenv("FOCALOOP_ORTHODB_CACHE_DIR", str(cache_d))
     res_cached = hf.fetch_orthodb_clade_proteins(clade="insecta", dest_dir=tmp_path / "odb_cached")
     assert res_cached["source"] == "orthodb_cached:Arthropoda"
+
+
+def test_marius_expressionloop_memory_and_stream_guards(tmp_path, monkeypatch):
+    import gzip
+    import inspect
+    from focaloop import galaxy_runners, runners_expression
+    from focaloop.panexpr import catalog as cat_mod
+    from focaloop.panexpr import kernels as kern_mod
+    from focaloop.panexpr import regime as reg_mod
+    from focaloop.panexpr.streamer import FastqPrefixStream, GzipStreamDecoder, LocalFileSource
+
+    # 1. ENA HTML redirect / non-gzip payload raises instead of silently yielding 0 reads
+    html_payload = b"<html>\n<head><title>301 Moved Permanently</title></head>\n<body>Moved</body>\n</html>\n"
+    with pytest.raises(RuntimeError, match="HTML"):
+        GzipStreamDecoder(expect_gzip=True).feed_named(html_payload, eof=True)
+    with pytest.raises(RuntimeError, match="gzip"):
+        GzipStreamDecoder(expect_gzip=True).feed_named(b"plain non-gzip noise\n", eof=True)
+
+    bad_gz = tmp_path / "redirected.fastq.gz"
+    bad_gz.write_bytes(html_payload)
+    with pytest.raises(RuntimeError, match="HTML"):
+        FastqPrefixStream(LocalFileSource(bad_gz)).advance_by_named(1024)
+
+    ok_gz = tmp_path / "valid.fastq.gz"
+    with gzip.open(ok_gz, "wb") as fh:
+        fh.write(b"@r1/1\nACGTACGT\n+\nIIIIIIII\n")
+    recs = FastqPrefixStream(LocalFileSource(ok_gz)).advance_by_named(1024)
+    assert len(recs) == 1 and recs[0][0] == "r1"
+
+    # 2. Catalog.release_decoy_sequences() drops resident decoy strings while keeping Target.length & gene seqs
+    td = REPO_ROOT / "tools" / "focaloop" / "test-data" / "expressionloop"
+    cat = cat_mod.build_catalog(
+        [cat_mod.AssemblySpec("primary", td / "ref_primary.fa", td / "ref_primary.gtf")],
+        "eukaryotic",
+        "primary",
+        tmp_path / "cat_decoy",
+    )
+    decoys = [t for t in cat.targets.values() if t.is_decoy]
+    genes = [t for t in cat.targets.values() if not t.is_decoy]
+    assert decoys and genes
+    orig_decoy_lens = [t.length for t in decoys]
+    freed = cat.release_decoy_sequences()
+    assert freed > 0
+    assert all(t.seq == "" for t in decoys)
+    assert [t.length for t in decoys] == orig_decoy_lens
+    assert all(len(t.seq) == t.length and t.length > 0 for t in genes)
+
+    # 3. map_pooled scales clone_with_threads concurrency by cgroup RAM & accepts 4-tuple holdout batches
+    cloned_threads: list[int] = []
+
+    class _FakeCloneKernel:
+        supports_pooling = False
+
+        def __init__(self, threads: int = 8) -> None:
+            self.threads = threads
+
+        def clone_with_threads(self, threads: int):
+            cloned_threads.append(threads)
+            return _FakeCloneKernel(threads)
+
+        def map_batch(self, r1, r2, cal=None, trace=False):
+            return kern_mod.MapResult(n_reads=len(r1))
+
+    batches4 = [(f"s{i}", [("ACGT", "IIII")], [("TGCA", "IIII")], None) for i in range(4)]
+
+    cloned_threads.clear()
+    monkeypatch.setattr(reg_mod, "available_ram_bytes", lambda: 12 << 30)  # 12 GiB -> sequential (1 worker)
+    out_12g = kern_mod.map_pooled(_FakeCloneKernel(threads=8), batches4)
+    assert len(out_12g) == 4 and cloned_threads == []
+
+    cloned_threads.clear()
+    monkeypatch.setattr(reg_mod, "available_ram_bytes", lambda: 20 << 30)  # 20 GiB -> 2 workers x 4 threads
+    out_20g = kern_mod.map_pooled(_FakeCloneKernel(threads=8), batches4)
+    assert len(out_20g) == 4 and cloned_threads == [4, 4, 4, 4]
+
+    cloned_threads.clear()
+    monkeypatch.setattr(reg_mod, "available_ram_bytes", lambda: 64 << 30)  # 64 GiB -> 4 workers x 2 threads
+    out_64g = kern_mod.map_pooled(_FakeCloneKernel(threads=8), batches4)
+    assert len(out_64g) == 4 and cloned_threads == [2, 2, 2, 2]
+
+    # 4. Regime exclusions (fast_euk + RAM_SAFETY) apply unconditionally when kernel_names is unset
+    for mod in (runners_expression, galaxy_runners):
+        src = inspect.getsource(mod)
+        assert "if not kernel_names and regime_dec.excluded:" in src
+        assert "and regime_dec.pseudoaligners_disqualified" not in src
+        assert "map_pooled(win_kernel, hold_batches, calibrators)" not in src

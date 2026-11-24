@@ -436,9 +436,10 @@ def run_panexpr_galaxy(
             use_island_pc_router=True,
             ipc_index_dir=work_dir / "ipc_cache",
         )
-        rv = regime_dec.router_verdict
-        if rv and rv.get("pseudoaligners_disqualified"):
-            cands = [k for k in cands if k.name not in regime_dec.excluded]
+        if not kernel_names and regime_dec.excluded:
+            pruned = [k for k in cands if k.name not in regime_dec.excluded]
+            if pruned:
+                cands = pruned
 
         live: list[Kernel] = []
         for k in cands:
@@ -463,6 +464,10 @@ def run_panexpr_galaxy(
         )
         t_tour = time.time() - t_tour0
         win_kernel = next(k for k in live if k.name == winner)
+        del live, cands
+        catalog.release_decoy_sequences()
+        import gc
+        gc.collect()
         _log(f"Stage 1 winner: {winner} ({t_tour:.1f}s)")
 
         max_pct = float(max_byte_fraction) * 100.0 if max_byte_fraction <= 1.0 else float(max_byte_fraction)
@@ -495,7 +500,7 @@ def run_panexpr_galaxy(
         bytes_by_run: dict[str, int] = {rid: int(acc.bytes_consumed) for rid, acc in loop.accs.items()}
         try:
             hold_accs: dict[str, RunAccumulator] = {}
-            hold_batches: list[tuple[str, list, list | None]] = []
+            hold_batches: list[tuple[str, list, list | None, Any]] = []
             decoy_set = catalog.decoy_ids
             for r in manifest.rna_runs:
                 used_b = bytes_by_run.get(r.run_id, 0)
@@ -509,12 +514,12 @@ def run_panexpr_galaxy(
                         if hr1:
                             acc_h = RunAccumulator(run=r, decoy_ids=decoy_set)
                             hold_accs[r.run_id] = acc_h
-                            hold_batches.append((r.run_id, hr1, hr2))
+                            hold_batches.append((r.run_id, hr1, hr2, acc_h.calibrator))
                     finally:
                         if hasattr(rs, "close"):
                             rs.close()
             if len(hold_batches) >= 2:
-                mapped_h = map_pooled(win_kernel, hold_batches, {rid: hold_accs[rid].calibrator for rid in hold_accs})
+                mapped_h = map_pooled(win_kernel, hold_batches)
                 for rid, mres in mapped_h.items():
                     hold_accs[rid].add(mres)
                 tc_hold, _, _ = quantify_cohort(hold_accs, catalog, dna_prob=None, strand_prior=rep.strand_priors, em_iters=4)

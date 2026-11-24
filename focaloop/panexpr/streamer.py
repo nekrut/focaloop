@@ -107,6 +107,18 @@ class HttpRangeSource(ByteSource):
     def _fetch(self, start: int, end_inclusive: int) -> bytes:
         sem = self._host_sem(self.host)
         last: Exception | None = None
+        gz_url = self.url.split("?", 1)[0].lower().endswith((".gz", ".bgz"))
+
+        def _validate_payload(payload: bytes, ctype: str = "") -> None:
+            if "text/html" in ctype.lower():
+                raise RuntimeError(f"server returned HTML error page ({ctype}) instead of FASTQ bytes")
+            if start == 0 and payload:
+                head = payload.lstrip()[:16].lower()
+                if head.startswith((b"<!doctype", b"<html", b"<?xml")):
+                    raise RuntimeError(f"server returned HTML/XML body ({head!r}) instead of FASTQ bytes")
+                if gz_url and len(payload) >= 2 and payload[:2] != b"\x1f\x8b":
+                    raise RuntimeError(f"expected gzip magic 1f8b at offset 0 of {self.url}, got {payload[:4].hex()}")
+
         for attempt in range(10):
             with sem:
                 t0 = time.time()
@@ -117,6 +129,7 @@ class HttpRangeSource(ByteSource):
                     data = r.content
                     if r.status_code == 200:  # server ignored the range
                         data = data[start:end_inclusive + 1]
+                    _validate_payload(data, r.headers.get("Content-Type", ""))
                     dt = time.time() - t0
                     with self._stats_lock:
                         self.requests_made += 1
@@ -127,9 +140,10 @@ class HttpRangeSource(ByteSource):
                     last = exc
                     try:
                         out = subprocess.run(
-                            ["curl", "-4", "-sS", "--fail", "--max-time", str(int(self.timeout)), "-r", f"{start}-{end_inclusive}", self.url],
+                            ["curl", "-4", "-sS", "-L", "--fail", "--max-time", str(int(self.timeout)), "-r", f"{start}-{end_inclusive}", self.url],
                             check=True, capture_output=True, timeout=self.timeout + 30,
                         ).stdout
+                        _validate_payload(out)
                         dt = time.time() - t0
                         with self._stats_lock:
                             self.requests_made += 1
@@ -202,16 +216,22 @@ def _norm_qname(header: bytes) -> str:
 class GzipStreamDecoder:
     """Stateful gzip/plain FASTQ decoder (multi-member aware) that yields complete FASTQ records."""
 
-    def __init__(self) -> None:
+    def __init__(self, expect_gzip: bool = False) -> None:
         self._d = zlib.decompressobj(16 + zlib.MAX_WBITS)
         self._rem = b""
         self._plain: bool | None = None
+        self.expect_gzip = expect_gzip
         self.records_emitted = 0
         self.malformed_skipped = 0
 
     def _decompress_lines(self, raw: bytes, eof: bool = False) -> list[bytes]:
         chunks: list[bytes] = [self._rem] if self._rem else []
         if self._plain is None and raw:
+            head = raw.lstrip()[:16].lower()
+            if head.startswith((b"<!doctype", b"<html", b"<?xml")):
+                raise RuntimeError(f"received HTML/XML payload ({head!r}) instead of FASTQ stream")
+            if self.expect_gzip and len(raw) >= 2 and raw[:2] != b"\x1f\x8b":
+                raise RuntimeError(f"expected gzip-compressed FASTQ stream (magic 1f8b), got {raw[:4].hex()}")
             self._plain = raw[:2] != b"\x1f\x8b"
         if self._plain:
             if raw:
@@ -302,9 +322,12 @@ class GzipStreamDecoder:
 class FastqPrefixStream:
     """Sequential compressed-byte cursor over one FASTQ file (any ByteSource)."""
 
-    def __init__(self, source: ByteSource) -> None:
+    def __init__(self, source: ByteSource, expect_gzip: bool | None = None) -> None:
         self.source = source
-        self.decoder = GzipStreamDecoder()
+        if expect_gzip is None:
+            loc = str(getattr(source, "path", "") or getattr(source, "url", "")).split("?", 1)[0].lower()
+            expect_gzip = loc.endswith((".gz", ".bgz"))
+        self.decoder = GzipStreamDecoder(expect_gzip=bool(expect_gzip))
         self.consumed_bytes = 0
 
     @property

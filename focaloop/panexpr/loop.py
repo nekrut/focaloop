@@ -508,12 +508,17 @@ class Focaloop:
         return io_s, time.time() - t1
 
     def stream_and_map(self, alloc: dict[str, int]) -> tuple[float, float]:
-        """Bounded-RAM streaming + mapping: caps raw reads in Python heap per micro-wave (~1.2 GB compressed)."""
+        """Bounded-RAM streaming + mapping: caps raw reads in Python heap per micro-wave against cgroup RAM."""
         import gc
         import math
         import os
+        from .regime import available_ram_bytes
 
-        max_wave_bytes = int(os.environ.get("PANEXPR_MAX_WAVE_BYTES", "1200000000"))
+        raw_env = os.environ.get("PANEXPR_MAX_WAVE_BYTES")
+        if raw_env:
+            max_wave_bytes = int(raw_env)
+        else:
+            max_wave_bytes = min(1_200_000_000, max(67_108_864, available_ram_bytes() // 64))
         tot_planned = sum(v for v in alloc.values() if v > 0)
         if tot_planned <= max_wave_bytes:
             return self._stream_and_map_wave(alloc)

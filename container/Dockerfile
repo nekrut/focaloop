@@ -117,6 +117,7 @@ ENV FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints \
     TIBERIUS_WEIGHTS_DIR=/opt/focaloop/tiberius_weights \
     TF_USE_LEGACY_KERAS=0 \
     PANEXPR_DESEQ2_CPUS=1 \
+    MPLCONFIGDIR=/tmp/matplotlib \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/focaloop/native_cache:/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH
 

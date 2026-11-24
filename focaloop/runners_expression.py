@@ -957,9 +957,14 @@ def run_expressionloop_galaxy(
             use_island_pc_router=True,
             ipc_index_dir=work_dir / "ipc_cache",
         )
-        rv = regime_dec.router_verdict
-        if rv and rv.get("pseudoaligners_disqualified"):
-            cands = [k for k in cands if k.name not in regime_dec.excluded]
+        if not kernel_names and regime_dec.excluded:
+            pruned = [k for k in cands if k.name not in regime_dec.excluded]
+            if pruned:
+                cands = pruned
+                _log(
+                    f"Regime classifier selected {[k.name for k in cands]} "
+                    f"(RAM budget {regime_dec.ram_budget_bytes / (1 << 30):.1f} GiB)"
+                )
 
         live: list[Kernel] = []
         for k in cands:
@@ -984,6 +989,10 @@ def run_expressionloop_galaxy(
         )
         t_tour = time.time() - t_tour0
         win_kernel = next(k for k in live if k.name == winner)
+        del live, cands
+        catalog.release_decoy_sequences()
+        import gc
+        gc.collect()
         _log(f"Stage 1 winner: {winner} ({t_tour:.1f}s)")
 
         max_pct = float(max_byte_fraction) * 100.0 if max_byte_fraction <= 1.0 else float(max_byte_fraction)
@@ -1021,7 +1030,7 @@ def run_expressionloop_galaxy(
         bytes_by_run: dict[str, int] = {rid: int(acc.bytes_consumed) for rid, acc in loop.accs.items()}
         try:
             hold_accs: dict[str, RunAccumulator] = {}
-            hold_batches: list[tuple[str, list, list | None]] = []
+            hold_batches: list[tuple[str, list, list | None, Any]] = []
             decoy_set = catalog.decoy_ids
             for r in manifest.rna_runs:
                 used_b = bytes_by_run.get(r.run_id, 0)
@@ -1036,12 +1045,12 @@ def run_expressionloop_galaxy(
                         if hr1:
                             acc_h = RunAccumulator(run=r, decoy_ids=decoy_set)
                             hold_accs[r.run_id] = acc_h
-                            hold_batches.append((r.run_id, hr1, hr2))
+                            hold_batches.append((r.run_id, hr1, hr2, acc_h.calibrator))
                     finally:
                         if hasattr(rs, "close"):
                             rs.close()
             if len(hold_batches) >= 2:
-                mapped_h = map_pooled(win_kernel, hold_batches, {rid: hold_accs[rid].calibrator for rid in hold_accs})
+                mapped_h = map_pooled(win_kernel, hold_batches)
                 for rid, mres in mapped_h.items():
                     hold_accs[rid].add(mres)
                 tc_hold, _, _ = quantify_cohort(hold_accs, catalog, dna_prob=None, strand_prior=rep.strand_priors, em_iters=4)
@@ -1079,6 +1088,21 @@ def run_expressionloop_galaxy(
                     "pct_streamed": 100.0 * sb / tb,
                     "mapped_reads": int(round(mapped_by_run.get(r.run_id, 0.0))),
                 }
+            )
+
+        mapped_by_sample: dict[str, float] = {}
+        cond_by_sample: dict[str, str] = {}
+        for r in manifest.rna_runs:
+            mapped_by_sample[r.sample] = mapped_by_sample.get(r.sample, 0.0) + float(loop.accs[r.run_id].n_mapped)
+            cond_by_sample.setdefault(r.sample, str(r.condition))
+        empty_focal = [
+            s for s, m in mapped_by_sample.items()
+            if m <= 0 and (fac != "condition" or cond_by_sample.get(s) in (str(lvl_a), str(lvl_b)))
+        ]
+        if empty_focal:
+            raise RuntimeError(
+                f"Zero mapped reads in active sample(s): {', '.join(sorted(empty_focal))}. "
+                "Verify FASTQ inputs, reference assembly match, or remote archive availability."
             )
 
         strand_p = float(np.mean([v for k, v in rep.strand_priors.items() if not manifest.run(k).is_wgs])) if rep.strand_priors else 0.5

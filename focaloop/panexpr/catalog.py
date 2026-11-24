@@ -117,10 +117,15 @@ class Target:
     seq: str
     product: str = ""
     exons: list[tuple[int, int]] = field(default_factory=list)
+    _seq_len: int = 0
+
+    def __post_init__(self) -> None:
+        if self._seq_len <= 0 and self.seq:
+            self._seq_len = len(self.seq)
 
     @property
     def length(self) -> int:
-        return len(self.seq)
+        return len(self.seq) if self.seq else self._seq_len
 
     @property
     def is_decoy(self) -> bool:
@@ -768,6 +773,16 @@ class Catalog:
     def write_fasta(self, path: str | Path) -> Path:
         write_fasta(path, ((t.target_id, t.seq) for t in self.targets.values()))
         return Path(path)
+
+    def release_decoy_sequences(self) -> int:
+        """Drop resident decoy sequences after FASTA export while preserving cached target lengths and gene sequences."""
+        freed = 0
+        for t in self.targets.values():
+            if t.is_decoy and t.seq:
+                t._seq_len = len(t.seq)
+                freed += t._seq_len
+                t.seq = ""
+        return freed
 
     def write_gentrome(self, path: str | Path, genome_fastas: list[str | Path]) -> tuple[Path, Path]:
         """Salmon-style gentrome: targets followed by whole-genome decoy contigs + decoys.txt."""
