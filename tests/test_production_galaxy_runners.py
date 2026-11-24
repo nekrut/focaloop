@@ -279,7 +279,7 @@ def test_malariavar_mapper_probe_fallback_and_minimap2_batch_flag(monkeypatch: p
     from focaloop.malariavar.streamer import mapper_cmd
 
     mm_cmd = mapper_cmd(4, paired=True, ref="Pf3D7.fasta", mapper="minimap2")
-    assert "-K" in mm_cmd and "20M" in mm_cmd
+    assert "-K" in mm_cmd and "1M" in mm_cmd
 
     monkeypatch.setattr(gr, "_mapper_runs_cleanly", lambda cand: cand == "minimap2")
     assert gr._select_malariavar_mapper("strobealign") == "minimap2"
