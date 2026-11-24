@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
 import socket
 import subprocess
@@ -24,6 +25,33 @@ import time
 import zlib
 
 from .manifest import Run
+
+
+class _NonRangeServerError(RuntimeError):
+    """Raised when a remote HTTP server ignores Range headers on partial slice requests."""
+
+
+def _check_unsupported_magic(payload: bytes, source_label: str = "") -> None:
+    """Reject binary or unsupported compression formats at stream offset 0 with a clear error."""
+    if not payload:
+        return
+    src_note = f" ({source_label})" if source_label else ""
+    if payload.startswith(b"BZh"):
+        raise RuntimeError(
+            f"Unsupported bzip2-compressed stream{src_note} (magic 425a68) - provide uncompressed or gzip-compressed FASTQ"
+        )
+    if payload.startswith(b"\x28\xb5\x2f\xfd"):
+        raise RuntimeError(
+            f"Unsupported zstd-compressed stream{src_note} (magic 28b52ffd) - provide uncompressed or gzip-compressed FASTQ"
+        )
+    if payload.startswith(b"\xfd7zXZ\x00"):
+        raise RuntimeError(
+            f"Unsupported xz-compressed stream{src_note} (magic fd377a585a00) - provide uncompressed or gzip-compressed FASTQ"
+        )
+    if payload.startswith(b"NCBI.sra"):
+        raise RuntimeError(
+            f"Received binary NCBI .sra archive{src_note} instead of FASTQ stream - enable xsra/sra_odp or provide FASTQ URLs"
+        )
 
 
 class ByteSource:
@@ -104,10 +132,85 @@ class HttpRangeSource(ByteSource):
                 cls._HOST_SESSIONS[host] = sess
             return sess
 
+    def _read_bounded_stream(self, raw_iter, max_bytes: int) -> tuple[bytes, int, bool]:
+        """Read up to ``max_bytes + 1`` bytes from an iterator/stream, returning (data, wire_read, exceeded)."""
+        buf = bytearray()
+        wire = 0
+        exceeded = False
+        for chunk in raw_iter:
+            if not chunk:
+                continue
+            wire += len(chunk)
+            take = min(len(chunk), max_bytes - len(buf))
+            if take > 0:
+                buf.extend(chunk[:take])
+            if wire > max_bytes:
+                exceeded = True
+                break
+        return bytes(buf), wire, exceeded
+
+    def _curl_range_bounded(self, start: int, end_inclusive: int, expected_len: int) -> tuple[bytes, int]:
+        """Bounded curl byte-range fallback that aborts immediately if a server ignores Range."""
+        proc = subprocess.Popen(
+            [
+                "curl",
+                "-4",
+                "-sS",
+                "-L",
+                "--fail",
+                "--max-time",
+                str(int(self.timeout)),
+                "-r",
+                f"{start}-{end_inclusive}",
+                self.url,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdout is not None and proc.stderr is not None
+        chunks: list[bytes] = []
+        wire = 0
+        exceeded = False
+        try:
+            while True:
+                blk = proc.stdout.read(min(262_144, max(4096, expected_len + 1 - wire)))
+                if not blk:
+                    break
+                wire += len(blk)
+                if wire > expected_len:
+                    exceeded = True
+                    proc.kill()
+                    break
+                chunks.append(blk)
+            _, err_b = proc.communicate(timeout=15)
+        except Exception:
+            proc.kill()
+            proc.wait()
+            raise
+        if exceeded:
+            with self._stats_lock:
+                self.requests_made += 1
+                self.network_bytes += wire
+            raise _NonRangeServerError(
+                f"Server at {self.url} ignored HTTP Range bytes={start}-{end_inclusive} (returned >{expected_len} bytes)"
+            )
+        if proc.returncode != 0:
+            err_txt = (err_b or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"curl range {start}-{end_inclusive} failed (rc={proc.returncode}): {err_txt}")
+        out = b"".join(chunks)
+        min_expected = expected_len if (self.total_bytes <= 0 or end_inclusive < self.total_bytes - 1) else (self.total_bytes - start)
+        if len(out) < min_expected:
+            raise RuntimeError(
+                f"Short HTTP range body from {self.url} for {start}-{end_inclusive}: got {len(out)} bytes, expected {min_expected}"
+            )
+        return out, wire
+
     def _fetch(self, start: int, end_inclusive: int) -> bytes:
         sem = self._host_sem(self.host)
         last: Exception | None = None
         gz_url = self.url.split("?", 1)[0].lower().endswith((".gz", ".bgz"))
+        expected_len = max(0, end_inclusive - start + 1)
+        full_file_req = start == 0 and (self.total_bytes > 0 and end_inclusive + 1 >= self.total_bytes)
 
         def _validate_payload(payload: bytes, ctype: str = "") -> None:
             if "text/html" in ctype.lower():
@@ -116,6 +219,7 @@ class HttpRangeSource(ByteSource):
                 head = payload.lstrip()[:16].lower()
                 if head.startswith((b"<!doctype", b"<html", b"<?xml")):
                     raise RuntimeError(f"server returned HTML/XML body ({head!r}) instead of FASTQ bytes")
+                _check_unsupported_magic(payload, self.url)
                 if gz_url and len(payload) >= 2 and payload[:2] != b"\x1f\x8b":
                     raise RuntimeError(f"expected gzip magic 1f8b at offset 0 of {self.url}, got {payload[:4].hex()}")
 
@@ -123,33 +227,79 @@ class HttpRangeSource(ByteSource):
             with sem:
                 t0 = time.time()
                 try:
-                    r = self._get_session(self.host).get(self.url, headers={"Range": f"bytes={start}-{end_inclusive}"}, timeout=self.timeout)
-                    if r.status_code not in (200, 206):
-                        raise RuntimeError(f"HTTP {r.status_code} for range {start}-{end_inclusive}")
-                    data = r.content
-                    if r.status_code == 200:  # server ignored the range
-                        data = data[start:end_inclusive + 1]
-                    _validate_payload(data, r.headers.get("Content-Type", ""))
+                    r = self._get_session(self.host).get(
+                        self.url,
+                        headers={"Range": f"bytes={start}-{end_inclusive}"},
+                        stream=True,
+                        timeout=self.timeout,
+                    )
+                    try:
+                        if r.status_code == 200 and not full_file_req:
+                            cl_hdr = r.headers.get("Content-Length", "")
+                            cl_int = int(cl_hdr) if cl_hdr.isdigit() else -1
+                            if start > 0 or (cl_int >= 0 and cl_int > expected_len):
+                                with self._stats_lock:
+                                    self.requests_made += 1
+                                raise _NonRangeServerError(
+                                    f"Server at {self.url} ignored HTTP Range header (HTTP 200 for bytes={start}-{end_inclusive})"
+                                )
+                            data, wire, exceeded = self._read_bounded_stream(r.iter_content(chunk_size=262_144), expected_len)
+                            if exceeded:
+                                with self._stats_lock:
+                                    self.requests_made += 1
+                                    self.network_bytes += wire
+                                raise _NonRangeServerError(
+                                    f"Server at {self.url} ignored HTTP Range header (HTTP 200 streamed >{expected_len} bytes)"
+                                )
+                        elif r.status_code in (200, 206):
+                            data, wire, exceeded = self._read_bounded_stream(r.iter_content(chunk_size=262_144), expected_len)
+                            if exceeded:
+                                with self._stats_lock:
+                                    self.requests_made += 1
+                                    self.network_bytes += wire
+                                raise _NonRangeServerError(
+                                    f"Server at {self.url} returned oversized body (>{expected_len} bytes) for Range {start}-{end_inclusive}"
+                                )
+                        else:
+                            raise RuntimeError(f"HTTP {r.status_code} for range {start}-{end_inclusive}")
+                        ctype = r.headers.get("Content-Type", "")
+                    finally:
+                        r.close()
+
+                    min_expected = (
+                        expected_len
+                        if (self.total_bytes <= 0 or end_inclusive < self.total_bytes - 1)
+                        else (self.total_bytes - start)
+                    )
+                    if len(data) < min_expected:
+                        with self._stats_lock:
+                            self.requests_made += 1
+                            self.network_bytes += wire
+                        raise RuntimeError(
+                            f"Short HTTP {r.status_code} body for range {start}-{end_inclusive}: got {len(data)} of {min_expected} bytes"
+                        )
+                    _validate_payload(data, ctype)
                     dt = time.time() - t0
                     with self._stats_lock:
                         self.requests_made += 1
-                        self.network_bytes += len(data)
+                        self.network_bytes += wire
                         self.network_seconds += dt
                     return data
-                except Exception as exc:  # fall back to curl -4 which proved robust on this cluster
+                except _NonRangeServerError:
+                    raise
+                except Exception as exc:  # fall back to bounded curl -4
                     last = exc
                     try:
-                        out = subprocess.run(
-                            ["curl", "-4", "-sS", "-L", "--fail", "--max-time", str(int(self.timeout)), "-r", f"{start}-{end_inclusive}", self.url],
-                            check=True, capture_output=True, timeout=self.timeout + 30,
-                        ).stdout
+                        out, c_wire = self._curl_range_bounded(start, end_inclusive, expected_len)
                         _validate_payload(out)
                         dt = time.time() - t0
                         with self._stats_lock:
                             self.requests_made += 1
-                            self.network_bytes += len(out)
+                            self.network_bytes += c_wire
                             self.network_seconds += dt
                         return out
+                    except _NonRangeServerError:
+                        raise
                     except Exception as exc2:
                         last = exc2
             # Sleep outside the host semaphore so other threads are not blocked during backoff
@@ -213,60 +363,111 @@ def _norm_qname(header: bytes) -> str:
     return tok.decode("latin-1")
 
 
+def _complementary_mate_stem(q1: str, q2: str) -> str | None:
+    """If q1 and q2 end in complementary mate tags (_1/_2, .1/.2, :1/:2) with identical stem, return stem."""
+    if len(q1) > 2 and len(q1) == len(q2):
+        sep1, m1 = q1[-2], q1[-1]
+        sep2, m2 = q2[-2], q2[-1]
+        if sep1 == sep2 and sep1 in ("_", ".", ":") and m1 == "1" and m2 == "2" and q1[:-2] == q2[:-2]:
+            return q1[:-2]
+    return None
+
+
 class GzipStreamDecoder:
     """Stateful gzip/plain FASTQ decoder (multi-member aware) that yields complete FASTQ records."""
 
-    def __init__(self, expect_gzip: bool = False) -> None:
+    def __init__(self, expect_gzip: bool = False, source_label: str = "") -> None:
         self._d = zlib.decompressobj(16 + zlib.MAX_WBITS)
         self._rem = b""
         self._plain: bool | None = None
+        self._member_started: bool = False
         self.expect_gzip = expect_gzip
+        self.source_label = source_label
+        self.bytes_fed = 0
         self.records_emitted = 0
         self.malformed_skipped = 0
 
+    def _src_note(self) -> str:
+        return f" ({self.source_label})" if self.source_label else ""
+
     def _decompress_lines(self, raw: bytes, eof: bool = False) -> list[bytes]:
         chunks: list[bytes] = [self._rem] if self._rem else []
+        base_offset = self.bytes_fed
+        self.bytes_fed += len(raw)
         if self._plain is None and raw:
             head = raw.lstrip()[:16].lower()
             if head.startswith((b"<!doctype", b"<html", b"<?xml")):
-                raise RuntimeError(f"received HTML/XML payload ({head!r}) instead of FASTQ stream")
+                raise RuntimeError(f"received HTML/XML payload ({head!r}) instead of FASTQ stream{self._src_note()}")
+            _check_unsupported_magic(raw, self.source_label)
             if self.expect_gzip and len(raw) >= 2 and raw[:2] != b"\x1f\x8b":
-                raise RuntimeError(f"expected gzip-compressed FASTQ stream (magic 1f8b), got {raw[:4].hex()}")
+                raise RuntimeError(
+                    f"expected gzip-compressed FASTQ stream (magic 1f8b){self._src_note()}, got {raw[:4].hex()}"
+                )
             self._plain = raw[:2] != b"\x1f\x8b"
         if self._plain:
             if raw:
                 chunks.append(raw)
-        else:
+        elif self._plain is False:
             mv = memoryview(raw)
             n = len(mv)
             step = 262_144  # 256 KiB slice avoids O(N^2) unused_data copies on multi-member BGZF files
             pos = 0
-            broken = False
-            while pos < n and not broken:
+            while pos < n:
                 end = pos + step if pos + step < n else n
                 data: bytes | memoryview = mv[pos:end]
+                chunk_start = base_offset + pos
                 pos = end
                 while data:
+                    self._member_started = True
                     try:
                         part = self._d.decompress(data)
                         if part:
                             chunks.append(part)
-                    except zlib.error:
-                        broken = True
-                        break
+                    except zlib.error as exc:
+                        raise RuntimeError(
+                            f"Corrupt gzip FASTQ stream{self._src_note()} near compressed byte {chunk_start}: {exc}"
+                        ) from exc
                     if self._d.eof:
-                        data = self._d.unused_data
+                        unused = self._d.unused_data
+                        # Ignore trailing NUL padding after last gzip member if present
+                        if unused and not unused.strip(b"\x00"):
+                            unused = b""
                         self._d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                        self._member_started = False
+                        data = unused
                         if not data:
                             break
                     else:
                         break
+            if eof:
+                try:
+                    tail = self._d.flush()
+                    if tail:
+                        chunks.append(tail)
+                except zlib.error as exc:
+                    raise RuntimeError(
+                        f"Corrupt gzip FASTQ trailer{self._src_note()} at EOF ({self.bytes_fed} bytes): {exc}"
+                    ) from exc
+                if self._member_started and not self._d.eof:
+                    raise RuntimeError(
+                        f"Truncated gzip FASTQ stream{self._src_note()} at EOF ({self.bytes_fed} bytes): incomplete gzip member"
+                    )
         if not chunks:
             return [b""]
         buf = chunks[0] if len(chunks) == 1 else b"".join(chunks)
         if eof and buf and not buf.endswith(b"\n"):
             buf += b"\n"
         return buf.split(b"\n")
+
+    def _finalize_parse_check(self, eof: bool) -> None:
+        if eof and self._rem.strip():
+            self.malformed_skipped += 1
+        if self.records_emitted == 0 and (
+            (eof and self.malformed_skipped > 0) or self.malformed_skipped >= 64
+        ):
+            raise RuntimeError(
+                f"Zero valid FASTQ records decoded from stream{self._src_note()} (malformed lines={self.malformed_skipped})"
+            )
 
     def feed_named(self, raw: bytes, eof: bool = False) -> list[tuple[str, str, str]]:
         lines = self._decompress_lines(raw, eof=eof)
@@ -280,7 +481,8 @@ class GzipStreamDecoder:
             hdr = lines[i]
             plus = lines[i + 2]
             if not hdr or hdr[0] != 64 or not plus or plus[0] != 43:
-                self.malformed_skipped += 1
+                if hdr:
+                    self.malformed_skipped += 1
                 i += 1
                 continue
             seq = lines[i + 1].rstrip(b"\r ")
@@ -292,6 +494,7 @@ class GzipStreamDecoder:
                 self.malformed_skipped += 1
         self._rem = b"\n".join(lines[i:])
         self.records_emitted += len(recs)
+        self._finalize_parse_check(eof)
         return recs
 
     def feed(self, raw: bytes, eof: bool = False) -> list[tuple[str, str]]:
@@ -304,7 +507,8 @@ class GzipStreamDecoder:
             hdr = lines[i]
             plus = lines[i + 2]
             if not hdr or hdr[0] != 64 or not plus or plus[0] != 43:
-                self.malformed_skipped += 1
+                if hdr:
+                    self.malformed_skipped += 1
                 i += 1
                 continue
             seq = lines[i + 1].rstrip(b"\r ")
@@ -316,6 +520,7 @@ class GzipStreamDecoder:
                 self.malformed_skipped += 1
         self._rem = b"\n".join(lines[i:])
         self.records_emitted += len(recs)
+        self._finalize_parse_check(eof)
         return recs
 
 
@@ -324,10 +529,11 @@ class FastqPrefixStream:
 
     def __init__(self, source: ByteSource, expect_gzip: bool | None = None) -> None:
         self.source = source
+        loc_raw = str(getattr(source, "path", "") or getattr(source, "url", ""))
         if expect_gzip is None:
-            loc = str(getattr(source, "path", "") or getattr(source, "url", "")).split("?", 1)[0].lower()
+            loc = loc_raw.split("?", 1)[0].lower()
             expect_gzip = loc.endswith((".gz", ".bgz"))
-        self.decoder = GzipStreamDecoder(expect_gzip=bool(expect_gzip))
+        self.decoder = GzipStreamDecoder(expect_gzip=bool(expect_gzip), source_label=loc_raw)
         self.consumed_bytes = 0
 
     @property
@@ -355,10 +561,26 @@ class FastqPrefixStream:
     def advance_by(self, n_bytes: int) -> list[tuple[str, str]]:
         return self.advance_to(self.consumed_bytes + int(n_bytes))
 
+    def skip_bytes(self, n_bytes: int, chunk_bytes: int = 16 * 1024 * 1024) -> int:
+        """Advance ``n_bytes`` in bounded chunks while discarding decoded records so RSS stays flat."""
+        target = min(self.source.total_bytes, self.consumed_bytes + max(0, int(n_bytes)))
+        step = max(65_536, int(chunk_bytes))
+        before = self.consumed_bytes
+        while self.consumed_bytes < target:
+            nxt = min(target, self.consumed_bytes + step)
+            raw = self.source.read_range(self.consumed_bytes, nxt)
+            if not raw:
+                break
+            self.consumed_bytes += len(raw)
+            _ = self.decoder.feed(raw, eof=self.exhausted)
+        return self.consumed_bytes - before
+
 
 @dataclass
 class RunStream:
     """PE (two cursors) or SE (one cursor) stream for one run."""
+
+    _MAX_UNPAIRED_CARRY = 16_384
 
     run: Run
     streams: list[FastqPrefixStream]
@@ -384,6 +606,25 @@ class RunStream:
     @property
     def network_bytes(self) -> int:
         return sum(getattr(s.source, "network_bytes", 0) for s in self.streams)
+
+    @property
+    def malformed_skipped(self) -> int:
+        return sum(s.decoder.malformed_skipped for s in self.streams)
+
+    def skip_bytes(self, n_bytes_total: int, chunk_bytes: int = 16 * 1024 * 1024) -> int:
+        """Skip ``n_bytes_total`` compressed bytes in bounded chunks while keeping PE mate cursors aligned."""
+        rem = max(0, int(n_bytes_total))
+        step = max(65_536, int(chunk_bytes))
+        before = self.consumed_bytes
+        while rem > 0 and not self.exhausted:
+            take = min(rem, step)
+            prev = self.consumed_bytes
+            _a, _b = self.advance_bytes(take)
+            delta = self.consumed_bytes - prev
+            if delta <= 0:
+                break
+            rem -= max(take, delta)
+        return self.consumed_bytes - before
 
     def advance_fraction(self, frac: float, min_bytes: int = 262_144) -> tuple[list[tuple[str, str]], list[tuple[str, str]] | None]:
         """Advance every mate cursor by ``frac`` of its own file size (at least min_bytes)."""
@@ -435,8 +676,22 @@ class RunStream:
                 self.skipped_unpaired_mates += len(r1) + len(r2)
                 self._carry_named = [[], []]
             else:
+                if len(r1) > self._MAX_UNPAIRED_CARRY or len(r2) > self._MAX_UNPAIRED_CARRY:
+                    raise RuntimeError(
+                        f"Paired-end mate streams severely out of balance in run {self.run.run_id!r} "
+                        f"(buffered R1={len(r1)}, R2={len(r2)})"
+                    )
                 self._carry_named = [r1, r2]
             return [], []
+
+        # Detect complementary mate suffixes (_1/_2, .1/.2, :1/:2) when raw tokens differ only by mate digit
+        if r1[0][0] != r2[0][0] and _complementary_mate_stem(r1[0][0], r2[0][0]) is not None:
+            sep = r1[0][0][-2]
+            suf1 = f"{sep}1"
+            suf2 = f"{sep}2"
+            r1 = [(q[:-2] if len(q) > 2 and q.endswith(suf1) else q, s, ql) for q, s, ql in r1]
+            r2 = [(q[:-2] if len(q) > 2 and q.endswith(suf2) else q, s, ql) for q, s, ql in r2]
+
         # Fast path: QNAMEs already aligned at every index (standard uncorrupted stream)
         if all(r1[i][0] == r2[i][0] for i in range(n)):
             out1 = [(s, q) for _, s, q in r1[:n]]
@@ -448,6 +703,7 @@ class RunStream:
                 self._carry_named = [r1[n:], r2[n:]]
             self.reads_emitted += n
             return out1, out2
+
         # Resync path: one mate stream skipped a malformed record; pair strictly by matching QNAME in order
         from collections import deque
         pos2: dict[str, deque[int]] = {}
@@ -472,12 +728,22 @@ class RunStream:
             out1.append((s1, q1))
             out2.append((s2, q2))
             matched += 1
+        if matched == 0 and n >= 1:
+            raise RuntimeError(
+                f"Paired-end mate headers do not match in run {self.run.run_id!r} "
+                f"(0 of {n} records paired, first R1={r1[0][0]!r}, first R2={r2[0][0]!r})"
+            )
         rem1 = r1[last_i1 + 1:]
         rem2 = r2[last_i2 + 1:]
         if self.exhausted:
             self.skipped_unpaired_mates += len(rem1) + len(rem2)
             self._carry_named = [[], []]
         else:
+            if len(rem1) > self._MAX_UNPAIRED_CARRY or len(rem2) > self._MAX_UNPAIRED_CARRY:
+                raise RuntimeError(
+                    f"Unpaired mate backlog exceeded {self._MAX_UNPAIRED_CARRY} records in run {self.run.run_id!r} "
+                    f"(first unpaired R1={rem1[0][0] if rem1 else ''!r}, R2={rem2[0][0] if rem2 else ''!r})"
+                )
             self._carry_named = [rem1, rem2]
         self.reads_emitted += matched
         return out1, out2
@@ -496,13 +762,19 @@ def open_run_stream(run: Run, source_mode: str, cache_dir: str | Path | None = N
             return XsraRunStream(run, ledger=ledger, cache_dir=cache_dir)
         source_mode = "http_range"
     streams: list[FastqPrefixStream] = []
-    for f in run.files:
+    safe_rid = run.run_id.replace("/", "_").replace("\\", "_")
+    for mate_idx, f in enumerate(run.files):
         if source_mode == "local_bytes":
             if not f.local_path:
                 raise ValueError(f"run {run.run_id}: local_bytes mode needs local_path for {f.basename}")
             src: ByteSource = LocalFileSource(f.local_path, f.bytes if f.bytes else None)
         elif source_mode == "http_range":
-            cache = (Path(cache_dir) / f"{f.basename}.part") if cache_dir else None
+            if "sra-pub-run-odp.s3.amazonaws.com/sra/" in f.url or run.extra.get("_odp_sra_only"):
+                raise RuntimeError(
+                    f"Run {run.run_id} has no ENA FASTQ mirror (only binary NCBI .sra at {f.url}) and requires 'xsra' on PATH"
+                )
+            url_hash = hashlib.sha1(f.url.encode("utf-8")).hexdigest()[:12]
+            cache = (Path(cache_dir) / f"{safe_rid}_{mate_idx}_{url_hash}.part") if cache_dir else None
             src = HttpRangeSource(f.url, f.bytes, cache)
         else:
             raise ValueError(f"unknown source_mode {source_mode!r}")

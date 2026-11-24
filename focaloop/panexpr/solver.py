@@ -528,7 +528,9 @@ def quantify_cohort(
 
     chunks: dict[str, list] = {k: [] for k in TARGET_COUNTS_SCHEMA.names}
     post_lookup: dict[tuple[str, int], list[float]] = {}
-    for acc in rna:
+    sparse_threshold_rows = 250_000
+    use_sparse_runs = (n * len(rna)) > sparse_threshold_rows and n > 0
+    for run_i, acc in enumerate(rna):
         act_eff, act_var, post, gvar = results[acc.run.run_id]
         if include_posteriors:
             for idx, ws in post.items():
@@ -563,16 +565,34 @@ def quantify_cohort(
             if rows is not None:
                 gvar_col[rows] = val
 
-        chunks["run_id"].append(pa.repeat(pa.scalar(acc.run.run_id, pa.string()), n))
-        chunks["sample"].append(pa.repeat(pa.scalar(acc.run.sample, pa.string()), n))
-        chunks["condition"].append(pa.repeat(pa.scalar(acc.run.condition, pa.string()), n))
-        chunks["unique_sense"].append(pa.array(u_s))
-        chunks["unique_antisense"].append(pa.array(u_a))
-        chunks["effective_count"].append(pa.array(eff_col))
-        chunks["assignment_variance"].append(pa.array(var_col))
-        chunks["group_assignment_variance"].append(pa.array(gvar_col))
-        for k, arr in static.items():
-            chunks[k].append(arr)
+        if use_sparse_runs and run_i > 0:
+            nz_mask = (u_s != 0.0) | (u_a != 0.0) | (eff_col != 0.0) | (var_col != 0.0) | (gvar_col != 0.0)
+            row_idx = np.nonzero(nz_mask)[0]
+            if row_idx.size == 0:
+                row_idx = np.array([0], dtype=np.int64)
+            m_rows = int(row_idx.size)
+            pa_idx = pa.array(row_idx, pa.int64())
+            chunks["run_id"].append(pa.repeat(pa.scalar(acc.run.run_id, pa.string()), m_rows))
+            chunks["sample"].append(pa.repeat(pa.scalar(acc.run.sample, pa.string()), m_rows))
+            chunks["condition"].append(pa.repeat(pa.scalar(acc.run.condition, pa.string()), m_rows))
+            chunks["unique_sense"].append(pa.array(u_s[row_idx]))
+            chunks["unique_antisense"].append(pa.array(u_a[row_idx]))
+            chunks["effective_count"].append(pa.array(eff_col[row_idx]))
+            chunks["assignment_variance"].append(pa.array(var_col[row_idx]))
+            chunks["group_assignment_variance"].append(pa.array(gvar_col[row_idx]))
+            for k, arr in static.items():
+                chunks[k].append(arr.take(pa_idx))
+        else:
+            chunks["run_id"].append(pa.repeat(pa.scalar(acc.run.run_id, pa.string()), n))
+            chunks["sample"].append(pa.repeat(pa.scalar(acc.run.sample, pa.string()), n))
+            chunks["condition"].append(pa.repeat(pa.scalar(acc.run.condition, pa.string()), n))
+            chunks["unique_sense"].append(pa.array(u_s))
+            chunks["unique_antisense"].append(pa.array(u_a))
+            chunks["effective_count"].append(pa.array(eff_col))
+            chunks["assignment_variance"].append(pa.array(var_col))
+            chunks["group_assignment_variance"].append(pa.array(gvar_col))
+            for k, arr in static.items():
+                chunks[k].append(arr)
     cols = {k: pa.chunked_array(chunks[k], TARGET_COUNTS_SCHEMA.field(k).type) for k in TARGET_COUNTS_SCHEMA.names}
     return pa.table(cols).cast(TARGET_COUNTS_SCHEMA), post_lookup
 
@@ -594,7 +614,13 @@ def assembly_assignment_summary(table: pa.Table) -> dict[str, float]:
 # Gene-level aggregation
 # ---------------------------------------------------------------------------
 
-DE_EXCLUDED_BIOTYPES = ("rRNA", "tRNA", "tmRNA", "RNase_P_RNA", "SRP_RNA", "window")
+DE_EXCLUDED_BIOTYPES = (
+    "rRNA", "tRNA", "tmRNA", "RNase_P_RNA", "SRP_RNA", "window",
+    "Mt_rRNA", "Mt_tRNA", "mt_rRNA", "mt_tRNA",
+    "rRNA_pseudogene", "tRNA_pseudogene",
+    "5S_rRNA", "5_8S_rRNA", "5.8S_rRNA", "12S_rRNA", "16S_rRNA", "18S_rRNA", "23S_rRNA", "28S_rRNA",
+    "SSU_rRNA", "LSU_rRNA", "ribosomal_RNA", "transfer_RNA",
+)
 
 
 def gene_level_tables(
@@ -796,10 +822,6 @@ def transcript_level_table(
         np.maximum(1.0, len_arr / 2.0),
     )
     eff_len_pa = pa.array(eff_len, pa.float64())
-    rate = cnt_mat / eff_len[None, :]
-    rate_sum = np.sum(rate, axis=1, keepdims=True)
-    pos_rs = rate_sum > 0.0
-    tpm_mat = np.where(pos_rs, rate * (1e6 / np.where(pos_rs, rate_sum, 1.0)), 0.0)
 
     g_map: dict[str, int] = {}
     g_code = np.empty(n_tx, dtype=np.int64)
@@ -815,7 +837,10 @@ def transcript_level_table(
     base_st = cached["base_static"]
     chunks: dict[str, list] = {k: [] for k in TRANSCRIPT_ABUNDANCE_SCHEMA.names}
     for si, sname in enumerate(s_lab):
-        tpm_s = tpm_mat[si]
+        cnt_s = cnt_mat[si]
+        rate_s = cnt_s / eff_len
+        rsum_s = float(rate_s.sum())
+        tpm_s = (rate_s * (1e6 / rsum_s)) if rsum_s > 0.0 else np.zeros(n_tx, dtype=np.float64)
         gene_sum = np.bincount(g_code, weights=tpm_s, minlength=n_genes)
         denom = gene_sum[g_code]
         psi_s = np.where(denom > 0.0, tpm_s / np.where(denom > 0.0, denom, 1.0), 0.0)
@@ -828,7 +853,7 @@ def transcript_level_table(
         chunks["biotype"].append(base_st["biotype"])
         chunks["length_bp"].append(base_st["length_bp"])
         chunks["effective_length"].append(eff_len_pa)
-        chunks["transcript_counts"].append(pa.array(cnt_mat[si], pa.float64()))
+        chunks["transcript_counts"].append(pa.array(cnt_s, pa.float64()))
         chunks["transcript_tpm"].append(pa.array(tpm_s, pa.float64()))
         chunks["isoform_fraction_psi"].append(pa.array(psi_s, pa.float64()))
 
@@ -839,6 +864,53 @@ def transcript_level_table(
 # ---------------------------------------------------------------------------
 # PyDESeq2 adapter and calibrated uncertainty
 # ---------------------------------------------------------------------------
+
+def parse_design_terms(design: str) -> list[tuple[str, bool]]:
+    """Parse an additive design formula into ``[(column_name, is_explicit_categorical), ...]``.
+
+    Rejects interaction operators (``*`` or ``:``) explicitly because PyDESeq2 and the fast NB
+    refit engine fit main-effect additive models only (L1).
+    """
+    import re
+
+    raw = str(design or "").strip()
+    if not raw:
+        raise ValueError("Design formula cannot be empty (expected a formula such as '~condition')")
+    rhs = raw.split("~", 1)[1].strip() if "~" in raw else raw
+    # Reject interaction terms outside parentheses (and inside C(...) if attempted)
+    if "*" in rhs or ":" in rhs:
+        raise ValueError(
+            f"Interaction terms ('*' or ':') in design {design!r} are not supported. "
+            "Use an additive design such as '~ batch + condition' or combine group levels into one factor column."
+        )
+    parts = [t.strip() for t in rhs.split("+") if t.strip() and t.strip() not in ("1", "0")]
+    if not parts:
+        raise ValueError(f"Design formula {design!r} has no covariate or condition terms")
+    out: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for t in parts:
+        m_cat = re.match(r"^C\(\s*([A-Za-z0-9_.-]+)\s*(?:,.*)?\)$", t)
+        if m_cat:
+            col = m_cat.group(1).strip()
+            is_cat = True
+        elif re.match(r"^[A-Za-z0-9_.-]+$", t):
+            col = t
+            is_cat = False
+        else:
+            raise ValueError(
+                f"Unsupported term {t!r} in design {design!r}. "
+                "Use additive column names joined by '+' (with optional C(column) for categorical integer covariates)."
+            )
+        if col not in seen:
+            seen.add(col)
+            out.append((col, is_cat))
+    return out
+
+
+def validate_additive_design(design: str) -> list[str]:
+    """Validate additive formula syntax and return ordered column names."""
+    return [col for col, _is_cat in parse_design_terms(design)]
+
 
 def run_pydeseq2(
     counts: pd.DataFrame,
@@ -852,9 +924,17 @@ def run_pydeseq2(
     from pydeseq2.dds import DeseqDataSet
     from pydeseq2.ds import DeseqStats
 
+    parsed_terms = parse_design_terms(design)
     if n_cpus is None:
         n_cpus = int(os.environ.get("PANEXPR_DESEQ2_CPUS", "1"))   # 1 = the locked behaviour; >1 crashed loky in the SIF
+    validate_additive_design(design)
     meta_aligned = meta.loc[counts.index].copy()
+    for col, is_cat in parsed_terms:
+        if col not in meta_aligned.columns:
+            raise ValueError(f"Design column {col!r} from {design!r} is missing in sample metadata: {list(meta_aligned.columns)}")
+        if is_cat or col == contrast[0]:
+            meta_aligned[col] = [f"cat_{v}" if pd.api.types.is_numeric_dtype(meta_aligned[col]) and col != contrast[0] else str(v) for v in meta_aligned[col]]
+    deseq_design = "~ " + " + ".join(col for col, _ in parsed_terms)
     keep = counts.sum(axis=0) >= min_total
     sub = counts.loc[:, keep].round().astype(int)
     nonzero_samples = sub.sum(axis=1) > 0
@@ -875,7 +955,7 @@ def run_pydeseq2(
     dds = DeseqDataSet(
         counts=sub,
         metadata=meta_aligned,
-        design=design,
+        design=deseq_design,
         refit_cooks=True,
         quiet=True,
         n_cpus=n_cpus,
@@ -1087,6 +1167,7 @@ def fast_nb_mom_de(
     while supporting arbitrary additive designs (including donor-blocked ``~ block + condition``).
     Full ``de_with_uncertainty`` (PyDESeq2) is always executed once the stopping rule triggers.
     """
+    validate_additive_design(design)
     meta_aligned = meta.loc[counts.index].copy()
     keep_g = (counts.sum(axis=0) >= min_total).to_numpy(dtype=bool)
     C_round = np.rint(counts.to_numpy(dtype=np.float64))
@@ -1262,19 +1343,18 @@ def _design_matrix_and_contrast(
     optional ``C(col)`` wrappers) while matching the exact 2-column ``[1, cond == lvl_a]`` layout
     on simple 2-group ``~condition`` designs.
     """
-    import re
     factor, lvl_a, lvl_b = contrast
     n = len(meta)
+    parsed_terms = parse_design_terms(design)
+    explicit_cats = {col for col, is_cat in parsed_terms if is_cat}
     cond = meta[factor].astype(str)
     is_a = (cond == str(lvl_a)).values
     is_b = (cond == str(lvl_b)).values
-    rhs = design.split("~", 1)[-1].strip() if "~" in design else design.strip()
-    raw_terms = [t.strip() for t in rhs.split("+") if t.strip() and t.strip() not in ("1", "0")]
     terms: list[str] = []
-    for t in raw_terms:
-        m = re.match(r"^C\(\s*([^,\)]+)\s*(?:,.*)?\)$", t)
-        col = m.group(1).strip() if m else t
-        if col in meta.columns and col not in terms:
+    for col, _is_cat in parsed_terms:
+        if col not in meta.columns:
+            raise ValueError(f"Design column {col!r} from {design!r} is missing in sample metadata: {list(meta.columns)}")
+        if col not in terms:
             terms.append(col)
     if factor not in terms:
         terms.append(factor)
@@ -1296,7 +1376,7 @@ def _design_matrix_and_contrast(
     factor_ref: str | None = None
     for col in terms:
         s = meta[col]
-        if col != factor and pd.api.types.is_numeric_dtype(s):
+        if col != factor and col not in explicit_cats and pd.api.types.is_numeric_dtype(s):
             vals = s.astype(float).fillna(0.0).values
             if np.std(vals[keep_mask]) > 0:
                 cols.append(vals)
@@ -1569,10 +1649,13 @@ def refit_genes_with_depth_offsets(
     out["streamed_reads"] = sr_arr
     out["base_mean"] = bm_arr
     out["status"] = status_arr
-    valid = out["pvalue"].notna() & out["status"].isin(["DE", "non_DE", "zoomed", "pending", "low_depth"])
+    valid = out["pvalue"].notna() & out["status"].isin(["DE", "non_DE", "zoomed"])
     if valid.any():
         _, q, _, _ = multipletests(out.loc[valid, "pvalue"].values, method="fdr_bh")
         out.loc[valid, "padj"] = q
+    non_zoom_tested = out["status"].isin(["DE", "non_DE"])
+    out.loc[non_zoom_tested & (out["padj"] < 0.05), "status"] = "DE"
+    out.loc[non_zoom_tested & ~(out["padj"] < 0.05), "status"] = "non_DE"
     zoomed = out["status"] == "zoomed"
     out.loc[zoomed & (out["padj"] < 0.05), "status"] = "DE_after_zoom"
     out.loc[zoomed & ~(out["padj"] < 0.05), "status"] = "non_DE_after_zoom"

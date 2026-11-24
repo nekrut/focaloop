@@ -62,7 +62,12 @@ focaloop expressionloop
         #end for
         --read-ids
         #for $pair in $input_source.paired_reads
-            '${str($pair.element_identifier).replace("'", "_")}'
+            #set $eid = str($pair.element_identifier).replace("'", "_")
+            #if $eid.startswith("-")
+                '_${eid[1:]}'
+            #else
+                '${eid}'
+            #end if
         #end for
     #elif str($input_source.source_type) == "history_single"
         --reads
@@ -71,7 +76,12 @@ focaloop expressionloop
         #end for
         --read-ids
         #for $r in $input_source.reads
-            '${str($r.element_identifier).replace("'", "_")}'
+            #set $eid = str($r.element_identifier).replace("'", "_")
+            #if $eid.startswith("-")
+                '_${eid[1:]}'
+            #else
+                '${eid}'
+            #end if
         #end for
     #end if
     #if str($input_source.source_type) == "manifest_insdc"
@@ -241,9 +251,9 @@ ${a}	${gname}	${a}
                     </when>
                     <when value="inline">
                         <repeat name="condition_groups" title="Experimental condition group" min="2" default="2" help="Define at least two experimental condition groups (for example, treated and control) and list the public SRA/ENA run accessions belonging to each group. Make sure Primary differential expression contrast below uses these exact group names (for example, condition:treated:control).">
-                            <param name="group_name" type="text" value="" label="Condition group name" help="Short group label used in your differential expression contrast (letters, digits, underscores, dots, or hyphens only, for example treated or control).">
+                            <param name="group_name" type="text" value="" label="Condition group name" help="Short group label used in your differential expression contrast (start with a letter, digit, or underscore, followed by letters, digits, underscores, dots, or hyphens, for example treated or control).">
                                 <validator type="empty_field" message="Enter a condition group name (for example, treated or control)."/>
-                                <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only.">^[A-Za-z0-9_.-]+$</validator>
+                                <validator type="regex" message="Start with a letter, digit, or underscore and use letters, digits, underscores, dots, or hyphens only.">^[A-Za-z0-9_][A-Za-z0-9_.-]*$</validator>
                             </param>
                             <param name="accessions" type="text" area="true" value="" label="Public SRA/ENA run accessions" help="Enter one or more public SRA/ENA run accessions (SRR, ERR, or DRR prefix) separated by newlines, spaces, or commas.">
                                 <sanitizer invalid_char="">
@@ -270,22 +280,24 @@ ${a}	${gname}	${a}
         <param argument="--contrast" type="text" value="condition:treated:control" label="Primary differential expression contrast" help="Which two groups to compare, written as column:test_group:reference_group (for example, condition:treated:control or genotype:KO:WT). You may omit the column name (treated:control) when comparing groups in the condition column (always condition when using the inline builder). Positive log2FoldChange means higher expression in test_group relative to reference_group. Names are case-sensitive and must match your sample sheet or inline group names exactly.">
             <validator type="regex" message="Use column:test_group:reference_group (for example, condition:treated:control) or test_group:reference_group">^([A-Za-z0-9_]+[:=])?[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$</validator>
         </param>
-        <param argument="--design" type="text" value="~condition" label="Statistical model formula" help="DESeq2 model formula starting with ~ followed by one or more column names from your sample sheet joined with + (for example, ~condition for a simple comparison, ~batch + condition to adjust for sequencing batch, or ~donor + condition for paired samples). Leave as ~condition when using the inline builder. The factor column named in your contrast must appear in this formula (put covariates first and your main group column last).">
+        <param argument="--design" type="text" value="~condition" label="Statistical model formula" help="Additive DESeq2 model formula starting with ~ followed by one or more column names from your sample sheet joined with + (for example, ~condition for a simple comparison, ~batch + condition to adjust for sequencing batch, ~age + condition for a continuous numeric covariate, or ~C(batch) + condition to treat integer batch codes as categorical factors). Interaction operators (* or :) are not supported, combine multi-factor levels into one group column instead. Leave as ~condition when using the inline builder. The factor column named in your contrast must appear in this formula (put covariates first and your main group column last).">
             <sanitizer>
                 <valid initial="default">
                     <add value="~"/>
+                    <add value="("/>
+                    <add value=")"/>
                 </valid>
             </sanitizer>
-            <validator type="regex" message="Formula must start with ~ followed by valid sample sheet column names joined by + (for example, ~condition or ~batch + condition)">^~\s*[A-Za-z0-9_]+(\s*[+*:]\s*[A-Za-z0-9_]+)*$</validator>
+            <validator type="regex" message="Formula must start with ~ followed by additive sample sheet column names joined by + (for example, ~condition, ~batch + condition, or ~C(batch) + condition)">^~\s*(?:C\(\s*[A-Za-z0-9_.-]+\s*\)|[A-Za-z0-9_.-]+)(?:\s*\+\s*(?:C\(\s*[A-Za-z0-9_.-]+\s*\)|[A-Za-z0-9_.-]+))*$</validator>
         </param>
 
         <section name="secondary_reference" title="Additional reference genomes and multi-strain pan-transcriptome (optional)" expanded="false">
             <param argument="--primary-label" type="text" value="primary" label="Primary reference label" help="Short identifier for your primary reference recorded in outputs and the saved state bundle when quantifying across multiple genomes.">
-                <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]+$</validator>
+                <validator type="regex" message="Start with a letter, digit, or underscore and use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_][A-Za-z0-9_.-]*$</validator>
             </param>
             <repeat name="extra_references" title="Additional reference genome" min="0" help="Add one or more extra genomes (other strains, older annotation releases, plasmids, or co-infecting pathogens). ExpressionLoop indexes all genomes together, links orthologous genes automatically, and quantifies strain-specific or accessory genes without double-counting conserved core genes.">
                 <param name="label" type="text" value="" optional="true" label="Assembly label (optional)" help="Short prefix attached to gene IDs from this genome in the ortholog_bridge column (for example, prev or strainB). Leave empty to derive automatically from the accession or position.">
-                    <validator type="regex" message="Use letters, digits, underscores, dots, or hyphens only">^[A-Za-z0-9_.-]*$</validator>
+                    <validator type="regex" message="Start with a letter, digit, or underscore and use letters, digits, underscores, dots, or hyphens only">^([A-Za-z0-9_][A-Za-z0-9_.-]*)?$</validator>
                 </param>
                 <conditional name="extra_source">
                     <param name="source" type="select" label="Additional reference source" help="Fetch a genome and annotation automatically from NCBI, pick a built-in Galaxy genome, or use datasets from your Galaxy History.">
@@ -353,7 +365,7 @@ ${a}	${gname}	${a}
                 <when value="adaptive_30"/>
                 <when value="full"/>
                 <when value="custom">
-                    <param argument="--max-byte-fraction" type="float" min="0.005" max="1.0" value="1.0" label="Maximum fraction of each sequencing file to read" help="Hard cap on how much of each FASTQ or archive is read (0.12 = 12%, 1.0 = 100%)."/>
+                    <param argument="--max-byte-fraction" type="float" min="0.005" max="1.0" value="1.0" label="Maximum fraction of each sequencing file to read" help="Hard cap on total archive bytes read across both adaptive waves and any extra borderline scan (0.12 = 12%, 1.0 = 100%)."/>
                     <param argument="--v-tech-target" type="float" min="0.02" max="0.90" value="0.25" label="Sequencing-noise stopping threshold" help="Stopping target for the median share of technical sequencing noise relative to total biological plus technical variance. Lower values stream more reads."/>
                     <param argument="--delta-lfc-stop" type="float" min="0.005" max="0.50" value="0.05" label="Fold-change stability threshold" help="Maximum allowed median shift in log2 fold change between consecutive waves before stopping."/>
                     <param argument="--min-mapped-per-sample" type="integer" min="0" value="0" label="Minimum mapped reads per sample (0 = automatic)" help="Per-sample mapped read floor required before early stopping is allowed. Leave at 0 to scale automatically with gene count."/>
@@ -407,7 +419,7 @@ ${a}	${gname}	${a}
         </section>
 
         <section name="output_options" title="Additional outputs" expanded="false">
-            <param name="include_transcript_table" type="boolean" checked="false" label="Output transcript-level abundances and isoform proportions (TSV)" help="Also writes per-sample transcript counts, TPM values, and within-gene isoform fractions (PSI)."/>
+            <param name="include_transcript_table" type="boolean" checked="false" label="Output transcript or gene-group abundances (TSV)" help="Writes per-sample transcript counts, TPM values, and within-gene isoform fractions (PSI) in raw-read mode, or gene-group counts and TPM values (without isoform PSI) when streaming pre-assembled Logan unitigs."/>
         </section>
     </inputs>
     <outputs>
@@ -632,7 +644,7 @@ ${a}	${gname}	${a}
 
 **What is saved in the state bundle**
 
-The `.focaloop.tar.zst` archive stores the transcript catalog, per-sample gene and transcript counts, placement uncertainty estimates, sample metadata, a small held-out read slice for independent validation, and a statistical test ledger. Pass this bundle directly to **Focaloop Query** to test additional group comparisons or alternative model formulas in seconds without re-reading any FASTQ files.
+The `.focaloop.tar.zst` archive stores the transcript catalog, per-sample gene and transcript counts, placement uncertainty estimates, sample metadata, an optional held-out read slice when unstreamed archive bytes remain, and an unspent hypothesis ledger. Pass this bundle directly to **Focaloop Query** to test additional group comparisons or alternative model formulas in seconds without re-reading any FASTQ files.
 
 -----
 
@@ -742,7 +754,7 @@ ExpressionLoop fits a DESeq2 negative-binomial model specified with an R-style f
 1. **Differential expression table (`de_results.tsv`):** Gene-level differential expression results sorted by adjusted p-value (`padj`).
 2. **HTML report:** Self-contained visual summary showing aligner benchmark scores, fraction of each file read vs. skipped, wave convergence plots, a volcano plot, and top differentially expressed genes.
 3. **State bundle (`expression_state.focaloop.tar.zst`):** Compact saved state ready for instant follow-up contrasts in **Focaloop Query**.
-4. **Transcript abundances (`transcript_abundances.tsv`, optional):** Enabled under **Additional outputs**. Reports per-sample effective transcript counts, TPM, and within-gene isoform proportion (`isoform_fraction_psi`).
+4. **Transcript abundances (`transcript_abundances.tsv`, optional):** Enabled under **Additional outputs**. Reports per-sample effective transcript counts, TPM, and within-gene isoform proportion (`isoform_fraction_psi`) in raw-read mode, or gene-group counts and TPM (without isoform proportions) in Logan unitig mode.
 
 Key columns in `de_results.tsv`:
 

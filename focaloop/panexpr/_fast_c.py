@@ -240,29 +240,49 @@ static inline uint64_t hash_packed_ec(const uint32_t *arr, uint32_t len) {
     return h;
 }
 
+static inline uint32_t read_u_le(const uint8_t *p, int32_t w) {
+    if (w == 1) return (uint32_t)p[0];
+    if (w == 2) { uint16_t v = 0; memcpy(&v, p, 2); return (uint32_t)v; }
+    if (w == 4) { uint32_t v = 0; memcpy(&v, p, 4); return v; }
+    if (w == 8) { uint64_t v = 0; memcpy(&v, p, 8); return (uint32_t)v; }
+    return 0U;
+}
+
 RadAggOut *panexpr_rad_aggregate(
     const char *rad_path,
     int64_t body_offset,
+    int64_t expected_chunks,
     int32_t rw,
     int32_t ori_off,
     int32_t astride,
+    int32_t fmt_read_off,
+    int32_t fmt_read_width,
+    int32_t fmt_aln_off,
+    int32_t fmt_aln_width,
     int32_t nref,
     int32_t sentinel_idx,
     const int32_t *ref_rank,
-    double *out_uniq
+    double *out_uniq,
+    int32_t *out_err
 ) {
+    if (out_err) *out_err = 0;
+    if (rw < 0 || ori_off < 0 || astride < 4 || ori_off + 4 > astride || nref < 0) {
+        if (out_err) *out_err = 2;
+        return NULL;
+    }
     FILE *fp = fopen(rad_path, "rb");
-    if (!fp) return NULL;
-    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    if (!fp) { if (out_err) *out_err = 1; return NULL; }
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); if (out_err) *out_err = 1; return NULL; }
     long fsz = ftell(fp);
-    if (fsz < body_offset) { fclose(fp); return NULL; }
+    if (fsz < body_offset) { fclose(fp); if (out_err) *out_err = 2; return NULL; }
     size_t body_len = (size_t)(fsz - body_offset);
-    if (fseek(fp, (long)body_offset, SEEK_SET) != 0) { fclose(fp); return NULL; }
+    if (fseek(fp, (long)body_offset, SEEK_SET) != 0) { fclose(fp); if (out_err) *out_err = 1; return NULL; }
     uint8_t *buf = (uint8_t *)malloc(body_len > 0 ? body_len : 1);
-    if (!buf) { fclose(fp); return NULL; }
+    if (!buf) { fclose(fp); if (out_err) *out_err = 1; return NULL; }
     if (body_len > 0 && fread(buf, 1, body_len, fp) != body_len) {
         free(buf);
         fclose(fp);
+        if (out_err) *out_err = 2;
         return NULL;
     }
     fclose(fp);
@@ -288,6 +308,7 @@ RadAggOut *panexpr_rad_aggregate(
     if (!ec_starts || !ec_lens || !ec_counts || !ec_hashes || !flat_packed || !ht || !keys || !uniq_p) {
         free(buf); free(ec_starts); free(ec_lens); free(ec_counts); free(ec_hashes);
         free(flat_packed); free(ht); free(keys); free(uniq_p);
+        if (out_err) *out_err = 1;
         return NULL;
     }
     memset(ht, 0xFF, ht_cap * sizeof(int32_t)); /* -1 empty */
@@ -295,28 +316,41 @@ RadAggOut *panexpr_rad_aggregate(
     int64_t n_mapped = 0;
     int64_t n_eq = 0;
     int64_t total_l = 0;
+    int64_t chunks_seen = 0;
+    int corrupt = 0;
+    int oom = 0;
 
     size_t o = 0;
-    while (o + 8 <= body_len) {
+    while (o < body_len) {
+        if (o + 8 > body_len) { corrupt = 1; break; }
         uint32_t nbytes = 0, nrec = 0;
         memcpy(&nbytes, buf + o, 4);
         memcpy(&nrec, buf + o + 4, 4);
-        if (nbytes < 8 || o + (size_t)nbytes > body_len) break;
+        if (nbytes < 8 || o + (size_t)nbytes > body_len) { corrupt = 1; break; }
         size_t chunk_end = o + (size_t)nbytes;
         o += 8;
 
         for (uint32_t rec_i = 0; rec_i < nrec; ++rec_i) {
-            if (o + 4 + (size_t)rw > chunk_end) break;
+            if (o + 4 + (size_t)rw > chunk_end) { corrupt = 1; break; }
             uint32_t na = 0;
             memcpy(&na, buf + o, 4);
+            uint32_t fmt_rec = 0U;
+            if (fmt_read_off >= 0 && fmt_read_width > 0 && (size_t)(fmt_read_off + fmt_read_width) <= (size_t)rw) {
+                fmt_rec = read_u_le(buf + o + 4 + (size_t)fmt_read_off, fmt_read_width);
+            }
             o += 4 + (size_t)rw;
-            if (o + (size_t)na * (size_t)astride > chunk_end) break;
+            if ((size_t)na > (chunk_end - o) / (size_t)astride) { corrupt = 1; break; }
 
             if ((size_t)na > keys_cap) {
                 while (keys_cap < (size_t)na) keys_cap *= 2;
                 uint64_t *nk = (uint64_t *)realloc(keys, keys_cap * sizeof(uint64_t));
                 uint32_t *nu = (uint32_t *)realloc(uniq_p, keys_cap * sizeof(uint32_t));
-                if (!nk || !nu) { o = chunk_end; break; }
+                if (!nk || !nu) {
+                    if (nk) keys = nk;
+                    if (nu) uniq_p = nu;
+                    oom = 1;
+                    break;
+                }
                 keys = nk; uniq_p = nu;
             }
 
@@ -324,11 +358,15 @@ RadAggOut *panexpr_rad_aggregate(
             for (uint32_t a = 0; a < na; ++a) {
                 uint32_t v = 0;
                 memcpy(&v, buf + o + (size_t)ori_off, 4);
+                uint32_t fmt = fmt_rec;
+                if (fmt_aln_off >= 0 && fmt_aln_width > 0 && (size_t)(fmt_aln_off + fmt_aln_width) <= (size_t)astride) {
+                    fmt = read_u_le(buf + o + (size_t)fmt_aln_off, fmt_aln_width);
+                }
                 o += (size_t)astride;
                 uint32_t r = v & 0x3FFFFFFFU;
                 uint32_t ori = v >> 30;
                 if (r >= (uint32_t)nref || (int32_t)r == sentinel_idx) continue;
-                uint32_t fl = (ori != 2U) ? 1U : 0U;
+                uint32_t fl = (fmt == 3U) ? ((ori == 2U) ? 1U : 0U) : ((ori != 2U) ? 1U : 0U);
                 uint64_t rk = (uint64_t)(uint32_t)ref_rank[r];
                 keys[m++] = (rk << 33) | ((uint64_t)fl << 32) | ((uint64_t)r << 1) | (uint64_t)fl;
             }
@@ -384,14 +422,25 @@ RadAggOut *panexpr_rad_aggregate(
 
             if ((size_t)n_eq == ec_cap) {
                 ec_cap *= 2;
-                ec_starts = (int64_t *)realloc(ec_starts, ec_cap * sizeof(int64_t));
-                ec_lens = (int32_t *)realloc(ec_lens, ec_cap * sizeof(int32_t));
-                ec_counts = (int32_t *)realloc(ec_counts, ec_cap * sizeof(int32_t));
-                ec_hashes = (uint64_t *)realloc(ec_hashes, ec_cap * sizeof(uint64_t));
+                int64_t *ns = (int64_t *)realloc(ec_starts, ec_cap * sizeof(int64_t));
+                int32_t *nl = (int32_t *)realloc(ec_lens, ec_cap * sizeof(int32_t));
+                int32_t *nc = (int32_t *)realloc(ec_counts, ec_cap * sizeof(int32_t));
+                uint64_t *nh = (uint64_t *)realloc(ec_hashes, ec_cap * sizeof(uint64_t));
+                if (!ns || !nl || !nc || !nh) {
+                    if (ns) ec_starts = ns;
+                    if (nl) ec_lens = nl;
+                    if (nc) ec_counts = nc;
+                    if (nh) ec_hashes = nh;
+                    oom = 1;
+                    break;
+                }
+                ec_starts = ns; ec_lens = nl; ec_counts = nc; ec_hashes = nh;
             }
             if ((size_t)(total_l + u) > flat_cap) {
                 while (flat_cap < (size_t)(total_l + u)) flat_cap *= 2;
-                flat_packed = (uint32_t *)realloc(flat_packed, flat_cap * sizeof(uint32_t));
+                uint32_t *nf = (uint32_t *)realloc(flat_packed, flat_cap * sizeof(uint32_t));
+                if (!nf) { oom = 1; break; }
+                flat_packed = nf;
             }
             int32_t new_id = (int32_t)n_eq++;
             ec_starts[new_id] = total_l;
@@ -405,6 +454,7 @@ RadAggOut *panexpr_rad_aggregate(
             if ((size_t)n_eq * 10 >= ht_cap * 7) {
                 ht_cap *= 2;
                 int32_t *nht = (int32_t *)malloc(ht_cap * sizeof(int32_t));
+                if (!nht) { oom = 1; break; }
                 memset(nht, 0xFF, ht_cap * sizeof(int32_t));
                 size_t nmask = ht_cap - 1;
                 for (int64_t e = 0; e < n_eq; ++e) {
@@ -416,7 +466,13 @@ RadAggOut *panexpr_rad_aggregate(
                 ht = nht;
             }
         }
-        o = chunk_end;
+        if (corrupt || oom) break;
+        if (o != chunk_end) { corrupt = 1; break; }
+        chunks_seen += 1;
+    }
+
+    if (!corrupt && !oom && expected_chunks > 0 && chunks_seen != expected_chunks) {
+        corrupt = 1;
     }
 
     free(buf);
@@ -424,6 +480,12 @@ RadAggOut *panexpr_rad_aggregate(
     free(ht);
     free(keys);
     free(uniq_p);
+
+    if (corrupt || oom) {
+        free(ec_starts); free(ec_lens); free(ec_counts); free(flat_packed);
+        if (out_err) *out_err = corrupt ? 2 : 1;
+        return NULL;
+    }
 
     RadAggOut *res = (RadAggOut *)malloc(sizeof(RadAggOut));
     if (!res) {
@@ -756,6 +818,7 @@ int64_t panexpr_sieve_filter_batch(
     } else {
         pthread_t tids[64];
         SieveTask tasks[64];
+        int spawned[64];
         int64_t chunk = (n_reads + n_threads - 1) / n_threads;
         int actual = 0;
         for (int w = 0; w < n_threads; ++w) {
@@ -764,11 +827,18 @@ int64_t panexpr_sieve_filter_batch(
             if (s >= n_reads) break;
             if (e > n_reads) e = n_reads;
             tasks[actual] = (SieveTask){ctx, lut, seq1, off1, seq2, off2, s, e, min_hits, out_keep};
-            pthread_create(&tids[actual], NULL, sieve_worker, &tasks[actual]);
+            if (pthread_create(&tids[actual], NULL, sieve_worker, &tasks[actual]) == 0) {
+                spawned[actual] = 1;
+            } else {
+                spawned[actual] = 0;
+                sieve_worker(&tasks[actual]);
+            }
             actual += 1;
         }
         for (int w = 0; w < actual; ++w) {
-            pthread_join(tids[w], NULL);
+            if (spawned[w]) {
+                pthread_join(tids[w], NULL);
+            }
         }
     }
     int64_t kept = 0;
@@ -793,7 +863,7 @@ int64_t panexpr_bait_filter(
     SieveCtx *ctx = panexpr_sieve_from_kmers(bait, n_bait, k, 0);
     if (!ctx) return -1;
     int64_t *offs = (int64_t *)malloc((size_t)(max_keep + 1) * sizeof(int64_t));
-    uint8_t *mask = (uint8_t *)malloc((size_t)max_keep);
+    uint8_t *mask = (uint8_t *)calloc((size_t)max_keep, sizeof(uint8_t));
     if (!offs || !mask) {
         free(offs); free(mask); panexpr_sieve_free(ctx);
         return -1;
@@ -981,6 +1051,7 @@ int64_t panexpr_clip_adapters(
     } else {
         pthread_t tids[64];
         ClipTask tasks[64];
+        int spawned[64];
         int64_t chunk = (n_reads + n_threads - 1) / n_threads;
         int actual = 0;
         for (int w = 0; w < n_threads; ++w) {
@@ -989,11 +1060,18 @@ int64_t panexpr_clip_adapters(
             if (s >= n_reads) break;
             if (e > n_reads) e = n_reads;
             tasks[actual] = (ClipTask){lut, seq1, off1, seq2, off2, s, e, min_len, out_cut1, out_cut2};
-            pthread_create(&tids[actual], NULL, clip_worker, &tasks[actual]);
+            if (pthread_create(&tids[actual], NULL, clip_worker, &tasks[actual]) == 0) {
+                spawned[actual] = 1;
+            } else {
+                spawned[actual] = 0;
+                clip_worker(&tasks[actual]);
+            }
             actual += 1;
         }
         for (int w = 0; w < actual; ++w) {
-            pthread_join(tids[w], NULL);
+            if (spawned[w]) {
+                pthread_join(tids[w], NULL);
+            }
         }
     }
 
@@ -1048,46 +1126,50 @@ def get_fast_lib() -> ctypes.CDLL | None:
     with _LOCK:
         if _TRIED:
             return _LIB
-        _TRIED = True
+        from ._medvedev_compile import (
+            ensure_user_native_cache_dir,
+            prebuilt_native_dirs,
+            verify_native_artifact,
+        )
+
         digest = hashlib.sha256(_C_SOURCE.encode("utf-8")).hexdigest()[:16]
         ext = ".dylib" if sys.platform == "darwin" else ".so"
         fname = f"panexpr_fast_{digest}{ext}"
-        for pre_dir in (
-            os.environ.get("FOCALOOP_NATIVE_CACHE"),
-            str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
-            "/opt/focaloop/native_cache",
-        ):
-            if pre_dir:
-                cand = Path(pre_dir) / fname
-                if cand.exists():
-                    try:
-                        lib = ctypes.CDLL(str(cand))
-                        _bind_signatures(lib)
-                        _LIB = lib
-                        return _LIB
-                    except Exception:
-                        pass
-        build_dir_env = os.environ.get("FOCALOOP_BUILD_NATIVE_DIR")
-        env_cache = os.environ.get("PANEXPR_C_CACHE") or os.environ.get("PANEXPR_C_CACHE_DIR")
-        cache_dir = (
-            Path(build_dir_env)
-            if build_dir_env
-            else (Path(env_cache) if env_cache else (Path(tempfile.gettempdir()) / f"panexpr_c_v24_{os.getuid()}"))
-        )
+        for pre_dir in prebuilt_native_dirs():
+            cand = pre_dir / fname
+            if verify_native_artifact(cand, require_current_uid=False):
+                try:
+                    lib = ctypes.CDLL(str(cand))
+                    _bind_signatures(lib)
+                    _LIB = lib
+                    _TRIED = True
+                    return _LIB
+                except Exception:
+                    pass
         try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_dir, is_build_dir = ensure_user_native_cache_dir(
+                explicit_build_dir=os.environ.get("FOCALOOP_BUILD_NATIVE_DIR"),
+                explicit_cache_root=os.environ.get("PANEXPR_C_CACHE") or os.environ.get("PANEXPR_C_CACHE_DIR"),
+                subdir_stem="panexpr_c_v24",
+            )
             so_path = cache_dir / fname
+            if so_path.exists() and not verify_native_artifact(so_path, require_current_uid=True):
+                _TRIED = True
+                _LIB = None
+                return None
             if not so_path.exists():
                 cc = _find_compiler()
                 if not cc:
+                    _TRIED = True
                     return None
                 pid = os.getpid()
-                src_path = cache_dir / f"panexpr_fast_{digest}_{pid}.c"
-                tmp_so = cache_dir / f"panexpr_fast_{digest}_{pid}{ext}"
+                tid = threading.get_ident()
+                src_path = cache_dir / f".panexpr_fast_{digest}_{pid}_{tid}.c"
+                tmp_so = cache_dir / f".panexpr_fast_{digest}_{pid}_{tid}{ext}"
                 src_path.write_text(_C_SOURCE)
                 isa_flags: list[str] = []
                 arch = platform.machine().lower()
-                if os.environ.get("FOCALOOP_PORTABLE_ISA") == "1" and sys.platform != "darwin" and arch in ("x86_64", "amd64"):
+                if os.environ.get("FOCALOOP_PORTABLE_ISA", "1") != "0" and sys.platform != "darwin" and arch in ("x86_64", "amd64"):
                     isa_flags = ["-msse4.2", "-mpopcnt"]
                 try:
                     subprocess.run(
@@ -1097,15 +1179,21 @@ def get_fast_lib() -> ctypes.CDLL | None:
                         stderr=subprocess.DEVNULL,
                         timeout=30,
                     )
+                    os.chmod(tmp_so, 0o755 if is_build_dir else 0o700)
                     os.replace(tmp_so, so_path)
                 finally:
                     src_path.unlink(missing_ok=True)
                     tmp_so.unlink(missing_ok=True)
+            if not verify_native_artifact(so_path, require_current_uid=True):
+                _TRIED = True
+                _LIB = None
+                return None
             lib = ctypes.CDLL(str(so_path))
             _bind_signatures(lib)
             _LIB = lib
         except Exception:
             _LIB = None
+        _TRIED = True
         return _LIB
 
 
@@ -1129,7 +1217,9 @@ def _bind_signatures(lib: ctypes.CDLL) -> None:
     lib.panexpr_em_sparse.restype = c_i32
 
     lib.panexpr_rad_aggregate.argtypes = [
-        ctypes.c_char_p, c_i64, c_i32, c_i32, c_i32, c_i32, c_i32, p_i32, p_dbl,
+        ctypes.c_char_p, c_i64, c_i64, c_i32, c_i32, c_i32,
+        c_i32, c_i32, c_i32, c_i32,
+        c_i32, c_i32, p_i32, p_dbl, p_i32,
     ]
     lib.panexpr_rad_aggregate.restype = ctypes.POINTER(_RadAggOutStruct)
 
@@ -1228,77 +1318,120 @@ def c_em_sparse(
     return out_eff, out_var, out_ws, out_gvar[:n_g]
 
 
-def parse_rad_header(path: str | Path) -> tuple[list[str], int, int, int, int]:
-    """Read only the header of a piscem map-bulk .rad file -> (names, body_offset, rw, ori_off, astride)."""
+def parse_rad_header(path: str | Path) -> tuple[list[str], int, int, int, int, int, int, int, int, int]:
+    """Read only the header of a piscem map-bulk .rad file."""
     import struct
 
+    file_sz = Path(path).stat().st_size
+    if file_sz < 24:
+        raise RuntimeError(f"Truncated or corrupt piscem RAD file {path} ({file_sz} bytes)")
     with open(path, "rb") as fh:
         buf = fh.read(16 << 20)
         o = 0
-        if buf[:8] == b"RAD_FILE":
-            o = 14
-        _is_paired = buf[o]
-        o += 1
-        (nref,) = struct.unpack_from("<Q", buf, o)
-        o += 8
-        if len(buf) < o + nref * 48:
-            buf += fh.read()
-        names: list[str] = []
-        unpack_h = struct.unpack_from
-        for _ in range(nref):
-            if o + 2 > len(buf):
+        try:
+            if buf[:8] == b"RAD_FILE":
+                o = 14
+            if o + 9 > len(buf):
+                raise RuntimeError(f"Truncated RAD header in {path}")
+            _is_paired = buf[o]
+            o += 1
+            (nref,) = struct.unpack_from("<Q", buf, o)
+            o += 8
+            if len(buf) < o + nref * 48:
                 buf += fh.read()
-            (L,) = unpack_h("<H", buf, o)
-            o += 2
-            if o + L > len(buf):
-                buf += fh.read()
-            names.append(buf[o:o + L].decode("ascii"))
-            o += L
-        if o + 64 > len(buf):
-            buf += fh.read()
-        (_nchunks,) = unpack_h("<Q", buf, o)
-        o += 8
-        width = {1: 1, 2: 2, 3: 4, 4: 8, 5: 4, 6: 8}
-
-        def read_descs():
-            nonlocal o, buf
-            (cnt,) = unpack_h("<H", buf, o)
-            o += 2
-            out = []
-            for _ in range(cnt):
+            names: list[str] = []
+            unpack_h = struct.unpack_from
+            for _ in range(nref):
+                if o + 2 > len(buf):
+                    buf += fh.read()
+                if o + 2 > len(buf):
+                    raise RuntimeError(f"Truncated RAD reference table in {path}")
                 (L,) = unpack_h("<H", buf, o)
                 o += 2
-                nm = buf[o:o + L].decode("ascii")
+                if o + L > len(buf):
+                    buf += fh.read()
+                if o + L > len(buf):
+                    raise RuntimeError(f"Truncated RAD reference name in {path}")
+                names.append(buf[o:o + L].decode("ascii"))
                 o += L
-                ty = buf[o]
-                o += 1
-                sub = None
-                if ty == 7:
-                    sub = (buf[o], buf[o + 1])
-                    o += 2
-                o += 2
-                out.append((nm, ty, sub))
-            return out
+            if o + 64 > len(buf):
+                buf += fh.read()
+            if o + 8 > len(buf):
+                raise RuntimeError(f"Truncated RAD chunk header in {path}")
+            (nchunks,) = unpack_h("<Q", buf, o)
+            o += 8
+            width = {1: 1, 2: 2, 3: 4, 4: 8, 5: 4, 6: 8}
 
-        file_tags = read_descs()
-        read_tags = read_descs()
-        aln_tags = read_descs()
-        for _nm, ty, sub in file_tags:
-            if ty == 8:
-                (L,) = unpack_h("<H", buf, o)
-                o += 2 + L
-            elif ty == 7:
-                lw, ew = width[sub[0]], width[sub[1]]
-                n = int.from_bytes(buf[o:o + lw], "little")
-                o += lw + n * ew
-            else:
-                o += width[ty]
-        rw = sum(width[t] for _, t, _ in read_tags)
-        aw = [width[t] for _, t, _ in aln_tags]
-        ori_i = next(i for i, (nm, _, _) in enumerate(aln_tags) if nm.startswith("compressed_ori_ref"))
-        ori_off = sum(aw[:ori_i])
-        astride = sum(aw)
-        return names, o, rw, ori_off, astride
+            def read_descs():
+                nonlocal o, buf
+                if o + 2 > len(buf):
+                    buf += fh.read()
+                if o + 2 > len(buf):
+                    raise RuntimeError(f"Truncated RAD tag descriptor table in {path}")
+                (cnt,) = unpack_h("<H", buf, o)
+                o += 2
+                out = []
+                for _ in range(cnt):
+                    if o + 2 > len(buf):
+                        buf += fh.read()
+                    (L,) = unpack_h("<H", buf, o)
+                    o += 2
+                    if o + L + 3 > len(buf):
+                        buf += fh.read()
+                    if o + L + 3 > len(buf):
+                        raise RuntimeError(f"Truncated RAD tag descriptor in {path}")
+                    nm = buf[o:o + L].decode("ascii")
+                    o += L
+                    ty = buf[o]
+                    o += 1
+                    sub = None
+                    if ty == 7:
+                        if o + 4 > len(buf):
+                            buf += fh.read()
+                        sub = (buf[o], buf[o + 1])
+                        o += 2
+                    o += 2
+                    out.append((nm, ty, sub))
+                return out
+
+            file_tags = read_descs()
+            read_tags = read_descs()
+            aln_tags = read_descs()
+            for _nm, ty, sub in file_tags:
+                if ty == 8:
+                    (L,) = unpack_h("<H", buf, o)
+                    o += 2 + L
+                elif ty == 7:
+                    lw, ew = width[sub[0]], width[sub[1]]
+                    n = int.from_bytes(buf[o:o + lw], "little")
+                    o += lw + n * ew
+                else:
+                    o += width[ty]
+            if o > file_sz:
+                raise RuntimeError(f"Truncated RAD file-level tags in {path}")
+            rwidths = [width[t] for _, t, _ in read_tags]
+            rw = sum(rwidths)
+            fmt_read_off = -1
+            fmt_read_width = 0
+            for idx_rt, (nm, ty, _) in enumerate(read_tags):
+                if nm == "frag_map_type" and ty in (1, 2, 3, 4):
+                    fmt_read_off = sum(rwidths[:idx_rt])
+                    fmt_read_width = width[ty]
+                    break
+            aw = [width[t] for _, t, _ in aln_tags]
+            ori_i = next(i for i, (nm, _, _) in enumerate(aln_tags) if nm.startswith("compressed_ori_ref"))
+            ori_off = sum(aw[:ori_i])
+            fmt_aln_off = -1
+            fmt_aln_width = 0
+            for idx_at, (nm, ty, _) in enumerate(aln_tags):
+                if nm == "frag_map_type" and ty in (1, 2, 3, 4):
+                    fmt_aln_off = sum(aw[:idx_at])
+                    fmt_aln_width = width[ty]
+                    break
+            astride = sum(aw)
+            return names, o, int(nchunks), rw, ori_off, astride, fmt_read_off, fmt_read_width, fmt_aln_off, fmt_aln_width
+        except (struct.error, KeyError, StopIteration, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"Corrupt or truncated piscem RAD header in {path}: {exc}") from exc
 
 
 def c_rad_aggregate(
@@ -1310,7 +1443,18 @@ def c_rad_aggregate(
     lib = get_fast_lib()
     if lib is None:
         return None
-    names, body_offset, rw, ori_off, astride = parse_rad_header(rad_path)
+    (
+        names,
+        body_offset,
+        nchunks,
+        rw,
+        ori_off,
+        astride,
+        fmt_read_off,
+        fmt_read_width,
+        fmt_aln_off,
+        fmt_aln_width,
+    ) = parse_rad_header(rad_path)
     nref = len(names)
     if nref == 0:
         return 0, {}, {}
@@ -1334,17 +1478,26 @@ def c_rad_aggregate(
             cached_meta.update(nref=nref, first=names[0], last=names[-1], ref_rank=ref_rank, sentinel_idx=sentinel_idx)
 
     out_uniq = np.zeros(nref * 2, dtype=np.float64)
+    out_err = ctypes.c_int32(0)
     ptr = lib.panexpr_rad_aggregate(
         str(rad_path).encode("utf-8"),
         int(body_offset),
+        int(nchunks),
         int(rw),
         int(ori_off),
         int(astride),
+        int(fmt_read_off),
+        int(fmt_read_width),
+        int(fmt_aln_off),
+        int(fmt_aln_width),
         int(nref),
         int(sentinel_idx),
         ref_rank.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         out_uniq.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        ctypes.byref(out_err),
     )
+    if out_err.value == 2:
+        raise RuntimeError(f"Corrupt or truncated piscem RAD file {rad_path}")
     if not ptr:
         return None
     try:
@@ -1475,7 +1628,7 @@ class FastCSieve:
             b2 = o2 = None
             p_b2 = ctypes.POINTER(ctypes.c_uint8)()
             p_o2 = ctypes.POINTER(ctypes.c_int64)()
-        out_mask = np.empty(n, dtype=np.uint8)
+        out_mask = np.zeros(n, dtype=np.uint8)
         self._lib.panexpr_sieve_filter_batch(
             ctypes.c_void_p(self._handle),
             b1.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
@@ -1620,10 +1773,10 @@ def clip_adapters_batch(
     lib = get_fast_lib()
     if lib is not None:
         b1, o1 = _pack_reads_with_offsets(r1[:n])
-        cut1 = np.empty(n, dtype=np.int32)
+        cut1 = np.diff(o1).astype(np.int32) - 1
         if r2 is not None:
             b2, o2 = _pack_reads_with_offsets(r2[:n])
-            cut2 = np.empty(n, dtype=np.int32)
+            cut2 = np.diff(o2).astype(np.int32) - 1
             p_b2 = b2.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
             p_o2 = o2.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
             p_c2 = cut2.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))

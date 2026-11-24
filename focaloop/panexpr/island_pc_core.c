@@ -943,6 +943,12 @@ typedef struct {
     double kr_hat;
     int high_divergence_merged_islands;
     int used_high_div_fallback;
+    uint64_t n_anchored_reads;
+    uint64_t n_unanchored_reads;
+    uint64_t anchored_kmer_windows;
+    uint64_t anchored_ocean_kmers;
+    uint64_t anchored_novel_kmers;
+    double unanchored_read_fraction;
 } probe_result_t;
 
 #define BATCH_READS 16
@@ -989,6 +995,7 @@ int ipc_classify_reads(
     int batch_win_count[BATCH_READS];
     int batch_read_len[BATCH_READS];
     int32_t batch_read_off[BATCH_READS];
+    int batch_is_first_chunk[BATCH_READS];
 
     uint64_t shash_buf[512];
 
@@ -1049,6 +1056,7 @@ int ipc_classify_reads(
             int has_invalid = 0;
 
             int w_base = total_batch_wins;
+            batch_is_first_chunk[n_in_batch] = is_first_chunk;
 
             if (!q_ptr) {
                 for (int i = 0; i < IPC_S - 1; i++) {
@@ -1244,6 +1252,10 @@ int ipc_classify_reads(
             const char *s_ptr = seqs + batch_read_off[bi];
 
             int anchored = 0;
+            int chunk_has_anchor = 0;
+            uint64_t chunk_kmer_win = 0;
+            uint64_t chunk_ocean_km = 0;
+            uint64_t chunk_novel_km = 0;
             uint16_t anc_ctg = 0;
             int64_t anc_pos = 0;
             int anc_strand = 1;
@@ -1335,20 +1347,34 @@ int ipc_classify_reads(
                     }
                 }
 
+                if (hv != 0) {
+                    chunk_has_anchor = 1;
+                }
                 batch_hval[w] = hv;
                 uint8_t qf = batch_qok[w];
                 if (qf & 1) {
                     out->total_kmer_windows++;
+                    chunk_kmer_win++;
                     if (hv != 0) {
                         out->total_ocean_kmers++;
+                        chunk_ocean_km++;
                         if (VAL_UNIQUE(hv)) out->unique_ocean_kmers++;
                     } else {
                         out->total_novel_kmers++;
+                        chunk_novel_km++;
                         if (qf & 2) {
                             out->syncmer_probe_novel++;
                         }
                     }
                 }
+            }
+            if (chunk_has_anchor) {
+                if (batch_is_first_chunk[bi]) out->n_anchored_reads++;
+                out->anchored_kmer_windows += chunk_kmer_win;
+                out->anchored_ocean_kmers += chunk_ocean_km;
+                out->anchored_novel_kmers += chunk_novel_km;
+            } else if (batch_is_first_chunk[bi]) {
+                out->n_unanchored_reads++;
             }
         }
 
@@ -1494,6 +1520,10 @@ int ipc_classify_reads(
     out->ocean_fraction = (out->total_kmer_windows > 0)
         ? ((double)out->total_ocean_kmers / (double)out->total_kmer_windows)
         : 0.0;
+    uint64_t tot_anc_unanc = out->n_anchored_reads + out->n_unanchored_reads;
+    out->unanchored_read_fraction = (tot_anc_unanc > 0)
+        ? ((double)out->n_unanchored_reads / (double)tot_anc_unanc)
+        : 0.0;
 
     double eps_base_admitted = (total_admitted_interior_s_bases > 0)
         ? (sum_interior_base_err / (double)total_admitted_interior_s_bases)
@@ -1526,8 +1556,13 @@ int ipc_classify_reads(
         ? (sync_ci.ci_high_overlap - eps_sync_per_base) : 0.0;
 
     double d1_for_dense = idx->dense_d1_computed ? idx->d1_dense_bar : idx->d1_sync_bar;
+    // Estimate on-target --pc divergence from anchored reads (>=1 matching k-mer) when available so
+    // off-target/unannotated plasmid/rRNA/spike-in reads do not masquerade as high genomic divergence (L78).
+    int use_anchored_dense = (out->anchored_kmer_windows >= 20 && out->ocean_fraction >= 0.10);
+    uint64_t dense_novel = use_anchored_dense ? out->anchored_novel_kmers : out->total_novel_kmers;
+    uint64_t dense_wins = use_anchored_dense ? out->anchored_kmer_windows : out->total_kmer_windows;
     out->r_pc_dense_raw = ipc_solve_pc_divergence(
-        out->total_novel_kmers, out->total_kmer_windows, IPC_K, d1_for_dense, NULL
+        dense_novel, dense_wins, IPC_K, d1_for_dense, NULL
     );
     out->r_pc_dense_bio = (out->r_pc_dense_raw > eps_sync_per_base)
         ? (out->r_pc_dense_raw - eps_sync_per_base) : 0.0;
@@ -1550,23 +1585,32 @@ int ipc_classify_reads(
     if (mean_del_len < 1.0) mean_del_len = 1.0;
     if (mean_ins_len < 1.0) mean_ins_len = 1.0;
 
+    double anchor_read_frac = (tot_anc_unanc > 0 && out->n_anchored_reads > 0)
+        ? ((double)out->n_anchored_reads / (double)tot_anc_unanc)
+        : 1.0;
     int mean_L = (n_valid_reads > 0) ? (int)(sum_read_len / (int64_t)n_valid_reads) : 150;
-    double B_s_uniq = (double)total_admitted_interior_s_bases * frac_uniq;
-    double B_d_uniq = (double)total_raw_interior_d_juncs * q_admit_frac * frac_uniq;
+    double B_s_uniq = (double)total_admitted_interior_s_bases * anchor_read_frac * frac_uniq;
+    double B_d_uniq = (double)total_raw_interior_d_juncs * anchor_read_frac * q_admit_frac * frac_uniq;
     double ins_trim = (mean_ins_len > 1.0) ? (mean_ins_len - 1.0) : 0.0;
     double B_i_per_read = (double)(mean_L - 2 * IPC_K + 1) - ins_trim;
     if (B_i_per_read < 1.0) B_i_per_read = 1.0;
-    double B_i_uniq = (double)n_valid_reads * B_i_per_read * q_admit_frac * frac_uniq;
+    double B_i_uniq = (double)n_valid_reads * anchor_read_frac * B_i_per_read * q_admit_frac * frac_uniq;
 
     uint64_t total_iso_uniq = out->c_sub_iso + out->c_del_iso + out->c_ins_iso;
     double merged_frac = ((total_iso_uniq + out->c_merged_uniq) > 0)
         ? ((double)out->c_merged_uniq / (double)(total_iso_uniq + out->c_merged_uniq))
         : 0.0;
 
-    double r_ref_raw = (out->total_kmer_windows > 0) ? out->r_pc_dense_raw : out->r_pc_syncmer_raw;
+    double r_ref_raw = (dense_wins > 0) ? out->r_pc_dense_raw : out->r_pc_syncmer_raw;
     double kr_probe = (double)IPC_K * r_ref_raw;
+    double anchored_ocean_frac = (out->anchored_kmer_windows > 0)
+        ? ((double)out->anchored_ocean_kmers / (double)out->anchored_kmer_windows)
+        : out->ocean_fraction;
+    int low_ocean_div = use_anchored_dense
+        ? (anchored_ocean_frac < 0.50 && out->anchored_kmer_windows >= 100)
+        : (out->ocean_fraction < 0.50 && out->total_kmer_windows >= 100);
 
-    int high_div = (kr_probe > 0.35) || (out->ocean_fraction < 0.50 && out->total_kmer_windows >= 100) || (merged_frac > 0.45 && out->c_merged_uniq >= 10);
+    int high_div = (kr_probe > 0.35) || low_ocean_div || (out->ocean_fraction < 0.10 && out->total_kmer_windows >= 100) || (merged_frac > 0.45 && out->c_merged_uniq >= 10);
     out->high_divergence_merged_islands = high_div ? 1 : 0;
 
     if (B_s_uniq >= 50.0) {
@@ -1607,7 +1651,7 @@ int ipc_classify_reads(
             out->used_high_div_fallback = 1;
 
             double b_eff_per_read = feller_effective_interior_sites(mean_L, IPC_K, r_ref_raw, 1);
-            double B_eff_junc = (double)n_valid_reads * b_eff_per_read * q_admit_frac * frac_uniq;
+            double B_eff_junc = (double)n_valid_reads * anchor_read_frac * b_eff_per_read * q_admit_frac * frac_uniq;
             if (B_eff_junc < 1.0) B_eff_junc = 1.0;
 
             double tot_del_events = (double)out->c_del_iso + ((double)out->sum_merged_pos_delta / mean_del_len);
