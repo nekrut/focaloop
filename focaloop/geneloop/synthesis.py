@@ -87,6 +87,8 @@ class SynthParams:
     emit_structural_ncrna: bool = True
     enable_rna_orf_repaired: bool = True
     enable_rna_orf_bridged: bool = True
+    threads: int = 8
+    strict_retrocopy_scan: bool = True
 
 
 _LOWER_ASCII = b"abcdefghijklmnopqrstuvwxyz"
@@ -161,6 +163,7 @@ class Cand:
     feats: dict = field(default_factory=dict)
     microexons: int = 0
     micro_parent: dict = field(default_factory=dict)  # flanking intron -> spanning intron it was split from
+    cds_phase: int = 0
 
     @property
     def start(self) -> int:
@@ -196,6 +199,8 @@ def _add(cands: dict, c: Cand) -> Cand:
             old.exons, old.tx_cov = c.exons, c.tx_cov
         if c.hit is not None and (old.hit is None or c.hit.quality > old.hit.quality):
             old.hit = c.hit
+        if old.cds_phase == 0 and c.cds_phase != 0 and "tiberius" in c.sources and len(old.sources) == 1:
+            old.cds_phase = c.cds_phase
         if "tiberius" in c.sources:
             if not c.feats.get("tiberius_backfill", False):
                 old.feats["tiberius_non_backfill"] = True
@@ -548,6 +553,67 @@ def _generate_orphan_rna_candidates(
             _emit_chain(cur_ex, cur_n, cur_used_junc, first_g_lo, last_g_hi, cur_cov)
 
 
+def _validate_or_repair_tiberius_cds(
+    genome: Genome,
+    t: Transcript,
+) -> tuple[tuple[tuple[int, int], ...], int, bool] | None:
+    """Validate or edge-trim a Tiberius CDS model; returns ``(cds_tuple, cds_phase, partial_edge)`` or ``None``."""
+    from .sequtil import _cds_introns_canonical
+
+    t_cds = tuple(sorted(t.cds))
+    if not t_cds:
+        return None
+    ph = int(getattr(t, "cds_phase", 0) or 0) % 3
+    raw_seq = genome.spliced(t.contig, t.strand, list(t_cds))
+    if ph == 0 and orf_status(raw_seq)["valid"]:
+        return t_cds, 0, False
+
+    trimmed = trim_partial_edge_cds(genome, t.contig, t.strand, t_cds, cds_phase=ph)
+    if trimmed is not None:
+        return tuple(trimmed), 0, True
+
+    # Support 5'-partial models carrying an explicit non-zero GTF phase (e.g. zoom-window edge)
+    # when phased translation has zero internal stops, valid frame, and canonical splice sites.
+    if ph in (1, 2):
+        u_ph = raw_seq[ph:].upper()
+        rem_ph = len(u_ph) % 3
+        clip_3p = (
+            (t.attrs.get("clip_right") == "1" and t.strand != "-")
+            or (t.attrs.get("clip_left") == "1" and t.strand == "-")
+        )
+        if clip_3p and rem_ph != 0 and len(u_ph) - rem_ph >= 150:
+            proj = project_tx_interval(list(t_cds), t.strand, 0, len(raw_seq) - rem_ph)
+            if len(proj) >= len(t_cds):
+                t_cds_try = tuple(proj)
+                u_try = genome.spliced(t.contig, t.strand, list(t_cds_try))[ph:].upper()
+                if (
+                    len(u_try) >= 150
+                    and len(u_try) % 3 == 0
+                    and _cds_introns_canonical(genome, t.contig, t.strand, t_cds_try)
+                    and all(u_try[i : i + 3] not in STOP_CODONS for i in range(0, len(u_try), 3))
+                ):
+                    return t_cds_try, ph, True
+        if (
+            rem_ph == 0
+            and len(u_ph) >= 6
+            and (u_ph[-3:] in STOP_CODONS or clip_3p)
+            and _cds_introns_canonical(genome, t.contig, t.strand, t_cds)
+            and all(u_ph[i : i + 3] not in STOP_CODONS for i in range(0, max(0, len(u_ph) - 3), 3))
+        ):
+            return t_cds, ph, True
+
+    # Try small local start/stop repair for unphased canonical models without internal stops
+    if ph == 0 and _cds_introns_canonical(genome, t.contig, t.strand, t_cds):
+        repaired = repair_orf(genome, t.contig, t.strand, list(t_cds), max_ext=90, partial_edge=True)
+        if repaired is not None:
+            rep_seq = genome.spliced(t.contig, t.strand, list(repaired))
+            if orf_status(rep_seq)["valid"]:
+                return tuple(repaired), 0, False
+            if is_scaffold_edge_partial_cds(genome, t.contig, t.strand, repaired):
+                return tuple(repaired), 0, True
+    return None
+
+
 def generate_candidates(
     genome: Genome,
     tiberius: list[Transcript],
@@ -565,18 +631,12 @@ def generate_candidates(
     for t in tiberius:
         if not t.cds:
             continue
-        ph = int(getattr(t, "cds_phase", 0) or 0) % 3
-        t_cds = tuple(sorted(t.cds))
-        st = orf_status(genome.spliced(t.contig, t.strand, t_cds)) if ph == 0 else {"valid": False}
-        partial_edge = False
-        if not st["valid"]:
-            trimmed = trim_partial_edge_cds(genome, t.contig, t.strand, t_cds, cds_phase=ph)
-            if trimmed is not None:
-                t_cds = tuple(trimmed)
-                partial_edge = True
-                st = orf_status(genome.spliced(t.contig, t.strand, t_cds))
-        c = Cand(t.contig, t.strand, t_cds, {"tiberius"})
-        c.feats["tib_valid"] = st["valid"] or partial_edge
+        validated = _validate_or_repair_tiberius_cds(genome, t)
+        if validated is None:
+            continue
+        t_cds, eff_ph, partial_edge = validated
+        c = Cand(t.contig, t.strand, t_cds, {"tiberius"}, cds_phase=eff_ph)
+        c.feats["tib_valid"] = True
         if partial_edge:
             c.feats["partial_edge"] = True
         if t.source == "tiberius_backfill" or t.attrs.get("backfill") == "1":
@@ -584,12 +644,11 @@ def generate_candidates(
         if t.attrs.get("trimmed_spacer") == "1":
             c.feats["trimmed_spacer"] = True
         _add(cands, c)
-    # protein chains: top-N per overlapping cluster
-    hs = sorted([h for h in hits if h.quality >= p.hit_candidate_min_quality and h.frameshift == 0],
-                key=lambda h: (h.contig, h.strand, h.start))
-    cluster: list[ProteinHit] = []
-    cend = -1
-    ckey = None
+    # protein chains: top-N per CDS-block-overlapping cluster (preserves nested intronic genes)
+    hs_by_cs: dict[tuple[str, str], list[ProteinHit]] = defaultdict(list)
+    for h in hits:
+        if h.quality >= p.hit_candidate_min_quality and h.frameshift == 0:
+            hs_by_cs[(h.contig, h.strand)].append(h)
 
     def flush(cl: list[ProteinHit]):
         for h in sorted(cl, key=lambda h: -(h.quality * (1 + 0.05 * min(h.n_proteins, 20))))[: p.max_hit_candidates_per_cluster]:
@@ -601,17 +660,9 @@ def generate_candidates(
                 c.feats["partial_edge"] = True
             _add(cands, c)
 
-    for h in hs:
-        k = (h.contig, h.strand)
-        if cluster and (k != ckey or h.start >= cend):
-            flush(cluster)
-            cluster = []
-            cend = -1
-        cluster.append(h)
-        ckey = k
-        cend = max(cend, h.end)
-    if cluster:
-        flush(cluster)
+    for _cs in sorted(hs_by_cs):
+        for comp in _exonic_connected_components(hs_by_cs[_cs], lambda h: h.cds):
+            flush(comp)
     if rna_tx:
         for t in rna_tx:
             for c in rna_orf_candidate(genome, t, p.rna_orf_min_aa):
@@ -669,28 +720,26 @@ class EvidenceView:
             if genome is None:
                 valid.append(t)
                 continue
-            ph = int(getattr(t, "cds_phase", 0) or 0) % 3
-            if ph == 0 and orf_status(genome.spliced(t.contig, t.strand, t.cds))["valid"]:
-                valid.append(t)
-                continue
-            trimmed = trim_partial_edge_cds(genome, t.contig, t.strand, t.cds, cds_phase=ph)
-            if trimmed is not None:
+            validated = _validate_or_repair_tiberius_cds(genome, t)
+            if validated is not None:
+                v_cds, v_ph, _pe = validated
                 valid.append(
                     Transcript(
                         tid=t.tid,
                         contig=t.contig,
                         strand=t.strand,
                         exons=list(t.exons),
-                        cds=trimmed,
+                        cds=list(v_cds),
                         gid=t.gid,
                         source=t.source,
                         attrs=dict(t.attrs),
                         biotype=t.biotype,
+                        cds_phase=v_ph,
                     )
                 )
         self.tib_index = LocusIndex([(t.contig, t.cds_start, t.cds_end, t) for t in valid])
         self.tib_introns: set = set()
-        for t in tiberius:
+        for t in valid:
             for a, b in t.cds_introns:
                 self.tib_introns.add((t.contig, t.strand, a, b))
         good = [h for h in hits if h.positive >= 0.5]
@@ -1205,11 +1254,9 @@ def score(c: Cand, ev: EvidenceView) -> float:
 # ----------------------------------------------------------------------------------------------
 
 
-def schedule(cands: list[Cand]) -> list[Cand]:
-    """Weighted interval scheduling: max-score set of non-overlapping CDS spans (one strand/contig)."""
-    xs = sorted([c for c in cands if c.score > 0], key=lambda c: c.end)
-    if not xs:
-        return []
+def _schedule_span_dp(xs: list[Cand]) -> list[Cand]:
+    """O(n log n) exact DP when conflict == outer-span overlap."""
+    xs = sorted(xs, key=lambda c: (c.end, c.start))
     ends = [c.end for c in xs]
     n = len(xs)
     dp = [0.0] * (n + 1)
@@ -1225,7 +1272,7 @@ def schedule(cands: list[Cand]) -> list[Cand]:
             take[i] = True
         else:
             dp[i] = dp[i - 1]
-    out = []
+    out: list[Cand] = []
     i = n
     while i > 0:
         if take[i]:
@@ -1234,6 +1281,77 @@ def schedule(cands: list[Cand]) -> list[Cand]:
         else:
             i -= 1
     return out[::-1]
+
+
+def _schedule_cds_mwis_exact(comp: list[Cand]) -> list[Cand]:
+    """Exact maximum-weight CDS-disjoint subset on one exonic connected component."""
+    ordered = sorted(comp, key=lambda c: (-c.score, c.end, c.start, c.cds))
+    m = len(ordered)
+    adj = [0] * m
+    has_nested_pair = False
+    for i in range(m):
+        ci = ordered[i]
+        for j in range(i + 1, m):
+            cj = ordered[j]
+            if _cds_overlap_bp(ci.cds, cj.cds) > 0:
+                adj[i] |= 1 << j
+                adj[j] |= 1 << i
+            elif ci.start < cj.end and cj.start < ci.end:
+                has_nested_pair = True
+    if not has_nested_pair:
+        return _schedule_span_dp(comp)
+
+    suffix = [0.0] * (m + 1)
+    for i in range(m - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + ordered[i].score
+
+    best_score = -1.0
+    best_mask = 0
+
+    def _dfs(idx: int, chosen_mask: int, blocked_mask: int, cur_score: float) -> None:
+        nonlocal best_score, best_mask
+        if cur_score + suffix[idx] <= best_score + 1e-12:
+            return
+        if idx >= m:
+            if cur_score > best_score:
+                best_score = cur_score
+                best_mask = chosen_mask
+            return
+        bit = 1 << idx
+        if not (blocked_mask & bit):
+            _dfs(idx + 1, chosen_mask | bit, blocked_mask | adj[idx], cur_score + ordered[idx].score)
+        _dfs(idx + 1, chosen_mask, blocked_mask, cur_score)
+
+    _dfs(0, 0, 0, 0.0)
+    chosen = [ordered[i] for i in range(m) if (best_mask >> i) & 1]
+    chosen.sort(key=lambda c: (c.start, c.end, c.cds))
+    return chosen
+
+
+def schedule(cands: list[Cand]) -> list[Cand]:
+    """Select max-score set of CDS-block-disjoint candidates on one strand/contig (retaining nested intronic genes)."""
+    pos = [c for c in cands if c.score > 0]
+    if not pos:
+        return []
+    out: list[Cand] = []
+    for comp in _exonic_connected_components(pos, lambda c: c.cds):
+        if len(comp) == 1:
+            out.append(comp[0])
+        elif len(comp) <= 28:
+            out.extend(_schedule_cds_mwis_exact(comp))
+        else:
+            top = sorted(comp, key=lambda c: (-c.score, c.end, c.start))[:28]
+            picked = _schedule_cds_mwis_exact(top)
+            picked_ids = {id(c) for c in picked}
+            for rem_c in sorted(comp, key=lambda c: (-c.score, c.end, c.start)):
+                if id(rem_c) in picked_ids:
+                    continue
+                if all(_cds_overlap_bp(rem_c.cds, pk.cds) == 0 for pk in picked):
+                    picked.append(rem_c)
+                    picked_ids.add(id(rem_c))
+            out.extend(picked)
+    out.sort(key=lambda c: (c.start, c.end, c.cds))
+    return out
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1310,8 +1428,18 @@ def insert_microexons(c: Cand, genome: Genome, micro: dict) -> Cand:
         if (me - ms) % 3 != 0 or not (a < ms < me < b):
             continue
         new = sorted(cds + [(ms, me)])
-        st = orf_status(genome.spliced(c.contig, c.strand, new))
-        if st["valid"]:
+        ph = int(getattr(c, "cds_phase", 0) or 0) % 3
+        spliced_new = genome.spliced(c.contig, c.strand, new)
+        if ph == 0:
+            valid_new = orf_status(spliced_new)["valid"]
+        else:
+            u_ph = spliced_new[ph:].upper()
+            valid_new = (
+                len(u_ph) >= 6
+                and len(u_ph) % 3 == 0
+                and all(u_ph[i : i + 3] not in STOP_CODONS for i in range(0, max(0, len(u_ph) - 3), 3))
+            )
+        if valid_new:
             cds = new
             changed += 1
             parent[(a, ms)] = (a, b)
@@ -1321,31 +1449,46 @@ def insert_microexons(c: Cand, genome: Genome, micro: dict) -> Cand:
     exons = None
     if c.exons:
         exons = tuple(sorted(list(c.exons) + [x for x in cds if x not in c.cds]))
-    nc = Cand(c.contig, c.strand, tuple(cds), set(c.sources) | {"microexon_zoom"}, exons, c.tx_cov, c.hit)
+    nc = Cand(
+        c.contig, c.strand, tuple(cds), set(c.sources) | {"microexon_zoom"}, exons, c.tx_cov, c.hit,
+        cds_phase=c.cds_phase,
+    )
     nc.microexons = changed
     nc.micro_parent = parent
     nc.feats = dict(c.feats)
     return nc
 
 
-def parent_intron_counts(single: list[Cand], multi: list[Cand], genome: Genome, work: Path) -> tuple[dict, float]:
+def parent_intron_counts(
+    single: list[Cand],
+    multi: list[Cand],
+    genome: Genome,
+    work: Path,
+    *,
+    threads: int = 8,
+    strict: bool = True,
+) -> tuple[dict, float, bool]:
     """Family intron architecture of each single-exon candidate (diamond blastp vs ALL selected models).
 
     A multi-exon "parent" is reported only when multi-exon homologs (>= 50 % id, >= 70 % query cover,
     other loci) outnumber single-exon homologs: intronless families (ORs, histones) contain a few
     mis-predicted multi-exon members and must not be read as retrocopies of them."""
+    if not single or not multi:
+        return {}, 0.0, False
     work.mkdir(parents=True, exist_ok=True)
     q = work / "single_exon.faa"
     db = work / "all_models.faa"
     allm = single + multi
     with open(q, "w") as fh:
         for i, c in enumerate(single):
-            fh.write(f">s{i}\n{translate(genome.spliced(c.contig, c.strand, list(c.cds))).rstrip('*')}\n")
+            ph_c = int(getattr(c, "cds_phase", 0) or 0) % 3
+            fh.write(f">s{i}\n{translate(genome.spliced(c.contig, c.strand, list(c.cds))[ph_c:]).rstrip('*')}\n")
     with open(db, "w") as fh:
         for i, c in enumerate(allm):
-            fh.write(f">m{i}\n{translate(genome.spliced(c.contig, c.strand, list(c.cds))).rstrip('*')}\n")
+            ph_c = int(getattr(c, "cds_phase", 0) or 0) % 3
+            fh.write(f">m{i}\n{translate(genome.spliced(c.contig, c.strand, list(c.cds))[ph_c:]).rstrip('*')}\n")
     out = work / "single_vs_all.tsv"
-    n_threads = str(min(32, os.cpu_count() or 8))
+    n_threads = str(max(1, min(32, int(threads))))
     env = safe_env()
     diamond_cpu_s = 0.0
     try:
@@ -1355,8 +1498,10 @@ def parent_intron_counts(single: list[Cand], multi: list[Cand], genome: Genome, 
         )
         diamond_cpu_s += u1 + s1
         if rc1 != 0:
+            if strict:
+                raise RuntimeError(f"diamond makedb failed (rc={rc1}) during retrocopy family scan")
             _LOG.warning("diamond makedb exited with rc=%d during retrocopy family scan", rc1)
-            return {}, diamond_cpu_s
+            return {}, diamond_cpu_s, True
         rc2, _, u2, s2 = run_cmd(
             ["diamond", "blastp", "-q", str(q), "-d", str(work / "allm"), "-o", str(out), "--quiet",
              "--outfmt", "6", "qseqid", "sseqid", "pident", "qcovhsp", "-k", "25", "--id", "50",
@@ -1365,18 +1510,24 @@ def parent_intron_counts(single: list[Cand], multi: list[Cand], genome: Genome, 
         )
         diamond_cpu_s += u2 + s2
         if rc2 != 0:
+            if strict:
+                raise RuntimeError(f"diamond blastp failed (rc={rc2}) during retrocopy family scan")
             _LOG.warning("diamond blastp exited with rc=%d during retrocopy family scan", rc2)
-            return {}, diamond_cpu_s
-    except FileNotFoundError:
+            return {}, diamond_cpu_s, True
+    except FileNotFoundError as exc:
+        if strict:
+            raise RuntimeError(
+                "diamond binary not found on PATH during retrocopy family scan; install diamond or disable zoom"
+            ) from exc
         _LOG.warning("diamond binary not found; skipping retrocopy family scan")
-        return {}, diamond_cpu_s
+        return {}, diamond_cpu_s, True
     fam: dict[int, dict] = {}
     for line in out.read_text().splitlines():
         qs, ss, pid, qc = line.split("\t")
         qi, mi = int(qs[1:]), int(ss[1:])
         sc, mc = single[qi], allm[mi]
-        if sc.contig == mc.contig and sc.start < mc.end and mc.start < sc.end:
-            continue  # self / overlapping locus
+        if sc.contig == mc.contig and _cds_overlap_bp(sc.cds, mc.cds) > 0:
+            continue  # self / CDS-overlapping locus
         f = fam.setdefault(qi, {"multi": 0, "single": 0, "max_introns": 0, "seen": set()})
         if mi in f["seen"]:
             continue
@@ -1387,7 +1538,7 @@ def parent_intron_counts(single: list[Cand], multi: list[Cand], genome: Genome, 
             f["max_introns"] = max(f["max_introns"], ni)
         else:
             f["single"] += 1
-    return {qi: (f["max_introns"] if f["multi"] > f["single"] else 0) for qi, f in fam.items()}, diamond_cpu_s
+    return {qi: (f["max_introns"] if f["multi"] > f["single"] else 0) for qi, f in fam.items()}, diamond_cpu_s, False
 
 
 def _overlaps_bait(
@@ -1417,21 +1568,29 @@ def retrocopy_filter(
     work: Path,
     bait_intervals: dict[str, list[tuple[int, int]]] | None = None,
     organelle_contigs: set[str] | None = None,
-) -> tuple[list[Cand], list[dict], list[Cand], float]:
+    *,
+    threads: int | None = None,
+    strict: bool | None = None,
+) -> tuple[list[Cand], list[dict], list[Cand], float, bool]:
     single = [c for c in selected if len(c.cds) == 1]
     multi = [c for c in selected if len(c.cds) > 1]
     if not single:
-        return selected, [], [], 0.0
+        return selected, [], [], 0.0, False
     bmap = bait_intervals or {}
     org = organelle_contigs or set()
-    parents, diamond_cpu_s = parent_intron_counts(single, multi, genome, work)
+    eff_threads = int(threads if threads is not None else ev.p.threads)
+    eff_strict = bool(ev.p.strict_retrocopy_scan if strict is None else strict)
+    parents, diamond_cpu_s, scan_failed = parent_intron_counts(
+        single, multi, genome, work, threads=eff_threads, strict=eff_strict
+    )
     drop = set()
     calls = []
     d1_emit: list[Cand] = []
     for i, c in enumerate(single):
         ds = downstream_seq(genome, c, 300)
         tpm = ev.bins.rpkm(c.contig, c.start, c.end) if ev.bins is not None else 0.0
-        st = orf_status(genome.spliced(c.contig, c.strand, list(c.cds)))
+        ph_c = int(getattr(c, "cds_phase", 0) or 0) % 3
+        st = orf_status(genome.spliced(c.contig, c.strand, list(c.cds))[ph_c:])
         tib_p = 0.9 if c.feats.get("tib_exact") else (0.6 if c.feats.get("tib_introns") else 0.3)
         stem_loop = has_histone_stem_loop(ds[:150]) or _approx_find(ds[:150], _STEM_LOOP, 2)
         sec = SingleExonCandidate(
@@ -1460,7 +1619,7 @@ def retrocopy_filter(
             drop.add(id(c))
             if emit_pseudo:
                 d1_emit.append(c)
-    return [c for c in selected if id(c) not in drop], calls, d1_emit, diamond_cpu_s
+    return [c for c in selected if id(c) not in drop], calls, d1_emit, diamond_cpu_s, scan_failed
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1986,6 +2145,7 @@ def synthesize(
     scanned_tib_windows: list[tuple[str, int, int]] | None = None,
     gap_continuity: dict[tuple[str, int, int], int] | None = None,
     lnc_eligible_introns: set[tuple[str, int, int]] | None = None,
+    threads: int | None = None,
 ) -> SynthResult:
     p = params or SynthParams()
     bmap = bait_intervals or {}
@@ -2071,41 +2231,79 @@ def synthesize(
     retro_calls: list[dict] = []
     d1_cands: list[Cand] = []
     diamond_cpu_s = 0.0
+    retro_scan_failed = False
+    eff_threads = int(threads if threads is not None else p.threads)
     if zoom:
-        selected, retro_calls, d1_cands, diamond_cpu_s = retrocopy_filter(
-            selected, genome, ev, (work or Path(".")) / "retro", bait_intervals=bmap, organelle_contigs=org
+        selected, retro_calls, d1_cands, diamond_cpu_s, retro_scan_failed = retrocopy_filter(
+            selected,
+            genome,
+            ev,
+            (work or Path(".")) / "retro",
+            bait_intervals=bmap,
+            organelle_contigs=org,
+            threads=eff_threads,
+            strict=p.strict_retrocopy_scan,
         )
 
-    # Locus status lookup (for attributes only)
+    # Locus status lookup (for attributes only, requiring CDS overlap when locked_model exists)
     lidx = LocusIndex([(l.contig, l.start, l.end, l) for l in loci]) if loci else None
     rna_index = LocusIndex([(t.contig, t.start, t.end, t) for t in rna_tx]) if rna_tx else None
     cand_index = LocusIndex([(c.contig, c.start, c.end, c) for c in clist]) if rna_tx else None
     selected_sorted = sorted(selected, key=lambda c: (c.contig, c.start, c.end, c.strand))
+    prim_index = LocusIndex([(c.contig, c.start, c.end, c) for c in selected_sorted]) if rna_tx else None
     raw_isos_list = [
-        attach_transcripts(c, rna_index, cand_index, junctions, p, selected_primaries_index=None)
+        attach_transcripts(c, rna_index, cand_index, junctions, p, selected_primaries_index=prim_index)
         for c in selected_sorted
     ]
     unified_groups = _unify_bridged_coding_groups(
         selected_sorted, raw_isos_list, max_isoforms=p.max_isoforms
     )
     n_consolidated_split_genes = len(selected_sorted) - len(unified_groups)
-    selected = [rep_c for rep_c, _isos in unified_groups]
 
     coding_models: list[Transcript] = []
+    kept_selected: list[Cand] = []
     emitted_tx_by_source: dict[str, int] = {}
     n_utr = 0
     n_b_prime_genes = 0
     n_trimmed_spacer_tx = 0
     n_backfill_tx = 0
-    for gi, (c, isos) in enumerate(unified_groups, 1):
-        gid = f"{prefix}{gi:06d}"
+    n_dropped_invalid_coding = 0
+    gene_idx = 0
+    for c, isos in unified_groups:
+        valid_isos: list[tuple[tuple, tuple, Cand]] = []
+        for ex, cds, owner_c in isos:
+            ph_o = int(getattr(owner_c, "cds_phase", 0) or 0) % 3
+            spliced_nt = genome.spliced(c.contig, c.strand, list(cds))[ph_o:].upper()
+            if not spliced_nt or len(spliced_nt) % 3 != 0:
+                n_dropped_invalid_coding += 1
+                continue
+            aa = translate(spliced_nt)
+            aa_body = aa[:-1] if aa.endswith("*") else aa
+            if not aa_body or "*" in aa_body:
+                n_dropped_invalid_coding += 1
+                continue
+            valid_isos.append((ex, cds, owner_c))
+        if not valid_isos:
+            continue
+        gene_idx += 1
+        kept_selected.append(c)
+        gid = f"{prefix}{gene_idx:06d}"
         status = ""
         if lidx is not None:
-            ls = [l for l in lidx.overlapping(c.contig, c.start, c.end) if l.strand == c.strand]
+            ls = [
+                l
+                for l in lidx.overlapping(c.contig, c.start, c.end)
+                if l.strand == c.strand
+                and (
+                    getattr(l, "locked_model", None) is None
+                    or not l.locked_model.cds
+                    or _cds_overlap_bp(c.cds, l.locked_model.cds) > 0
+                )
+            ]
             status = ls[0].status if ls else "NOVEL"
         if int(c.feats.get("n_unsup_excused", 0)) > 0:
             n_b_prime_genes += 1
-        for ti, (ex, cds, owner_c) in enumerate(isos, 1):
+        for ti, (ex, cds, owner_c) in enumerate(valid_isos, 1):
             t = Transcript(
                 tid=f"{gid}.t{ti}",
                 contig=c.contig,
@@ -2115,6 +2313,7 @@ def synthesize(
                 gid=gid,
                 source="GeneLoop",
                 biotype="protein_coding",
+                cds_phase=int(getattr(owner_c, "cds_phase", 0) or 0) % 3,
             )
             if tuple(ex) != tuple(cds):
                 n_utr += 1
@@ -2139,6 +2338,7 @@ def synthesize(
             if owner_c.feats.get("partial_edge", False):
                 t.attrs["partial_edge"] = "1"
             coding_models.append(t)
+    selected = kept_selected
 
     pseudo_raw: list[tuple[str, str, list[tuple[int, int]], dict]] = [
         (c.contig, c.strand, list(c.cds), {"pseudo": "true", "evidence": "retrocopy_disabled", "score": f"{c.score:.2f}"})
@@ -2240,6 +2440,8 @@ def synthesize(
         "n_tiberius_backfill_tx": n_backfill_tx,
         "retro_rejected": sum(1 for r in retro_calls if r["call"] == "processed_pseudogene"),
         "retro_emitted_pseudogenes": len(d1_cands),
+        "retro_scan_failed": retro_scan_failed,
+        "dropped_invalid_coding_tx": n_dropped_invalid_coding,
         "disabled_hom_pseudogenes": len(d2_raw),
         "n_pseudo_genes": len(pseudo_models),
         "n_pseudo_protein_genes": len(protein_pseudo_models),

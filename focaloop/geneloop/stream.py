@@ -16,6 +16,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
+import math
 import os
 import random
 import re
@@ -32,7 +33,7 @@ from pathlib import Path
 import numpy as np
 
 from .sieve_syncmer import build_glcore
-from .telemetry import NicCounter, safe_env, wait_rusage
+from .telemetry import NicCounter, safe_env, samtools_sort_mem_arg, wait_rusage
 
 
 def _tool_path(name: str) -> str:
@@ -44,7 +45,14 @@ def _tool_path(name: str) -> str:
     return shutil.which(name) or name
 
 
-XSRA = _tool_path("xsra")
+def _xsra_bin() -> str:
+    env_x = os.environ.get("XSRA_BIN", "").strip()
+    if env_x:
+        return env_x
+    return _tool_path("xsra")
+
+
+XSRA = _xsra_bin()
 
 
 def _open_fastq_text(path: Path):
@@ -59,12 +67,29 @@ def _open_fastq_text(path: Path):
 
 def _count_fastq_records(path: Path) -> int:
     n_lines = 0
+    saw_bytes = False
+    first_nonws = b""
+    last_byte = b"\n"
     with _open_fastq_text(path) as fh:
         while True:
             chunk = fh.read(1 << 20)
             if not chunk:
                 break
+            if not saw_bytes:
+                stripped = chunk.lstrip(b" \t\r\n")
+                if stripped:
+                    saw_bytes = True
+                    first_nonws = stripped[:1]
             n_lines += chunk.count(b"\n")
+            last_byte = chunk[-1:]
+    if not saw_bytes:
+        raise ValueError(f"Empty FASTQ file: {path}")
+    if first_nonws != b"@":
+        raise ValueError(f"Malformed FASTQ file {path}: expected '@' at start of first record")
+    if last_byte != b"\n":
+        n_lines += 1
+    if n_lines % 4 != 0:
+        raise ValueError(f"Truncated FASTQ file {path}: line count {n_lines} is not a multiple of 4")
     return n_lines // 4
 
 
@@ -82,9 +107,20 @@ class LocalFastqStream:
         self.r1_path = Path(r1_path)
         self.r2_path = Path(r2_path) if r2_path is not None else None
         self.segs = 2 if self.r2_path is not None else 1
-        self.total_spots = int(total_spots) if total_spots is not None else _count_fastq_records(self.r1_path)
+        if total_spots is not None:
+            self.total_spots = int(total_spots)
+        else:
+            r1_recs = _count_fastq_records(self.r1_path)
+            if self.r2_path is not None:
+                r2_recs = _count_fastq_records(self.r2_path)
+                if r1_recs != r2_recs:
+                    raise ValueError(
+                        f"Paired FASTQ record count mismatch for {run_id}: R1 has {r1_recs} reads, R2 has {r2_recs} reads"
+                    )
+            self.total_spots = r1_recs
         self._fh1 = None
         self._fh2 = None
+        self._pos_spots = 0
         self.records_consumed = 0
         self.eof = False
         self.restarts = 0
@@ -96,13 +132,31 @@ class LocalFastqStream:
         return self.records_consumed // self.segs
 
     def _ensure_open(self) -> None:
+        reopened = False
         if self._fh1 is None:
             self._fh1 = _open_fastq_text(self.r1_path)
+            reopened = True
         if self.r2_path is not None and self._fh2 is None:
             self._fh2 = _open_fastq_text(self.r2_path)
+            reopened = True
+        if reopened:
+            self._pos_spots = 0
+        target_spots = self.spots_consumed
+        while self._pos_spots < target_spots:
+            r1 = self._read_rec(self._fh1, self.r1_path)
+            if r1 is None:
+                if self._fh2 is not None and self._read_rec(self._fh2, self.r2_path) is not None:
+                    raise ValueError(f"Paired FASTQ mate count mismatch for {self.run_id}: R1 ended before R2")
+                self.eof = True
+                break
+            if self._fh2 is not None:
+                r2 = self._read_rec(self._fh2, self.r2_path)
+                if r2 is None:
+                    raise ValueError(f"Paired FASTQ mate count mismatch for {self.run_id}: R2 ended before R1")
+            self._pos_spots += 1
 
     @staticmethod
-    def _read_rec(fh) -> tuple[bytes, bytes, bytes, bytes] | None:
+    def _read_rec(fh, path: Path | None = None) -> tuple[bytes, bytes, bytes, bytes] | None:
         h = fh.readline()
         if not h:
             return None
@@ -110,27 +164,44 @@ class LocalFastqStream:
         p = fh.readline()
         q = fh.readline()
         if not (s and p and q):
-            return None
-        return h, s, p, q
+            raise ValueError(f"Truncated FASTQ record at EOF in {path or '<fastq>'}")
+        if not h.startswith(b"@"):
+            raise ValueError(f"Malformed FASTQ header (expected '@') in {path or '<fastq>'}")
+        if not p.startswith(b"+"):
+            raise ValueError(f"Malformed FASTQ '+' separator in {path or '<fastq>'}")
+        s_raw = s.rstrip(b"\r\n")
+        q_raw = q.rstrip(b"\r\n")
+        if len(s_raw) != len(q_raw):
+            raise ValueError(
+                f"FASTQ sequence/quality length mismatch ({len(s_raw)} != {len(q_raw)}) in {path or '<fastq>'}"
+            )
+        h_clean = h.rstrip(b"\r\n") + b"\n"
+        return h_clean, s_raw + b"\n", b"+\n", q_raw + b"\n"
 
     def pump(self, n_spots: int, out) -> int:
         """Write up to ``n_spots`` spots (interleaved if paired) to ``out``; returns spots written."""
         if self.eof:
             return 0
         self._ensure_open()
+        if self.eof:
+            return 0
+        base_spot = self.spots_consumed
         spots = 0
         buf: list[bytes] = []
-        for idx in range(int(n_spots)):
-            r1 = self._read_rec(self._fh1)
+        for _idx in range(int(n_spots)):
+            r1 = self._read_rec(self._fh1, self.r1_path)
             if r1 is None:
+                if self._fh2 is not None:
+                    extra_r2 = self._read_rec(self._fh2, self.r2_path)
+                    if extra_r2 is not None:
+                        raise ValueError(f"Paired FASTQ mate count mismatch for {self.run_id}: R1 ended before R2")
                 self.eof = True
                 break
             if self._fh2 is not None:
-                r2 = self._read_rec(self._fh2)
+                r2 = self._read_rec(self._fh2, self.r2_path)
                 if r2 is None:
-                    self.eof = True
-                    break
-                spot_num = self.spots_consumed + spots + 1
+                    raise ValueError(f"Paired FASTQ mate count mismatch for {self.run_id}: R2 ended before R1")
+                spot_num = base_spot + spots + 1
                 hdr1 = f"@{self.run_id}.{spot_num}/1\n".encode("ascii")
                 hdr2 = f"@{self.run_id}.{spot_num}/2\n".encode("ascii")
                 buf.extend((hdr1, r1[1], b"+\n", r1[3], hdr2, r2[1], b"+\n", r2[3]))
@@ -138,6 +209,7 @@ class LocalFastqStream:
             else:
                 buf.extend(r1)
                 self.records_consumed += 1
+            self._pos_spots += 1
             spots += 1
             if len(buf) >= 1024:
                 out.write(b"".join(buf))
@@ -145,7 +217,16 @@ class LocalFastqStream:
         if buf:
             out.write(b"".join(buf))
         if spots < n_spots:
+            # If we filled fewer than requested spots, verify R2 is also at EOF when R1 hit EOF cleanly
             self.eof = True
+        elif self._fh1 is not None and self._fh2 is not None and self.spots_consumed >= self.total_spots:
+            # Check immediately if one mate has trailing records beyond total_spots
+            peek1 = self._read_rec(self._fh1, self.r1_path)
+            peek2 = self._read_rec(self._fh2, self.r2_path)
+            if (peek1 is None) != (peek2 is None):
+                raise ValueError(f"Paired FASTQ mate count mismatch at EOF for {self.run_id}")
+            if peek1 is None and peek2 is None:
+                self.eof = True
         return spots
 
     def close(self) -> None:
@@ -157,6 +238,7 @@ class LocalFastqStream:
                     pass
         self._fh1 = None
         self._fh2 = None
+        self._pos_spots = 0
 
 
 def describe_run(run_id: str, cache_dir: Path) -> dict:
@@ -165,8 +247,10 @@ def describe_run(run_id: str, cache_dir: Path) -> dict:
     p = cache_dir / f"{run_id}.describe.json"
     if p.exists():
         return json.loads(p.read_text())
-    out = subprocess.run([XSRA, "describe", run_id, "-l", "200"], capture_output=True, text=True, env=safe_env(), timeout=600)
-    txt = out.stdout
+    out = subprocess.run([_xsra_bin(), "describe", run_id, "-l", "200"], capture_output=True, text=True, env=safe_env(), timeout=600)
+    txt = out.stdout or ""
+    if out.returncode != 0 or "{" not in txt:
+        raise RuntimeError(f"xsra describe failed (rc={out.returncode}) for {run_id}: {(out.stderr or '').strip()}")
     d = json.loads(txt[txt.index("{"):])
     segs = [s for s in d.get("stats", []) if s.get("segment_type", "Biological") == "Biological"]
     res = {
@@ -184,12 +268,23 @@ class RunStream:
 
     CHUNK = 4 << 20
 
-    def __init__(self, run_id: str, n_segments: int, total_spots: int, log_dir: Path, threads: int = 4):
+    def __init__(
+        self,
+        run_id: str,
+        n_segments: int,
+        total_spots: int,
+        log_dir: Path,
+        threads: int = 4,
+        max_retries: int = 3,
+        max_total_restarts: int = 12,
+    ):
         self.run_id = run_id
         self.segs = n_segments
         self.total_spots = total_spots
         self.log_dir = log_dir
         self.threads = threads
+        self.max_retries = max(0, int(max_retries))
+        self.max_total_restarts = max(self.max_retries, int(max_total_restarts))
         self.proc: subprocess.Popen | None = None
         self._log_fh = None
         self.carry = b""
@@ -200,6 +295,11 @@ class RunStream:
         self.cpu_user = 0.0
         self.cpu_sys = 0.0
         self.skipped_records_restream = 0
+        self.last_rc: int | None = None
+        self.stalled: bool = False
+        self._killed_by_us: bool = False
+        self.stream_failed: bool = False
+        self.failure_reason: str = ""
 
     @property
     def spots_consumed(self) -> int:
@@ -213,8 +313,11 @@ class RunStream:
             except Exception:
                 pass
         self._log_fh = open(self.log_dir / f"xsra_{self.run_id}.log", "a")
+        self.last_rc = None
+        self.stalled = False
+        self._killed_by_us = False
         self.proc = subprocess.Popen(
-            [XSRA, "dump", "--skip-technical", self.run_id, "-T", str(self.threads)],
+            [_xsra_bin(), "dump", "--skip-technical", self.run_id, "-T", str(self.threads)],
             stdout=subprocess.PIPE, stderr=self._log_fh, bufsize=0, env=safe_env(),
         )
         self.carry = b""
@@ -235,7 +338,9 @@ class RunStream:
         poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
         events = poller.poll(timeout_ms)
         if not events:
-            # Stalled xsra socket: kill subprocess and return EOF so pump() can restart & skip.
+            # Stalled xsra socket: mark stalled, kill subprocess, and return EOF so pump() can retry with backoff.
+            self.stalled = True
+            self._killed_by_us = True
             try:
                 self.proc.kill()
             except Exception:
@@ -245,8 +350,8 @@ class RunStream:
 
     def _skip(self, n_records: int) -> None:
         sink = _NullSink()
-        self._emit(n_records, sink, count_consumed=False)
-        self.skipped_records_restream += n_records
+        got = self._emit(n_records, sink, count_consumed=False)
+        self.skipped_records_restream += got
 
     def _emit(self, n_records: int, out, count_consumed: bool = True) -> int:
         written = 0
@@ -268,6 +373,8 @@ class RunStream:
                     out.write(buf[:cut])
                     buf = buf[cut:]
                     written += complete
+            if self.eof:
+                break
             chunk = self._read_chunk()
             if not chunk:
                 self.eof = True
@@ -279,8 +386,17 @@ class RunStream:
             self.records_consumed += written
         return written
 
+    def _retry_backoff(self, attempt_idx: int) -> None:
+        base_s = float(os.environ.get("GENELOOP_XSRA_RETRY_BASE_S", "0.5"))
+        if base_s <= 0.0:
+            return
+        delay = min(8.0, base_s * (2 ** attempt_idx)) * (0.75 + 0.5 * random.random())
+        time.sleep(delay)
+
     def pump(self, n_spots: int, out) -> int:
         """Write the next ``n_spots`` spots to file-like ``out``; returns spots written."""
+        if self.stream_failed:
+            raise RuntimeError(self.failure_reason or f"xsra stream previously failed for {self.run_id}")
         if self.eof:
             return 0
         if self.proc is None:
@@ -288,30 +404,63 @@ class RunStream:
         want = n_spots * self.segs
         got = 0
         tries = 0
-        while got < want and not self.eof:
-            try:
-                got += self._emit(want - got, out)
-            except (BrokenPipeError, OSError):
-                raise
-            if self.eof and self.records_consumed // self.segs < self.total_spots * 0.999 and tries < 3:
-                # premature EOF: restart stream and skip the consumed prefix
-                self._reap()
-                self.restarts += 1
-                tries += 1
+        prev_consumed = self.records_consumed
+        while got < want:
+            if not self.eof:
+                try:
+                    got += self._emit(want - got, out)
+                except (BrokenPipeError, OSError):
+                    raise
+            if self.records_consumed > prev_consumed:
+                tries = 0
+                prev_consumed = self.records_consumed
+            if not self.eof:
+                break
+            # Stream ended: reap child immediately so exit code and stall state are known.
+            was_stalled = self.stalled
+            self._reap(expected_stop=False)
+            rc = self.last_rc
+            min_expected_spots = int(self.total_spots * 0.999) if self.total_spots > 0 else 0
+            below_expected = self.total_spots > 0 and self.spots_consumed < min_expected_spots
+            bad_exit = was_stalled or (rc is not None and rc != 0)
+            if below_expected or bad_exit:
+                if tries < self.max_retries and self.restarts < self.max_total_restarts:
+                    self._retry_backoff(tries)
+                    self.restarts += 1
+                    tries += 1
+                    self.eof = False
+                    self._start()
+                    continue
                 self.eof = False
-                self._start()
+                self.stream_failed = True
+                self.failure_reason = (
+                    f"xsra stream failed for {self.run_id}: spots_consumed={self.spots_consumed}/{self.total_spots}, "
+                    f"exit_code={rc}, stalled={was_stalled}, restarts={self.restarts}"
+                )
+                raise RuntimeError(self.failure_reason)
+            break
         return got // self.segs
 
-    def _reap(self) -> None:
+    def _reap(self, expected_stop: bool = True) -> None:
         if self.proc is None:
             return
         try:
             self.proc.stdout.close()
         except Exception:
             pass
+        terminated_for_stop = False
         if self.proc.poll() is None:
-            self.proc.terminate()
-        _, u, s = wait_rusage(self.proc)
+            terminated_for_stop = expected_stop and not self.stalled
+            self._killed_by_us = True
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        rc, u, s = wait_rusage(self.proc)
+        if terminated_for_stop:
+            self.last_rc = 0
+        else:
+            self.last_rc = rc
         self.cpu_user += u
         self.cpu_sys += s
         self.proc = None
@@ -323,7 +472,7 @@ class RunStream:
             self._log_fh = None
 
     def close(self) -> None:
-        self._reap()
+        self._reap(expected_stop=True)
 
 
 class _NullSink:
@@ -373,6 +522,60 @@ class SliceResult:
     bins_tsv: str = ""
 
 
+def minimap2_index_size_args(genome_bp: int | None) -> list[str]:
+    """Return ``['-I', '<N>G']`` above ``genome_bp`` so minimap2 never emits a headerless multi-part index."""
+    if genome_bp is None or int(genome_bp) <= 0:
+        return []
+    gb = max(8, int(math.ceil((int(genome_bp) * 1.5) / 1_000_000_000)) + 1)
+    return ["-I", f"{gb}G"]
+
+
+def validate_bam_header_against_genome(
+    bam_path: Path,
+    genome_lengths: dict[str, int],
+) -> list[tuple[str, int]]:
+    """Verify every ``@SQ`` contig name and length in ``bam_path`` matches ``genome_lengths``."""
+    samtools_bin = _tool_path("samtools")
+    res = subprocess.run(
+        [samtools_bin, "view", "-H", str(bam_path)],
+        capture_output=True,
+        text=True,
+        env=safe_env(),
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"samtools view -H failed (rc={res.returncode}) for {bam_path}: {(res.stderr or '').strip()}")
+    sq_records: list[tuple[str, int]] = []
+    for line in (res.stdout or "").splitlines():
+        if not line.startswith("@SQ\t"):
+            continue
+        sn = None
+        ln_val: int | None = None
+        for tok in line.split("\t")[1:]:
+            if tok.startswith("SN:"):
+                sn = tok[3:]
+            elif tok.startswith("LN:"):
+                try:
+                    ln_val = int(tok[3:])
+                except ValueError as exc:
+                    raise ValueError(f"Invalid @SQ LN field {tok!r} in {bam_path}") from exc
+        if sn is not None and ln_val is not None:
+            sq_records.append((sn, ln_val))
+    if not sq_records:
+        raise ValueError(f"BAM {bam_path} contains no @SQ reference contig headers")
+    for sn, ln_val in sq_records:
+        if sn not in genome_lengths:
+            sample_genome = ", ".join(list(genome_lengths.keys())[:5])
+            raise ValueError(
+                f"BAM {bam_path} references contig {sn!r} not present in target genome (example genome contigs: {sample_genome})"
+            )
+        exp_ln = int(genome_lengths[sn])
+        if ln_val != exp_ln:
+            raise ValueError(
+                f"BAM {bam_path} contig {sn!r} has LN:{ln_val}, which does not match target genome length {exp_ln}"
+            )
+    return sq_records
+
+
 def _junc_args(glcore: Path, prefix: Path, cap_state: Path | None, caps: tuple[int, int, int] | None) -> list[str]:
     a = [str(glcore), "junc", "--junc", f"{prefix}.junc.tsv", "--bins", f"{prefix}.bins.tsv", "--stats", f"{prefix}.junc.json"]
     if cap_state is not None and caps is not None:
@@ -411,6 +614,8 @@ def align_slice_short(
         "--min-hits", str(min_hits), "--max-miss", str(max_miss),
         "-t", str(sieve_threads),
     ]
+    if getattr(stream, "spots_consumed", 0) > 0:
+        sieve_cmd.append("--allow-empty")
     if active_bin is not None and active_bin.exists():
         sieve_cmd += ["-a", str(active_bin)]
     sieve = subprocess.Popen(sieve_cmd, stdin=subprocess.PIPE, env=env)
@@ -541,8 +746,11 @@ def ingest_bam_to_evidence(
     cap_state: Path | None,
     caps: tuple[int, int, int] | None,
     is_long_read: bool = False,
+    genome_lengths: dict[str, int] | None = None,
 ) -> SliceResult:
     """Stream an existing BAM through ``samtools view -h | glcore junc`` to extract junctions, bins, and capped BAM."""
+    if genome_lengths is not None:
+        validate_bam_header_against_genome(bam_path, genome_lengths)
     glc = build_glcore()
     work.mkdir(parents=True, exist_ok=True)
     prefix = work / tag
@@ -579,6 +787,8 @@ def align_slice_long(
     caps: tuple[int, int, int] | None,
     threads: int = 20,
     nic: NicCounter | None = None,
+    stranded: bool = False,
+    genome_bp: int | None = None,
 ) -> SliceResult:
     glc = build_glcore()
     work.mkdir(parents=True, exist_ok=True)
@@ -587,8 +797,20 @@ def align_slice_long(
     rx0 = nic.rx() if nic else 0
     t0 = time.time()
     mlog = open(f"{prefix}.minimap2.log", "w")
-    mm = subprocess.Popen(["minimap2", "-ax", "splice:hq", "-uf", "-t", str(threads), "--secondary=no", str(mm2_idx), "-"],
-                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=mlog, env=env)
+    strand_flag = "-uf" if stranded else "-ub"
+    mm_cmd = [
+        "minimap2",
+        "-ax",
+        "splice:hq",
+        strand_flag,
+        *minimap2_index_size_args(genome_bp),
+        "-t",
+        str(threads),
+        "--secondary=no",
+        str(mm2_idx),
+        "-",
+    ]
+    mm = subprocess.Popen(mm_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=mlog, env=env)
     junc = subprocess.Popen(_junc_args(glc, prefix, cap_state, caps) + ["--min-anchor", "8"], stdin=mm.stdout, stdout=subprocess.PIPE, env=env)
     mm.stdout.close()
     bam = subprocess.Popen(["samtools", "view", "-b", "-@", "2", "-o", f"{prefix}.bam", "-"], stdin=junc.stdout, env=env)
@@ -621,6 +843,10 @@ def align_slice_long(
         raise err[0]
     res = SliceResult(run_id=stream.run_id, spots=spots[0], wall=time.time() - t0, cpu=cpu)
     res.junc = json.loads(Path(f"{prefix}.junc.json").read_text())
+    if spots[0] > 0 and int(res.junc.get("n_sq", 1)) == 0:
+        raise RuntimeError(f"minimap2 emitted SAM without @SQ headers in {prefix}; pass genome_bp to raise -I")
+    if int(res.junc.get("records", 0)) > 0 and int(res.junc.get("mapped_records", 0)) == 0 and int(res.junc.get("unknown_rname", 0)) > 0:
+        raise RuntimeError(f"minimap2 mapped 0 records due to missing @SQ reference contigs in {prefix}")
     res.wire_bytes = (nic.rx() - rx0) if nic else 0
     res.bam, res.junc_tsv, res.bins_tsv = f"{prefix}.bam", f"{prefix}.junc.tsv", f"{prefix}.bins.tsv"
     return res
@@ -637,7 +863,12 @@ def align_run_full(
     sort_threads: int = 4,
     max_intron: int = 500000,
     nic: NicCounter | None = None,
+    long_stranded: bool = False,
+    stranded: bool | None = None,
+    genome_bp: int | None = None,
 ) -> SliceResult:
+    if stranded is not None:
+        long_stranded = bool(stranded)
     """Arm B: stream 100% of a run -> spliced aligner -> full coordinate-sorted BAM on disk."""
     glc = build_glcore()
     work.mkdir(parents=True, exist_ok=True)
@@ -664,13 +895,26 @@ def align_run_full(
         procs += [("split", split), ("hisat2", al)]
     else:
         alog = open(f"{prefix}.minimap2.log", "w")
-        al = subprocess.Popen(["minimap2", "-ax", "splice:hq", "-uf", "-t", str(threads), "--secondary=no", str(mm2_idx), "-"],
-                              stdin=xs.stdout, stdout=subprocess.PIPE, stderr=alog, env=env)
+        strand_flag = "-uf" if long_stranded else "-ub"
+        mm_cmd = [
+            "minimap2",
+            "-ax",
+            "splice:hq",
+            strand_flag,
+            *minimap2_index_size_args(genome_bp),
+            "-t",
+            str(threads),
+            "--secondary=no",
+            str(mm2_idx),
+            "-",
+        ]
+        al = subprocess.Popen(mm_cmd, stdin=xs.stdout, stdout=subprocess.PIPE, stderr=alog, env=env)
         xs.stdout.close()
         procs += [("minimap2", al)]
     junc = subprocess.Popen(_junc_args(glc, prefix, None, None), stdin=al.stdout, stdout=subprocess.PIPE, env=env)
     al.stdout.close()
-    sort = subprocess.Popen(["samtools", "sort", "-@", str(sort_threads), "-m", "1500M", "-T", f"{prefix}.sorttmp",
+    sort_mem = samtools_sort_mem_arg(sort_threads, max_per_thread_mb=1500)
+    sort = subprocess.Popen(["samtools", "sort", "-@", str(sort_threads), "-m", sort_mem, "-T", f"{prefix}.sorttmp",
                              "-o", f"{prefix}.bam", "-"], stdin=junc.stdout, env=env)
     junc.stdout.close()
     procs += [("junc", junc), ("samtools_sort", sort)]
@@ -694,6 +938,10 @@ def align_run_full(
     res = SliceResult(run_id=run_id, spots=0, wall=time.time() - t0, cpu=cpu)
     res.junc = json.loads(Path(f"{prefix}.junc.json").read_text())
     if long_read:
+        if int(res.junc.get("n_sq", 1)) == 0 or (
+            int(res.junc.get("records", 0)) > 0 and int(res.junc.get("mapped_records", 0)) == 0
+        ):
+            raise RuntimeError(f"Long-read alignment for {run_id} produced 0 mapped records out of {res.junc.get('records', 0)}")
         res.spots = res.junc.get("records", 0)  # minimap2 --secondary=no: one record per read (+ rare supplementary)
     else:
         res.sieve = json.loads(Path(f"{prefix}.split.json").read_text())
@@ -709,6 +957,8 @@ def align_run_full(
 # ----------------------------------------------------------------------------------------------
 
 LOGAN_CONTIGS_URL_TEMPLATE = "https://s3.amazonaws.com/logan-pub/c/{acc}/{acc}.contigs.fa.zst"
+MIN_LOGAN_ARCHIVE_BYTES = 100
+LOGAN_PROBE_SCHEMA_VERSION = 2
 ENA_FILEREPORT_URL_TEMPLATE = (
     "https://www.ebi.ac.uk/ena/portal/api/filereport"
     "?accession={acc}&result=read_run&fields=run_accession,scientific_name,tax_id&format=json"
@@ -728,7 +978,7 @@ def _write_json_atomic_stream(path: Path, payload: dict) -> None:
 
 
 def probe_logan_contigs_url(acc: str, timeout: float = 8.0, retries: int = 4) -> dict:
-    """Probe Logan S3 contigs object via HTTP HEAD with bounded retries on transient errors."""
+    """Probe Logan S3 contigs object via HTTP HEAD, rejecting <=100-byte empty zstd stubs."""
     clean = str(acc).strip()
     url = logan_contigs_url(clean)
     max_attempts = max(1, int(retries) + 1)
@@ -743,10 +993,14 @@ def probe_logan_contigs_url(acc: str, timeout: float = 8.0, retries: int = 4) ->
                 status = int(getattr(resp, "status", 200) or 200)
                 headers = getattr(resp, "headers", {}) or {}
                 cl_raw = headers.get("Content-Length") if hasattr(headers, "get") else None
-                cl = int(cl_raw) if cl_raw is not None and str(cl_raw).isdigit() else 0
+                if cl_raw is None and hasattr(headers, "get"):
+                    cl_raw = headers.get("content-length")
+                cl = int(cl_raw) if cl_raw is not None and str(cl_raw).strip().isdigit() else 0
+                is_stub = status == 200 and cl <= MIN_LOGAN_ARCHIVE_BYTES
                 return {
                     "run_id": clean,
-                    "available": status == 200,
+                    "available": status == 200 and cl > MIN_LOGAN_ARCHIVE_BYTES,
+                    "is_stub": is_stub,
                     "http_status": status,
                     "content_length": cl,
                     "url": url,
@@ -759,6 +1013,7 @@ def probe_logan_contigs_url(acc: str, timeout: float = 8.0, retries: int = 4) ->
                 return {
                     "run_id": clean,
                     "available": False,
+                    "is_stub": False,
                     "http_status": code,
                     "content_length": 0,
                     "url": url,
@@ -778,6 +1033,8 @@ def probe_logan_contigs_url(acc: str, timeout: float = 8.0, retries: int = 4) ->
     out = {
         "run_id": clean,
         "available": False,
+        "is_stub": False,
+        "transient_error": True,
         "http_status": last_status,
         "content_length": 0,
         "url": url,
@@ -794,7 +1051,7 @@ def probe_logan_runs(
     retries: int = 4,
     max_workers: int = 16,
 ) -> dict:
-    """Partition short SRA accessions into HTTP-200 ``logan_runs`` and ``fallback_short_runs``."""
+    """Partition short SRA accessions into non-stub HTTP-200 ``logan_runs`` and ``fallback_short_runs``."""
     ordered = [str(r).strip() for r in short_runs if str(r).strip()]
     unique_accs: list[str] = []
     seen: set[str] = set()
@@ -808,10 +1065,19 @@ def probe_logan_runs(
     if cache_path is not None and cache_path.exists():
         try:
             raw = json.loads(cache_path.read_text())
-            if isinstance(raw, dict) and raw.get("schema_version") == 1 and isinstance(raw.get("probes"), dict):
+            if (
+                isinstance(raw, dict)
+                and raw.get("schema_version") == LOGAN_PROBE_SCHEMA_VERSION
+                and isinstance(raw.get("probes"), dict)
+            ):
                 for k, v in raw["probes"].items():
                     if isinstance(v, dict) and int(v.get("http_status", 0)) in (200, 400, 403, 404):
-                        cached_probes[str(k)] = v
+                        st_code = int(v.get("http_status", 0))
+                        cl_val = int(v.get("content_length", 0))
+                        norm_v = dict(v)
+                        norm_v["is_stub"] = st_code == 200 and cl_val <= MIN_LOGAN_ARCHIVE_BYTES
+                        norm_v["available"] = st_code == 200 and cl_val > MIN_LOGAN_ARCHIVE_BYTES
+                        cached_probes[str(k)] = norm_v
                 if list(raw.get("requested_short_runs", [])) == ordered and all(a in cached_probes for a in unique_accs):
                     cache_exact_hit = True
         except (OSError, ValueError, TypeError):
@@ -822,18 +1088,39 @@ def probe_logan_runs(
         if missing:
             workers = max(1, min(int(max_workers), len(missing)))
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                for res in ex.map(lambda a: probe_logan_contigs_url(a, timeout=timeout, retries=retries), missing):
-                    cached_probes[res["run_id"]] = res
+                for acc, res in zip(
+                    missing,
+                    ex.map(lambda a: probe_logan_contigs_url(a, timeout=timeout, retries=retries), missing),
+                ):
+                    norm_r = dict(res)
+                    rid = str(norm_r.get("run_id") or acc)
+                    norm_r["run_id"] = rid
+                    if "http_status" not in norm_r and "status" in norm_r:
+                        norm_r["http_status"] = int(norm_r["status"])
+                    if "content_length" not in norm_r and "compressed_bytes" in norm_r:
+                        norm_r["content_length"] = int(norm_r["compressed_bytes"])
+                    if "is_stub" not in norm_r:
+                        st_c = int(norm_r.get("http_status", 0))
+                        cl_c = int(norm_r.get("content_length", 0))
+                        norm_r["is_stub"] = bool(
+                            norm_r.get("stub_archive", False)
+                            or (st_c == 200 and cl_c <= MIN_LOGAN_ARCHIVE_BYTES)
+                        )
+                    cached_probes[rid] = norm_r
 
     probes_out = {a: cached_probes[a] for a in unique_accs}
     logan_runs = [a for a in ordered if probes_out[a].get("available", False)]
     fallback_short_runs = [a for a in ordered if not probes_out[a].get("available", False)]
+    stub_runs = [a for a in ordered if probes_out[a].get("is_stub", False)]
+    transient_failed_runs = [a for a in ordered if probes_out[a].get("transient_error", False)]
     total_bytes = sum(int(probes_out[a].get("content_length", 0)) for a in unique_accs if probes_out[a].get("available"))
     payload = {
-        "schema_version": 1,
+        "schema_version": LOGAN_PROBE_SCHEMA_VERSION,
         "requested_short_runs": ordered,
         "logan_runs": logan_runs,
         "fallback_short_runs": fallback_short_runs,
+        "stub_runs": stub_runs,
+        "transient_failed_runs": transient_failed_runs,
         "total_compressed_bytes": total_bytes,
         "probes": probes_out,
     }
@@ -989,7 +1276,7 @@ def fetch_logan_contig_file(
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
         existing_sz = int(dst.stat().st_size)
-        if existing_sz > 0 and (expected_bytes <= 0 or existing_sz == int(expected_bytes)):
+        if existing_sz > MIN_LOGAN_ARCHIVE_BYTES and (expected_bytes <= 0 or existing_sz == int(expected_bytes)):
             return existing_sz
         dst.unlink(missing_ok=True)
     url = logan_contigs_url(acc)
@@ -997,6 +1284,7 @@ def fetch_logan_contig_file(
     part = dst.with_name(f".{dst.name}.part.{os.getpid()}.{threading.get_ident()}")
     last_exc: Exception | None = None
     for attempt in range(attempts):
+        is_stub_err = False
         try:
             expected_cl = int(expected_bytes) if expected_bytes > 0 else 0
             with urllib.request.urlopen(url, timeout=timeout) as resp, open(part, "wb") as fo:
@@ -1014,8 +1302,11 @@ def fetch_logan_contig_file(
                         expected_cl = int(cl_str)
                 shutil.copyfileobj(resp, fo, length=1 << 20)
             sz = int(part.stat().st_size)
-            if sz <= 0:
-                raise RuntimeError(f"Empty Logan contigs payload for {acc} from {url}")
+            if sz <= MIN_LOGAN_ARCHIVE_BYTES:
+                is_stub_err = True
+                raise RuntimeError(
+                    f"Stub or empty Logan contigs archive ({sz} bytes <= {MIN_LOGAN_ARCHIVE_BYTES}) for {acc} from {url}"
+                )
             if expected_cl > 0 and sz != expected_cl:
                 raise RuntimeError(
                     f"Truncated Logan contigs payload for {acc} from {url}: got {sz} bytes, expected Content-Length={expected_cl}"
@@ -1029,6 +1320,8 @@ def fetch_logan_contig_file(
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             part.unlink(missing_ok=True)
+            if is_stub_err:
+                break
             if attempt + 1 < attempts:
                 time.sleep(0.4 * (attempt + 1))
     raise RuntimeError(f"Failed to download Logan contigs for {acc} ({url}): {last_exc}") from last_exc
@@ -1045,6 +1338,7 @@ def align_logan_contigs(
     threads: int = 24,
     nic: NicCounter | None = None,
     local_zst_map: dict[str, Path] | None = None,
+    genome_bp: int | None = None,
 ) -> dict:
     """Fetch Logan ``c/`` contigs into ``tmp_dir``, stream ``zstd -> minimap2 -y -> glcore logan -> samtools sort``, and purge ``tmp_dir``."""
     if not logan_runs:
@@ -1114,9 +1408,14 @@ def align_logan_contigs(
         mm2_bin = _tool_path("minimap2")
         samtools_bin = _tool_path("samtools")
         sort_threads = min(16, max(2, int(threads) // 3))
+        eff_genome_bp = genome_bp
+        if eff_genome_bp is None and genome_fa.is_file():
+            eff_genome_bp = int(genome_fa.stat().st_size)
+        has_explicit_i = any(fl == "-I" or fl.startswith("-I") for fl in mm2_flags)
+        idx_flags = [] if has_explicit_i else minimap2_index_size_args(eff_genome_bp)
 
         zstd_cmd = [zstd_bin, "-dcq"] + [str(p) for p in zst_inputs]
-        mm2_cmd = [mm2_bin] + list(mm2_flags) + ["-y", "-t", str(max(1, int(threads))), str(genome_fa), "-"]
+        mm2_cmd = [mm2_bin] + list(mm2_flags) + idx_flags + ["-y", "-t", str(max(1, int(threads))), str(genome_fa), "-"]
         lj_cmd = [
             str(glcore_bin),
             "logan",
@@ -1126,10 +1425,11 @@ def align_logan_contigs(
             "--bins-ka", str(b_ka),
             "--stats", str(stats_p),
         ]
+        sort_mem = samtools_sort_mem_arg(sort_threads, max_per_thread_mb=2048)
         sort_cmd = [
             samtools_bin, "sort",
             "-@", str(sort_threads),
-            "-m", "2G",
+            "-m", sort_mem,
             "-T", f"{bam_out}.sorttmp",
             "-o", str(bam_out),
             "-",
@@ -1278,10 +1578,35 @@ def align_logan_contigs(
     nic_delta = (nic.rx() - rx0) if nic else 0
     wire_bytes = max(int(dl_bytes), int(nic_delta))
     lj_stats = json.loads(stats_p.read_text()) if stats_p.exists() else {}
+    n_recs_tot = int(lj_stats.get("records", 0))
+    n_mapped_tot = int(lj_stats.get("mapped_records", 0))
+    n_sq_tot = int(lj_stats.get("n_sq", 1))
+    if n_recs_tot > 0 and n_sq_tot == 0:
+        bam_out.unlink(missing_ok=True)
+        bai_out.unlink(missing_ok=True)
+        raise RuntimeError(
+            "minimap2 emitted multi-part SAM without @SQ headers during Logan contig alignment; increase minimap2 -I"
+        )
+    if n_recs_tot > 0 and n_mapped_tot == 0:
+        bam_out.unlink(missing_ok=True)
+        bai_out.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Logan contig alignment produced 0 mapped records out of {n_recs_tot} input records across {len(logan_runs)} run(s)"
+        )
+    run_records_map = lj_stats.get("run_records") if isinstance(lj_stats.get("run_records"), dict) else {}
+    run_mapped_map = lj_stats.get("run_mapped") if isinstance(lj_stats.get("run_mapped"), dict) else {}
+    zero_record_runs = [acc for acc in dict.fromkeys(logan_runs) if int(run_records_map.get(acc, 0)) == 0]
+    zero_mapped_runs = [
+        acc
+        for acc in dict.fromkeys(logan_runs)
+        if int(run_records_map.get(acc, 0)) > 0 and int(run_mapped_map.get(acc, 0)) == 0
+    ]
     total_cpu_s = round(sum(cpu_by_proc.values()), 3)
     meta = {
         "logan_runs": list(logan_runs),
         "n_logan_runs": len(logan_runs),
+        "zero_record_runs": zero_record_runs,
+        "zero_mapped_runs": zero_mapped_runs,
         "mm2_flags": list(mm2_flags),
         "bam_path": str(bam_out),
         "bam_bytes": int(bam_out.stat().st_size),
@@ -1306,14 +1631,19 @@ def ingest_per_run_junc_tsv(js, path: Path, genome) -> list[tuple[tuple[str, int
     from .evidence import junction_motif
 
     added: list[tuple[tuple[str, int, int], int, int]] = []
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         return added
     seen_runs = set(js.run_ids)
     with open(path, "r") as fh:
-        for line in fh:
-            f = line.rstrip("\n").split("\t")
-            if len(f) < 7:
+        for lineno, line in enumerate(fh, 1):
+            if not line.endswith("\n"):
+                raise ValueError(f"Truncated per-run junction TSV line {lineno} (missing newline) in {path}")
+            stripped = line.rstrip("\r\n")
+            if not stripped:
                 continue
+            f = stripped.split("\t")
+            if len(f) != 7:
+                raise ValueError(f"Malformed per-run junction TSV line {lineno} in {path}: expected 7 columns, got {len(f)}")
             rid = f[0]
             if rid not in seen_runs:
                 seen_runs.add(rid)
@@ -1341,13 +1671,18 @@ def load_unw_junc_stats(
     """Return ``(unw_runs_count, unw_ua_count)`` per ``(contig, start, end)`` from ``glcore logan --junc-unw``."""
     runs: dict[tuple[str, int, int], set[str]] = defaultdict(set)
     ua: dict[tuple[str, int, int], int] = defaultdict(int)
-    if not junc_unw_path.exists():
+    if not junc_unw_path.exists() or junc_unw_path.stat().st_size == 0:
         return {}, {}
     with open(junc_unw_path, "r") as fh:
-        for line in fh:
-            f = line.rstrip("\n").split("\t")
-            if len(f) < 7:
+        for lineno, line in enumerate(fh, 1):
+            if not line.endswith("\n"):
+                raise ValueError(f"Truncated unweighted junction TSV line {lineno} (missing newline) in {junc_unw_path}")
+            stripped = line.rstrip("\r\n")
+            if not stripped:
                 continue
+            f = stripped.split("\t")
+            if len(f) != 7:
+                raise ValueError(f"Malformed unweighted junction TSV line {lineno} in {junc_unw_path}: expected 7 columns")
             nua = int(f[5])
             if nua > 0:
                 k = (f[1], int(f[2]), int(f[3]))

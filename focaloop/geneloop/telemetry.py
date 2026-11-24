@@ -314,3 +314,213 @@ class ScratchMonitor:
         if self._t:
             self._t.join(timeout=30)
         self.sample()
+
+
+def _parse_mem_env_bytes(raw: str) -> int | None:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    mult = 1024 * 1024  # SLURM / Galaxy default unit is MiB
+    u = s[-1].upper()
+    if u in ("K", "M", "G", "T"):
+        s = s[:-1].strip()
+        mult = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}[u]
+    try:
+        val = float(s)
+    except ValueError:
+        return None
+    if val <= 0:
+        return None
+    return int(val * mult)
+
+
+def _walk_cgroup_dirs(root: Path, rel: str) -> list[Path]:
+    rel_clean = rel.strip("/")
+    out = [root]
+    if rel_clean:
+        cur = root
+        for part in rel_clean.split("/"):
+            if part:
+                cur = cur / part
+                out.append(cur)
+    return out
+
+
+def cgroup_and_scheduler_limits_bytes(
+    *,
+    cgroup_root: Path | None = None,
+    proc_cgroup: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int | None, int | None]:
+    """Return ``(effective_limit_bytes, effective_avail_bytes)`` across cgroup ancestors and scheduler env vars."""
+    cg_root = cgroup_root or Path("/sys/fs/cgroup")
+    proc_cg = proc_cgroup or Path("/proc/self/cgroup")
+    ev = os.environ if env is None else env
+    limits: list[int] = []
+    avails: list[int] = []
+
+    override_gib = ev.get("FOCALOOP_MAX_RAM_GIB", "").strip()
+    if override_gib:
+        try:
+            g = float(override_gib)
+            if g > 0:
+                b = int(g * (1024**3))
+                limits.append(b)
+                avails.append(b)
+        except ValueError:
+            pass
+
+    gal_mb = ev.get("GALAXY_MEMORY_MB", "").strip()
+    if gal_mb:
+        try:
+            mb = float(gal_mb)
+            if mb > 0:
+                b = int(mb * (1024**2))
+                limits.append(b)
+                avails.append(b)
+        except ValueError:
+            pass
+
+    slurm_node = _parse_mem_env_bytes(ev.get("SLURM_MEM_PER_NODE", ""))
+    if slurm_node is not None:
+        limits.append(slurm_node)
+        avails.append(slurm_node)
+
+    slurm_cpu = _parse_mem_env_bytes(ev.get("SLURM_MEM_PER_CPU", ""))
+    if slurm_cpu is not None:
+        cpus = 1
+        for k in ("GALAXY_SLOTS", "SLURM_CPUS_PER_TASK"):
+            v = ev.get(k, "").strip()
+            if v.isdigit() and int(v) > 0:
+                cpus = int(v)
+                break
+        b_cpu = slurm_cpu * cpus
+        limits.append(b_cpu)
+        avails.append(b_cpu)
+
+    try:
+        if proc_cg.is_file():
+            for line in proc_cg.read_text().splitlines():
+                parts = line.split(":", 2)
+                if len(parts) != 3:
+                    continue
+                _, subsys, rel = parts
+                if subsys == "":  # cgroup v2 unified hierarchy: walk root -> leaf
+                    for d in _walk_cgroup_dirs(cg_root, rel):
+                        dir_lim: int | None = None
+                        for fname in ("memory.max", "memory.high"):
+                            fp = d / fname
+                            if fp.is_file():
+                                txt = fp.read_text().strip()
+                                if txt and txt != "max" and txt.isdigit():
+                                    lv = int(txt)
+                                    if 0 < lv < (1 << 60):
+                                        dir_lim = lv if dir_lim is None else min(dir_lim, lv)
+                        if dir_lim is not None:
+                            limits.append(dir_lim)
+                            cur_p = d / "memory.current"
+                            cur_b = 0
+                            if cur_p.is_file():
+                                ctxt = cur_p.read_text().strip()
+                                if ctxt.isdigit():
+                                    cur_b = int(ctxt)
+                            avails.append(max(0, dir_lim - cur_b))
+                elif "memory" in subsys.split(","):  # cgroup v1 memory controller
+                    v1_root = cg_root / "memory"
+                    for d in _walk_cgroup_dirs(v1_root, rel):
+                        lim_p = d / "memory.limit_in_bytes"
+                        if lim_p.is_file():
+                            txt = lim_p.read_text().strip()
+                            if txt.isdigit():
+                                lv = int(txt)
+                                if 0 < lv < (1 << 60):
+                                    limits.append(lv)
+                                    use_p = d / "memory.usage_in_bytes"
+                                    cur_b = 0
+                                    if use_p.is_file():
+                                        utxt = use_p.read_text().strip()
+                                        if utxt.isdigit():
+                                            cur_b = int(utxt)
+                                    avails.append(max(0, lv - cur_b))
+    except OSError:
+        pass
+
+    eff_lim = min(limits) if limits else None
+    eff_av = min(avails) if avails else None
+    return eff_lim, eff_av
+
+
+def available_ram_bytes(
+    *,
+    meminfo_path: Path | None = None,
+    cgroup_root: Path | None = None,
+    proc_cgroup: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> int:
+    """Effective available RAM in bytes across `/proc/meminfo`, cgroup v1/v2 ancestors, and scheduler limits."""
+    host_avail: int | None = None
+    mi = meminfo_path or Path("/proc/meminfo")
+    try:
+        if mi.is_file():
+            for line in mi.read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    host_avail = int(line.split()[1]) * 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    if host_avail is None:
+        try:
+            host_avail = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_AVPHYS_PAGES"))
+        except (ValueError, OSError, AttributeError):
+            host_avail = 8 * (1024**3)
+    eff_lim, eff_av = cgroup_and_scheduler_limits_bytes(
+        cgroup_root=cgroup_root, proc_cgroup=proc_cgroup, env=env
+    )
+    cands = [host_avail]
+    if eff_lim is not None:
+        cands.append(eff_lim)
+    if eff_av is not None:
+        cands.append(eff_av)
+    return max(0, min(cands))
+
+
+def effective_total_ram_bytes(
+    *,
+    meminfo_path: Path | None = None,
+    cgroup_root: Path | None = None,
+    proc_cgroup: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> int:
+    """Effective total RAM ceiling in bytes across `/proc/meminfo`, cgroup v1/v2 ancestors, and scheduler limits."""
+    host_tot: int | None = None
+    mi = meminfo_path or Path("/proc/meminfo")
+    try:
+        if mi.is_file():
+            for line in mi.read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    host_tot = int(line.split()[1]) * 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    if host_tot is None:
+        try:
+            host_tot = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+        except (ValueError, OSError, AttributeError):
+            host_tot = 16 * (1024**3)
+    eff_lim, _ = cgroup_and_scheduler_limits_bytes(
+        cgroup_root=cgroup_root, proc_cgroup=proc_cgroup, env=env
+    )
+    return max(0, min(host_tot, eff_lim) if eff_lim is not None else host_tot)
+
+
+def samtools_sort_mem_arg(
+    sort_threads: int,
+    max_per_thread_mb: int = 1024,
+    avail_bytes: int | None = None,
+) -> str:
+    """Compute a cgroup-safe per-thread `-m` flag for `samtools sort` (uses <= 25% of available budget)."""
+    t = max(1, int(sort_threads))
+    eff_avail = available_ram_bytes() if avail_bytes is None else int(avail_bytes)
+    avail_mb = max(256, eff_avail // (1024 * 1024))
+    per_thread = max(64, min(int(max_per_thread_mb), int((avail_mb * 0.25) // t)))
+    return f"{per_thread}M"

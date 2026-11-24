@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 STOP_CODONS = frozenset({"TAA", "TAG", "TGA"})
-RESCUE_CODE_VERSION = "v2"
+RESCUE_CODE_VERSION = "v3"
 
 _CODON_TABLE = {
     "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
@@ -63,8 +63,8 @@ def scan_junction_gap_micro_exon(
 ) -> MicroExonHit | None:
     """Scan a single intron (5'->3' coding orientation) for a 3-27 nt micro-exon matching unaligned_query_nt.
 
-    Requires canonical upstream '...AG' acceptor and downstream 'GT...' (or 'GC...') donor,
-    plus absence of in-frame stop codons when len(query) is a multiple of 3.
+    Requires canonical upstream '...AG' acceptor and downstream 'GT...' (or 'GC...') donor.
+    Phase-aware in-frame stop validation is performed on the full spliced CDS in ``insert_microexons``.
     """
     q = unaligned_query_nt.upper()
     m = len(q)
@@ -79,8 +79,6 @@ def scan_junction_gap_micro_exon(
     # Leave >=12 bp 5' donor margin and >=4 bp 3' acceptor margin inside the intron
     max_pos = n - m - 4
     if allow_mismatches == 0:
-        if m % 3 == 0 and any(q[i : i + 3] in STOP_CODONS for i in range(0, m, 3)):
-            return None
         pos = u.find(q, 12)
         while 0 <= pos < max_pos:
             acceptor = u[pos - 2 : pos]
@@ -111,9 +109,6 @@ def scan_junction_gap_micro_exon(
         mismatches = sum(1 for a, b in zip(cand, q) if a != b)
         if mismatches > allow_mismatches:
             continue
-        if m % 3 == 0:
-            if any(cand[i : i + 3] in STOP_CODONS for i in range(0, m, 3)):
-                continue
         ident = (m - mismatches) / float(m)
         ppt = _pyrimidine_tract_fraction(u[max(0, pos - 22) : pos])
         donor_bonus = 0.05 if donor == "GT" else 0.0
@@ -294,6 +289,7 @@ def rescue_microexons_from_bam(
     min_clip: int = 5,
     max_reads_per_site: int = 200,
     max_workers: int = 1,
+    sided_votes_out: dict | None = None,
 ) -> dict:
     """Single-pass soft-clip split search per contig with exact random-fetch oracle parity.
 
@@ -338,6 +334,8 @@ def rescue_microexons_from_bam(
                 clips_by_ctg[ctg_r] = (d_by_h, a_by_h)
 
     votes: dict = {}
+    votes_right: dict = {}
+    votes_left: dict = {}
     handles = None if use_pool else [pysam.AlignmentFile(b) for b in bams_clean]
     try:
         n_h = len(bams_clean)
@@ -354,74 +352,118 @@ def rescue_microexons_from_bam(
             for a, b, s, strand in v:
                 if s < min_support or b - a < min_intron or strand not in "+-":
                     continue
+                raw_intr: str | None = None
                 intron_oriented: str | None = None
                 right_flank: str | None = None
                 left_flank: str | None = None
                 for hi in range(n_h):
                     d_list = d_by_h[hi].get(a)
                     if d_list:
-                        if intron_oriented is None:
+                        if raw_intr is None:
                             raw_intr = genome.fetch(ctg, a, b).upper()
                             intron_oriented = raw_intr if strand == "+" else _rc(raw_intr)
                         if right_flank is None:
                             right_flank = genome.fetch(ctg, b, b + 512).upper()
                         for clip in d_list:
-                            _vote_right(votes, ctg, a, b, intron_oriented, clip, right_flank, genome, strand)
+                            _vote_right(
+                                votes, ctg, a, b, intron_oriented, clip, right_flank, genome, strand,
+                                raw_intron=raw_intr, side_votes=votes_right,
+                            )
                     a_list = a_by_h[hi].get(b)
                     if a_list:
-                        if intron_oriented is None:
+                        if raw_intr is None:
                             raw_intr = genome.fetch(ctg, a, b).upper()
                             intron_oriented = raw_intr if strand == "+" else _rc(raw_intr)
                         if left_flank is None:
                             left_flank = genome.fetch(ctg, max(0, a - 512), a).upper()
                         for clip in a_list:
-                            _vote_left(votes, ctg, a, b, intron_oriented, clip, left_flank, genome, strand)
+                            _vote_left(
+                                votes, ctg, a, b, intron_oriented, clip, left_flank, genome, strand,
+                                raw_intron=raw_intr, side_votes=votes_left,
+                            )
     finally:
         if handles is not None:
             for h in handles:
                 h.close()
 
     out: dict = {}
-    for (ctg, a, b, ms, me), cnt in votes.items():
+    for k, cnt in votes.items():
+        ctg, a, b, ms, me = k
         if cnt >= 2:
             out.setdefault((ctg, a, b), []).append((ms, me, cnt))
+            if sided_votes_out is not None:
+                sided_votes_out[k] = (votes_right.get(k, 0), votes_left.get(k, 0))
     return out
 
 
-def _vote_right(votes, ctg, a, b, intron_oriented, clip, right_flank, genome, strand):
+def _vote_right(
+    votes, ctg, a, b, intron_oriented, clip, right_flank, genome, strand,
+    raw_intron: str | None = None, side_votes: dict | None = None,
+):
     """Genomic-left exon ends at a; clip = micro-exon (m nt) + start of exon at b."""
     L = len(clip)
     clip_u = clip.upper()
+    flank_tol = max(1, L // 10)
+    # Reject ordinary unspliced intronic overhangs or unsplit far-exon overhangs
+    intr_pref = raw_intron[:L] if (raw_intron is not None and L <= len(raw_intron)) else genome.fetch(ctg, a, a + L).upper()
+    if len(intr_pref) == L and _mismatches(clip_u, intr_pref) <= flank_tol:
+        return
+    far_pref = right_flank[:L] if L <= len(right_flank) else genome.fetch(ctg, b, b + L).upper()
+    if len(far_pref) == L and _mismatches(clip_u, far_pref) <= flank_tol:
+        return
+
     for m in range(3, min(27, L) + 1):
         rest = clip_u[m:]
         rlen = len(rest)
-        if rest:
-            ref = right_flank[:rlen] if rlen <= 512 else genome.fetch(ctg, b, b + rlen).upper()
-            if _mismatches(rest, ref) > max(1, rlen // 10):
-                continue
-        if rlen < 3 and L < 8:
+        min_rem = 8 if m == 3 else (6 if m <= 6 else 4)
+        if rlen < min_rem:
             continue
-        _scan_and_vote(votes, ctg, a, b, intron_oriented, clip_u[:m], strand)
+        ref = right_flank[:rlen] if rlen <= len(right_flank) else genome.fetch(ctg, b, b + rlen).upper()
+        if len(ref) < rlen:
+            continue
+        max_mm = 0 if rlen < 10 else (rlen // 10)
+        if _mismatches(rest, ref) > max_mm:
+            continue
+        _scan_and_vote(votes, ctg, a, b, intron_oriented, clip_u[:m], strand, side_votes=side_votes)
 
 
-def _vote_left(votes, ctg, a, b, intron_oriented, clip, left_flank, genome, strand):
+def _vote_left(
+    votes, ctg, a, b, intron_oriented, clip, left_flank, genome, strand,
+    raw_intron: str | None = None, side_votes: dict | None = None,
+):
     """Genomic-right exon starts at b; clip = end of exon at a + micro-exon (m nt)."""
     L = len(clip)
     clip_u = clip.upper()
     flank_len = len(left_flank)
+    flank_tol = max(1, L // 10)
+    # Reject ordinary unspliced intronic overhangs or unsplit far-exon overhangs
+    intr_suf = (
+        raw_intron[len(raw_intron) - L :]
+        if (raw_intron is not None and L <= len(raw_intron))
+        else genome.fetch(ctg, max(0, b - L), b).upper()
+    )
+    if len(intr_suf) == L and _mismatches(clip_u, intr_suf) <= flank_tol:
+        return
+    far_suf = left_flank[flank_len - L :] if L <= flank_len else genome.fetch(ctg, max(0, a - L), a).upper()
+    if len(far_suf) == L and _mismatches(clip_u, far_suf) <= flank_tol:
+        return
+
     for m in range(3, min(27, L) + 1):
         rest = clip_u[: L - m]
         rlen = len(rest)
-        if rest:
-            ref = left_flank[max(0, flank_len - rlen) :] if rlen <= 512 else genome.fetch(ctg, a - rlen, a).upper()
-            if _mismatches(rest, ref) > max(1, rlen // 10):
-                continue
-        if rlen < 3 and L < 8:
+        min_rem = 8 if m == 3 else (6 if m <= 6 else 4)
+        if rlen < min_rem:
             continue
-        _scan_and_vote(votes, ctg, a, b, intron_oriented, clip_u[L - m :], strand)
+        ref = left_flank[flank_len - rlen :] if rlen <= flank_len else genome.fetch(ctg, max(0, a - rlen), a).upper()
+        if len(ref) < rlen:
+            continue
+        max_mm = 0 if rlen < 10 else (rlen // 10)
+        if _mismatches(rest, ref) > max_mm:
+            continue
+        _scan_and_vote(votes, ctg, a, b, intron_oriented, clip_u[L - m :], strand, side_votes=side_votes)
 
 
-def _scan_and_vote(votes, ctg, a, b, intron_oriented, q, strand):
+def _scan_and_vote(votes, ctg, a, b, intron_oriented, q, strand, side_votes: dict | None = None):
     query = q if strand == "+" else _rc(q)
     hit = scan_junction_gap_micro_exon(intron_oriented, query, allow_mismatches=0)
     if hit is None:
@@ -433,6 +475,8 @@ def _scan_and_vote(votes, ctg, a, b, intron_oriented, q, strand):
         ms, me = a + (n - hit.intron_offset_end), a + (n - hit.intron_offset_start)
     k = (ctg, a, b, ms, me)
     votes[k] = votes.get(k, 0) + 1
+    if side_votes is not None:
+        side_votes[k] = side_votes.get(k, 0) + 1
 
 
 def merge_microexon_maps(*maps: dict) -> dict:

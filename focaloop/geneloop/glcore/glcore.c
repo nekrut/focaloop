@@ -52,6 +52,25 @@ static double now_s(void) {
 
 static void die(const char *m) { fprintf(stderr, "glcore: %s\n", m); exit(2); }
 
+static FILE *fopen_checked(const char *path, const char *mode, const char *ctx) {
+    FILE *f = fopen(path, mode);
+    if (!f) {
+        fprintf(stderr, "glcore: %s: cannot open '%s': %s\n", ctx, path ? path : "<null>", strerror(errno));
+        exit(2);
+    }
+    return f;
+}
+
+static void close_checked(FILE *f, const char *path, const char *ctx) {
+    int ferr = ferror(f);
+    int fl = fflush(f);
+    int fc = (f == stdout || f == stderr) ? 0 : fclose(f);
+    if (ferr || fl != 0 || fc != 0) {
+        fprintf(stderr, "glcore: %s: write/close error on '%s': %s\n", ctx, path ? path : "<stream>", strerror(errno));
+        exit(2);
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // Hash table: u64 key -> u32 value (open addressing, linear probe). EMPTY = all ones.
 // ------------------------------------------------------------------------------------------
@@ -182,6 +201,16 @@ static void read_fasta(const char *path, recs_t *out) {
     free(line); fclose(f);
 }
 
+static void free_fasta(recs_t *out) {
+    for (long i = 0; i < out->n; i++) {
+        free(out->r[i].name);
+        free(out->r[i].seq);
+    }
+    free(out->r);
+    out->r = NULL;
+    out->n = out->cap = 0;
+}
+
 // ------------------------------------------------------------------------------------------
 // syncmers: debug / test parity with the Python reference
 // ------------------------------------------------------------------------------------------
@@ -201,6 +230,10 @@ static int cmd_syncmers(int argc, char **argv) {
         scan_syncmers(line, ln, &sc, cb_print, NULL);
         puts("//");
     }
+    free(line);
+    free(sc.fs);
+    free(sc.rs);
+    close_checked(stdout, "stdout", "syncmers");
     return 0;
 }
 
@@ -222,12 +255,12 @@ static void cb_count(u64 key, long pos, void *ctx) {
 static int cmd_mult(int argc, char **argv) {
     const char *g = NULL, *c = NULL, *o = NULL; int threads = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-g")) g = argv[++i];
-        else if (!strcmp(argv[i], "-c")) c = argv[++i];
-        else if (!strcmp(argv[i], "-o")) o = argv[++i];
-        else if (!strcmp(argv[i], "-k")) K = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-s")) S = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-t")) threads = atoi(argv[++i]);
+        if (!strcmp(argv[i], "-g")) { if (i + 1 >= argc) die("mult: missing -g arg"); g = argv[++i]; }
+        else if (!strcmp(argv[i], "-c")) { if (i + 1 >= argc) die("mult: missing -c arg"); c = argv[++i]; }
+        else if (!strcmp(argv[i], "-o")) { if (i + 1 >= argc) die("mult: missing -o arg"); o = argv[++i]; }
+        else if (!strcmp(argv[i], "-k")) { if (i + 1 >= argc) die("mult: missing -k arg"); K = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "-s")) { if (i + 1 >= argc) die("mult: missing -s arg"); S = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "-t")) { if (i + 1 >= argc) die("mult: missing -t arg"); threads = atoi(argv[++i]); }
     }
     if (!g || !c || !o) die("mult: -g -c -o required");
 #ifdef _OPENMP
@@ -246,7 +279,9 @@ static int cmd_mult(int argc, char **argv) {
     const long CH = 8L << 20;
     long nchunks = 0;
     for (long i = 0; i < gen.n; i++) nchunks += (gen.r[i].len + CH - 1) / CH;
-    long *ci = malloc(nchunks * sizeof(long)), *cs = malloc(nchunks * sizeof(long));
+    long *ci = malloc((size_t)(nchunks ? nchunks : 1) * sizeof(long));
+    long *cs = malloc((size_t)(nchunks ? nchunks : 1) * sizeof(long));
+    if (!ci || !cs) die("mult: chunks oom");
     long q = 0;
     for (long i = 0; i < gen.n; i++) for (long s0 = 0; s0 < gen.r[i].len; s0 += CH) { ci[q] = i; cs[q] = s0; q++; }
     #pragma omp parallel
@@ -260,18 +295,24 @@ static int cmd_mult(int argc, char **argv) {
         }
         free(lsc.fs); free(lsc.rs);
     }
-    FILE *f = fopen(o, "wb"); if (!f) die("mult: open out");
+    FILE *f = fopen_checked(o, "wb", "mult");
     u64 hdr[4] = {0x31544c554d4c47ULL, (u64)K, (u64)S, (u64)h.n};
-    fwrite(hdr, sizeof(u64), 4, f);
+    if (fwrite(hdr, sizeof(u64), 4, f) != 4) die("mult: write header failed");
     long n1 = 0, n0 = 0, nm = 0;
     for (u64 i = 0; i < h.cap; i++) if (h.keys[i] != EMPTY_KEY) {
-        fwrite(&h.keys[i], sizeof(u64), 1, f); fwrite(&h.vals[i], sizeof(u32), 1, f);
+        if (fwrite(&h.keys[i], sizeof(u64), 1, f) != 1 || fwrite(&h.vals[i], sizeof(u32), 1, f) != 1)
+            die("mult: write entry failed");
         if (h.vals[i] == 1) n1++; else if (h.vals[i] == 0) n0++; else nm++;
     }
-    fclose(f);
+    close_checked(f, o, "mult");
     long gbp = 0; for (long i = 0; i < gen.n; i++) gbp += gen.r[i].len;
     fprintf(stderr, "{\"cand_records\":%ld,\"cand_syncmers\":%ld,\"unique\":%ld,\"multi\":%ld,\"absent\":%ld,\"genome_bp\":%ld,\"seconds\":%.2f}\n",
             cand.n, ncand, n1, nm, n0, gbp, now_s() - t0);
+    free(ci); free(cs);
+    free(sc.fs); free(sc.rs);
+    ht_free(&h);
+    free_fasta(&cand);
+    free_fasta(&gen);
     return 0;
 }
 
@@ -304,11 +345,11 @@ static void cb_activate(u64 key, long pos, void *ctx) {
 static int cmd_activate(int argc, char **argv) {
     const char *m = NULL, *c = NULL, *o = NULL, *l = NULL, *b = NULL;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-m")) m = argv[++i];
-        else if (!strcmp(argv[i], "-c")) c = argv[++i];
-        else if (!strcmp(argv[i], "-o")) o = argv[++i];
-        else if (!strcmp(argv[i], "-l")) l = argv[++i];
-        else if (!strcmp(argv[i], "-b")) b = argv[++i];
+        if (!strcmp(argv[i], "-m")) { if (i + 1 >= argc) die("activate: missing -m arg"); m = argv[++i]; }
+        else if (!strcmp(argv[i], "-c")) { if (i + 1 >= argc) die("activate: missing -c arg"); c = argv[++i]; }
+        else if (!strcmp(argv[i], "-o")) { if (i + 1 >= argc) die("activate: missing -o arg"); o = argv[++i]; }
+        else if (!strcmp(argv[i], "-l")) { if (i + 1 >= argc) die("activate: missing -l arg"); l = argv[++i]; }
+        else if (!strcmp(argv[i], "-b")) { if (i + 1 >= argc) die("activate: missing -b arg"); b = argv[++i]; }
     }
     if (!o) die("activate: -o required");
     htab mult = {0}, act; ht_init(&act, 1 << 16);
@@ -318,7 +359,7 @@ static int cmd_activate(int argc, char **argv) {
         load_table(m, &mult, &K, &S);
         // selected loci
         htab sel; ht_init(&sel, 1 << 12);
-        FILE *lf = fopen(l, "r"); if (!lf) die("activate: loci list");
+        FILE *lf = fopen_checked(l, "r", "activate");
         char *line = NULL; size_t lc = 0; ssize_t ln;
         while ((ln = getline(&line, &lc, lf)) > 0) {
             while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) line[--ln] = 0;
@@ -333,6 +374,8 @@ static int cmd_activate(int argc, char **argv) {
             if (ht_find(&sel, mix64(id + 1)) == sel.cap) continue;
             scan_syncmers(cand.r[i].seq, cand.r[i].len, &sc, cb_activate, &ac);
         }
+        ht_free(&sel);
+        free_fasta(&cand);
     }
     long locus_added = ac.added;
     if (b) {
@@ -340,14 +383,22 @@ static int cmd_activate(int argc, char **argv) {
         recs_t bait; read_fasta(b, &bait);
         ac.flag = 2; ac.added = 0;
         for (long i = 0; i < bait.n; i++) scan_syncmers(bait.r[i].seq, bait.r[i].len, &sc, cb_activate, &ac);
+        free_fasta(&bait);
     }
-    FILE *f = fopen(o, "wb"); if (!f) die("activate: out");
+    FILE *f = fopen_checked(o, "wb", "activate");
     u64 hdr[4] = {0x31544341ULL, (u64)K, (u64)S, (u64)act.n};
-    fwrite(hdr, sizeof(u64), 4, f);
-    for (u64 i = 0; i < act.cap; i++) if (act.keys[i] != EMPTY_KEY) { fwrite(&act.keys[i], 8, 1, f); fwrite(&act.vals[i], 4, 1, f); }
-    fclose(f);
+    if (fwrite(hdr, sizeof(u64), 4, f) != 4) die("activate: write header failed");
+    for (u64 i = 0; i < act.cap; i++) if (act.keys[i] != EMPTY_KEY) {
+        if (fwrite(&act.keys[i], 8, 1, f) != 1 || fwrite(&act.vals[i], 4, 1, f) != 1)
+            die("activate: write entry failed");
+    }
+    close_checked(f, o, "activate");
     fprintf(stderr, "{\"active\":%lu,\"locus_unique_hits\":%ld,\"locus_shared_skipped\":%ld,\"locus_absent\":%ld,\"bait_syncmers\":%ld}\n",
             (unsigned long)act.n, locus_added, ac.shared, ac.absent, ac.flag == 2 ? ac.added : 0L);
+    ht_free(&mult);
+    ht_free(&act);
+    free(sc.fs);
+    free(sc.rs);
     return 0;
 }
 
@@ -364,9 +415,12 @@ static void cb_read(u64 key, long pos, void *ctx) {
 }
 
 static int spot_key_len(const char *nm, int n) {
-    // strip trailing ".D" or "/D" (single digit segment id)
-    if (n >= 2 && (nm[n - 2] == '.' || nm[n - 2] == '/') && nm[n - 1] >= '0' && nm[n - 1] <= '9') return n - 2;
-    return n;
+    // key spots on the first whitespace-delimited token, then strip trailing ".D" or "/D"
+    int tok = 0;
+    while (tok < n && nm[tok] != ' ' && nm[tok] != '\t') tok++;
+    if (tok >= 4 && (nm[tok - 2] == '.' || nm[tok - 2] == '/') && nm[tok - 1] >= '0' && nm[tok - 1] <= '9')
+        return tok - 2;
+    return tok;
 }
 
 static void set_pipe(FILE *f) {
@@ -376,15 +430,19 @@ static void set_pipe(FILE *f) {
 }
 
 static int cmd_sieve(int argc, char **argv) {
-    const char *a = NULL, *o1 = NULL, *o2 = NULL, *st = NULL; int min_hits = 2, max_miss = 1, threads = 0;
+    const char *a = NULL, *o1 = NULL, *o2 = NULL, *st = NULL;
+    int min_hits = 2, max_miss = 1, threads = 0, allow_empty = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-a")) a = argv[++i];
-        else if (!strcmp(argv[i], "-1")) o1 = argv[++i];
-        else if (!strcmp(argv[i], "-2")) o2 = argv[++i];
-        else if (!strcmp(argv[i], "--stats")) st = argv[++i];
-        else if (!strcmp(argv[i], "--min-hits")) min_hits = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--max-miss")) max_miss = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-t")) threads = atoi(argv[++i]);
+        if (!strcmp(argv[i], "-a")) { if (i + 1 >= argc) die("sieve: missing -a arg"); a = argv[++i]; }
+        else if (!strcmp(argv[i], "-1")) { if (i + 1 >= argc) die("sieve: missing -1 arg"); o1 = argv[++i]; }
+        else if (!strcmp(argv[i], "-2")) { if (i + 1 >= argc) die("sieve: missing -2 arg"); o2 = argv[++i]; }
+        else if (!strcmp(argv[i], "--stats")) { if (i + 1 >= argc) die("sieve: missing --stats arg"); st = argv[++i]; }
+        else if (!strcmp(argv[i], "--min-hits")) { if (i + 1 >= argc) die("sieve: missing --min-hits arg"); min_hits = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--max-miss")) { if (i + 1 >= argc) die("sieve: missing --max-miss arg"); max_miss = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "-t")) { if (i + 1 >= argc) die("sieve: missing -t arg"); threads = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--allow-empty")) allow_empty = 1;
+        else if (!strcmp(argv[i], "-k") || !strcmp(argv[i], "-s")) { i++; }
+        else die("sieve: unknown flag");
     }
     if (!o1 || !o2) die("sieve: -1 -2 required");
 #ifdef _OPENMP
@@ -394,8 +452,8 @@ static int cmd_sieve(int argc, char **argv) {
     htab act = {0}; int have_act = 0;
     if (a) { int k, s; load_table(a, &act, &k, &s); K = k; S = s; have_act = act.n > 0; }
     double t0 = now_s();
-    FILE *f1 = fopen(o1, "w"); if (!f1) { perror(o1); exit(2); }
-    FILE *f2 = fopen(o2, "w"); if (!f2) { perror(o2); exit(2); }
+    FILE *f1 = fopen_checked(o1, "w", "sieve");
+    FILE *f2 = fopen_checked(o2, "w", "sieve");
     set_pipe(f1); set_pipe(f2);
     static char ob1[1 << 17], ob2[1 << 17];
     setvbuf(f1, ob1, _IOFBF, sizeof ob1); setvbuf(f2, ob2, _IOFBF, sizeof ob2);
@@ -406,33 +464,60 @@ static int cmd_sieve(int argc, char **argv) {
     fq_t *recs = malloc(BATCH * sizeof(fq_t));
     long *pa = malloc(BATCH * sizeof(long));  // pair first-record index
     u8 *dec = malloc(BATCH);
+    if (!arena || !recs || !pa || !dec) die("sieve: oom");
     char *line = NULL; size_t lc = 0; ssize_t ln;
     long pairs_in = 0, pairs_out = 0, drop_l = 0, drop_b = 0, orphans = 0, reads_in = 0, bases_in = 0;
     int eof = 0;
     fq_t carry; int have_carry = 0; char *carry_buf = NULL; long carry_len = 0;
-    while (!eof) {
+    const char *bad_msg = NULL;
+    while (!eof && !bad_msg) {
         long nrec = 0, used = 0;
         if (have_carry) {
             memcpy(arena, carry_buf, carry_len);
             recs[0] = carry; nrec = 1; used = carry_len; have_carry = 0;
         }
         while (nrec < BATCH) {
-            long start = used; fq_t r;
+            long start = used; fq_t r = {0, 0, 0, 0, 0};
             int ok = 1;
             for (int L = 0; L < 4; L++) {
                 ln = getline(&line, &lc, stdin);
-                if (ln <= 0) { ok = 0; eof = 1; break; }
+                if (ln <= 0) {
+                    if (L > 0) bad_msg = "sieve: truncated FASTQ record at EOF";
+                    ok = 0; eof = 1; break;
+                }
                 while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) line[--ln] = 0;
-                if (used + ln + 1 > arena_cap) { arena_cap *= 2; arena = realloc(arena, arena_cap); }
-                if (L == 0) { r.name = used; r.nlen = (int)ln; }
-                else if (L == 1) { r.seq = used; r.slen = (int)ln; }
-                else if (L == 2) { continue; }
-                else { r.qual = used; }
+                if (L == 0) {
+                    if (ln < 2 || line[0] != '@' || line[1] == ' ' || line[1] == '\t') {
+                        bad_msg = "sieve: malformed FASTQ header (expected '@')";
+                        ok = 0; break;
+                    }
+                    r.name = used; r.nlen = (int)ln;
+                } else if (L == 1) {
+                    r.seq = used; r.slen = (int)ln;
+                } else if (L == 2) {
+                    if (ln < 1 || line[0] != '+') {
+                        bad_msg = "sieve: malformed FASTQ separator (expected '+')";
+                        ok = 0; break;
+                    }
+                    continue;
+                } else {
+                    if ((int)ln != r.slen) {
+                        bad_msg = "sieve: FASTQ sequence and quality lengths differ";
+                        ok = 0; break;
+                    }
+                    r.qual = used;
+                }
+                if (used + ln + 1 > arena_cap) {
+                    while (used + ln + 1 > arena_cap) arena_cap *= 2;
+                    arena = realloc(arena, arena_cap);
+                    if (!arena) die("sieve: arena oom");
+                }
                 memcpy(arena + used, line, ln + 1); used += ln + 1;
             }
             if (!ok) { used = start; break; }
             recs[nrec++] = r; reads_in++; bases_in += r.slen;
         }
+        if (bad_msg) break;
         // pair consecutive records sharing a spot key
         long np = 0, i = 0;
         while (i < nrec) {
@@ -448,6 +533,7 @@ static int cmd_sieve(int argc, char **argv) {
                 carry = recs[i];
                 long beg = carry.name, end = carry.qual + carry.slen + 1;
                 carry_len = end - beg; carry_buf = realloc(carry_buf, carry_len);
+                if (!carry_buf) die("sieve: carry oom");
                 memcpy(carry_buf, arena + beg, carry_len);
                 carry.name -= beg; carry.seq -= beg; carry.qual -= beg;
                 have_carry = 1;
@@ -492,15 +578,30 @@ static int cmd_sieve(int argc, char **argv) {
         }
         fflush(f1); fflush(f2);
     }
-    fclose(f1); fclose(f2);
+    close_checked(f1, o1, "sieve");
+    close_checked(f2, o2, "sieve");
+    free(arena); free(recs); free(pa); free(dec); free(line); free(carry_buf);
+    if (bad_msg) {
+        ht_free(&act);
+        die(bad_msg);
+    }
+    if (reads_in > 0 && pairs_in <= 0) {
+        ht_free(&act);
+        die("sieve: zero paired reads found in input");
+    }
+    if (!allow_empty && pairs_in <= 0) {
+        ht_free(&act);
+        die("sieve: empty input (zero paired reads)");
+    }
     double el = now_s() - t0;
     struct rusage ru; getrusage(RUSAGE_SELF, &ru);
     double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec * 1e-6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec * 1e-6;
-    FILE *sf = st ? fopen(st, "w") : stderr;
+    FILE *sf = st ? fopen_checked(st, "w", "sieve") : stderr;
     fprintf(sf, "{\"pairs_in\":%ld,\"pairs_out\":%ld,\"pairs_dropped_locus\":%ld,\"pairs_dropped_bait\":%ld,"
                 "\"orphans\":%ld,\"reads_in\":%ld,\"bases_in\":%ld,\"active_syncmers\":%lu,\"wall_s\":%.3f,\"cpu_s\":%.3f}\n",
             pairs_in, pairs_out, drop_l, drop_b, orphans, reads_in, bases_in, (unsigned long)act.n, el, cpu);
-    if (st) fclose(sf);
+    if (st) close_checked(sf, st, "sieve");
+    ht_free(&act);
     return 0;
 }
 
@@ -534,25 +635,32 @@ static int cmd_junc(int argc, char **argv) {
     const char *jo = NULL, *bo = NULL, *st = NULL, *capf = NULL;
     int binsz = 1000, mapq_u = 10, min_anchor = 8, cap_u = -1, cap_s = -1, cap_c = -1, no_out = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--junc")) jo = argv[++i];
-        else if (!strcmp(argv[i], "--bins")) bo = argv[++i];
-        else if (!strcmp(argv[i], "--stats")) st = argv[++i];
-        else if (!strcmp(argv[i], "--bin")) binsz = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--mapq-uniq")) mapq_u = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--min-anchor")) min_anchor = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--cap-state")) capf = argv[++i];
-        else if (!strcmp(argv[i], "--cap-u")) cap_u = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--cap-s")) cap_s = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--cap-c")) cap_c = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--junc")) { if (i + 1 >= argc) die("junc: missing --junc arg"); jo = argv[++i]; }
+        else if (!strcmp(argv[i], "--bins")) { if (i + 1 >= argc) die("junc: missing --bins arg"); bo = argv[++i]; }
+        else if (!strcmp(argv[i], "--stats")) { if (i + 1 >= argc) die("junc: missing --stats arg"); st = argv[++i]; }
+        else if (!strcmp(argv[i], "--bin")) { if (i + 1 >= argc) die("junc: missing --bin arg"); binsz = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--mapq-uniq")) { if (i + 1 >= argc) die("junc: missing --mapq-uniq arg"); mapq_u = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--min-anchor")) { if (i + 1 >= argc) die("junc: missing --min-anchor arg"); min_anchor = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--cap-state")) { if (i + 1 >= argc) die("junc: missing --cap-state arg"); capf = argv[++i]; }
+        else if (!strcmp(argv[i], "--cap-u")) { if (i + 1 >= argc) die("junc: missing --cap-u arg"); cap_u = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--cap-s")) { if (i + 1 >= argc) die("junc: missing --cap-s arg"); cap_s = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--cap-c")) { if (i + 1 >= argc) die("junc: missing --cap-c arg"); cap_c = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--no-out")) no_out = 1;
+        else die("junc: unknown flag");
     }
+    if (binsz < 1) die("junc: --bin must be >= 1");
     int capping = capf != NULL;
     setvbuf(stdin, NULL, _IOFBF, 1 << 22);
     static char obuf[1 << 20]; setvbuf(stdout, obuf, _IOFBF, sizeof obuf);
     ctg_t *ctg = NULL; long nctg = 0, cctg = 0; u64 nbins = 0;
     u32 *bins = NULL; u16 *capv = NULL;
     jtab jt; jt_init(&jt, 1 << 16);
-    long nrec = 0, nprim = 0, nspl = 0, nout = 0, ncapped = 0, nuniq = 0;
+    int jcap = 256;
+    long *jA = malloc((size_t)jcap * sizeof(long));
+    long *jB = malloc((size_t)jcap * sizeof(long));
+    long *blks = malloc((size_t)(jcap + 2) * sizeof(long));
+    if (!jA || !jB || !blks) die("junc: cigar oom");
+    long nrec = 0, nmapped = 0, n_unk = 0, nprim = 0, nspl = 0, nout = 0, ncapped = 0, nuniq = 0;
     char *line = NULL; size_t lc = 0; ssize_t ln;
     int hdr_done = 0; long last_tid = -1; char *last_name = NULL; long *cidx = NULL; u64 cmask = 0;
     while ((ln = getline(&line, &lc, stdin)) > 0) {
@@ -560,27 +668,36 @@ static int cmd_junc(int argc, char **argv) {
             if (!strncmp(line, "@SQ", 3)) {
                 char *sn = strstr(line, "SN:"), *lnp = strstr(line, "LN:");
                 if (sn && lnp) {
-                    if (nctg == cctg) { cctg = cctg ? cctg * 2 : 256; ctg = realloc(ctg, cctg * sizeof(ctg_t)); }
-                    char *e = sn + 3; while (*e && *e != '\t' && *e != '\n') e++;
-                    ctg[nctg].name = strndup(sn + 3, e - sn - 3);
+                    if (nctg == cctg) {
+                        cctg = cctg ? cctg * 2 : 256;
+                        ctg = realloc(ctg, (size_t)cctg * sizeof(ctg_t));
+                        if (!ctg) die("junc: ctg oom");
+                    }
+                    char *e = sn + 3; while (*e && *e != '\t' && *e != '\n' && *e != '\r') e++;
+                    ctg[nctg].name = strndup(sn + 3, (size_t)(e - sn - 3));
+                    if (!ctg[nctg].name) die("junc: ctg name oom");
                     ctg[nctg].len = strtoull(lnp + 3, NULL, 10);
-                    ctg[nctg].off = nbins; nbins += ctg[nctg].len / binsz + 1; nctg++;
+                    ctg[nctg].off = nbins; nbins += ctg[nctg].len / (u64)binsz + 1; nctg++;
                 }
             }
-            if (!no_out) fwrite(line, 1, ln, stdout);
+            if (!no_out) fwrite(line, 1, (size_t)ln, stdout);
             continue;
         }
         if (!hdr_done) {
             hdr_done = 1;
             u64 cc = 64; while (cc < (u64)nctg * 2 + 2) cc <<= 1; cmask = cc - 1;
-            cidx = malloc(cc * sizeof(long)); for (u64 i = 0; i < cc; i++) cidx[i] = -1;
+            cidx = malloc((size_t)cc * sizeof(long));
+            if (!cidx) die("junc: cidx oom");
+            for (u64 i = 0; i < cc; i++) cidx[i] = -1;
             for (long t = 0; t < nctg; t++) {
                 u64 h = 1469598103934665603ULL; for (const char *q = ctg[t].name; *q; q++) { h ^= (u8)*q; h *= 1099511628211ULL; }
                 u64 i = mix64(h) & cmask; while (cidx[i] >= 0) i = (i + 1) & cmask; cidx[i] = t;
             }
             bins = calloc(nbins + 1, sizeof(u32));
+            if (!bins) die("junc: bins oom");
             if (capping) {
                 capv = calloc(3 * (nbins + 1), sizeof(u16));
+                if (!capv) die("junc: capv oom");
                 FILE *cf = fopen(capf, "rb");
                 if (cf) { size_t r = fread(capv, sizeof(u16), 3 * (nbins + 1), cf); (void)r; fclose(cf); }
             }
@@ -602,27 +719,41 @@ static int cmd_junc(int argc, char **argv) {
             while (cidx[i] >= 0) { if (!strcmp(ctg[cidx[i]].name, rname)) { tid = cidx[i]; break; } i = (i + 1) & cmask; }
             if (tid >= 0) { last_tid = tid; last_name = ctg[tid].name; }
         }
-        if (tid < 0) continue;
-        long pos = atol(f[3]) - 1; int mapq = atoi(f[4]);
+        if (tid < 0) { n_unk++; continue; }
+        nmapped++;
+        long pos = atol(f[3]) - 1;
+        if (pos < 0) pos = 0;
+        int mapq = atoi(f[4]);
         int primary = !(flag & 0x100) && !(flag & 0x800);
         // CIGAR walk: aligned block lengths between N operations, junction coordinates, soft clips
         const char *c = f[5]; long rp = pos; int clip5 = 0, clip3 = 0, spliced = 0, seen_m = 0;
-        long blks[130]; int nb = 0; long blk = 0; long jA[128], jB[128]; int nj = 0;
+        int nb = 0; long blk = 0; int nj = 0;
         while (*c && *c != '\t') {
             long n = 0; while (*c >= '0' && *c <= '9') { n = n * 10 + (*c - '0'); c++; }
+            if (!*c || *c == '\t') break;
             char op = *c++;
             switch (op) {
                 case 'M': case '=': case 'X': blk += n; rp += n; seen_m = 1; break;
                 case 'D': rp += n; break;
                 case 'N':
-                    if (nj < 128) { jA[nj] = rp; jB[nj] = rp + n; blks[nb++] = blk; nj++; }
+                    if (nj >= jcap) {
+                        jcap *= 2;
+                        jA = realloc(jA, (size_t)jcap * sizeof(long));
+                        jB = realloc(jB, (size_t)jcap * sizeof(long));
+                        blks = realloc(blks, (size_t)(jcap + 2) * sizeof(long));
+                        if (!jA || !jB || !blks) die("junc: cigar realloc oom");
+                    }
+                    jA[nj] = rp; jB[nj] = rp + n; blks[nb++] = blk; nj++;
                     blk = 0; rp += n; spliced = 1; break;
                 case 'S': if (!seen_m) clip5 = (int)n; else clip3 = (int)n; break;
                 default: break;
             }
         }
         blks[nb++] = blk;
-        u64 bin = ctg[tid].off + (u64)pos / binsz;
+        u64 ctg_nb = ctg[tid].len / (u64)binsz + 1;
+        u64 b_off = (u64)pos / (u64)binsz;
+        if (b_off >= ctg_nb) b_off = ctg_nb - 1;
+        u64 bin = ctg[tid].off + b_off;
         if (primary) {
             nprim++;
             if (mapq >= mapq_u) { bins[bin]++; nuniq++; }
@@ -632,7 +763,7 @@ static int cmd_junc(int argc, char **argv) {
                 int an = (int)(blks[q] < blks[q + 1] ? blks[q] : blks[q + 1]);
                 r->n_total++;
                 if (mapq >= mapq_u && an >= min_anchor) r->n_ua++;
-                if ((u32)an > r->max_anchor) r->max_anchor = an;
+                if ((u32)an > r->max_anchor) r->max_anchor = (u32)an;
             }
         }
         int emit = 1;
@@ -648,33 +779,49 @@ static int cmd_junc(int argc, char **argv) {
         }
         if (emit && !no_out) {
             for (int q = 0; q < nf - 1; q++) f[q + 1][-1] = '\t';
-            fwrite(line, 1, ln, stdout); nout++;
+            fwrite(line, 1, (size_t)ln, stdout); nout++;
         }
     }
-    fflush(stdout);
+    if (!no_out) close_checked(stdout, "stdout", "junc");
     if (jo) {
-        FILE *jf = fopen(jo, "w");
+        FILE *jf = fopen_checked(jo, "w", "junc");
         for (u64 i = 0; i < jt.cap; i++) if (jt.v[i].tid != UINT32_MAX) {
             jrec *r = &jt.v[i];
             fprintf(jf, "%s\t%u\t%u\t%u\t%u\t%u\n", ctg[r->tid].name, r->a, r->b, r->n_total, r->n_ua, r->max_anchor);
         }
-        fclose(jf);
+        close_checked(jf, jo, "junc");
     }
-    if (bo && bins) {
-        FILE *bf = fopen(bo, "w");
-        for (long i = 0; i < nctg; i++) {
-            u64 nb = ctg[i].len / binsz + 1;
-            for (u64 q = 0; q < nb; q++) { u32 v = bins[ctg[i].off + q]; if (v) fprintf(bf, "%s\t%lu\t%u\n", ctg[i].name, (unsigned long)q, v); }
+    if (bo) {
+        FILE *bf = fopen_checked(bo, "w", "junc");
+        if (bins) {
+            for (long i = 0; i < nctg; i++) {
+                u64 nb = ctg[i].len / (u64)binsz + 1;
+                for (u64 q = 0; q < nb; q++) { u32 v = bins[ctg[i].off + q]; if (v) fprintf(bf, "%s\t%lu\t%u\n", ctg[i].name, (unsigned long)q, v); }
+            }
         }
-        fclose(bf);
+        close_checked(bf, bo, "junc");
     }
     if (capping && capv) {
-        FILE *cf = fopen(capf, "wb"); fwrite(capv, sizeof(u16), 3 * (nbins + 1), cf); fclose(cf);
+        FILE *cf = fopen_checked(capf, "wb", "junc");
+        size_t nw = 3 * (size_t)(nbins + 1);
+        if (fwrite(capv, sizeof(u16), nw, cf) != nw) die("junc: cap-state write failed");
+        close_checked(cf, capf, "junc");
     }
-    FILE *sf = st ? fopen(st, "w") : stderr;
-    fprintf(sf, "{\"records\":%ld,\"primary\":%ld,\"primary_unique\":%ld,\"spliced_primary\":%ld,\"junctions\":%lu,\"out_records\":%ld,\"capped_records\":%ld}\n",
-            nrec, nprim, nuniq, nspl, (unsigned long)jt.n, nout, ncapped);
-    if (st) fclose(sf);
+    FILE *sf = st ? fopen_checked(st, "w", "junc") : stderr;
+    fprintf(sf, "{\"records\":%ld,\"mapped_records\":%ld,\"unknown_rname\":%ld,\"n_sq\":%ld,\"primary\":%ld,\"primary_unique\":%ld,\"spliced_primary\":%ld,\"junctions\":%lu,\"out_records\":%ld,\"capped_records\":%ld}\n",
+            nrec, nmapped, n_unk, nctg, nprim, nuniq, nspl, (unsigned long)jt.n, nout, ncapped);
+    if (st) close_checked(sf, st, "junc");
+
+    free(line);
+    free(jA);
+    free(jB);
+    free(blks);
+    free(cidx);
+    free(bins);
+    free(capv);
+    free(jt.v);
+    for (long i = 0; i < nctg; i++) free(ctg[i].name);
+    free(ctg);
     return 0;
 }
 
@@ -684,7 +831,7 @@ static int cmd_junc(int argc, char **argv) {
 typedef struct {
     u32 tid, rid, a, b;
     u32 n_total, n_ua, max_anchor;
-    double ka_total, ka_ua;
+    float ka_total, ka_ua;
 } lj_rec_t;
 
 typedef struct {
@@ -724,7 +871,7 @@ static void lj_grow(lj_tab_t *j) {
 }
 
 static lj_rec_t *lj_get(lj_tab_t *j, u32 tid, u32 rid, u32 a, u32 b) {
-    if ((j->n + 1) * 2 > j->cap) lj_grow(j);
+    if ((j->n + 1) * 4 > j->cap * 3) lj_grow(j);
     u64 i = lj_hash(tid, rid, a, b) & j->mask;
     while (1) {
         lj_rec_t *r = &j->v[i];
@@ -745,6 +892,8 @@ static lj_rec_t *lj_get(lj_tab_t *j, u32 tid, u32 rid, u32 a, u32 b) {
 typedef struct {
     char **names;
     size_t *lens;
+    u64 *n_recs;
+    u64 *n_mapped;
     int n, cap;
     int *ht;
     u64 hcap, hmask;
@@ -756,10 +905,12 @@ static void lj_runs_init(lj_runs_t *rs) {
     rs->cap = 64;
     rs->names = malloc((size_t)rs->cap * sizeof(char *));
     rs->lens = malloc((size_t)rs->cap * sizeof(size_t));
+    rs->n_recs = calloc((size_t)rs->cap, sizeof(u64));
+    rs->n_mapped = calloc((size_t)rs->cap, sizeof(u64));
     rs->hcap = 256;
     rs->hmask = rs->hcap - 1;
     rs->ht = malloc((size_t)rs->hcap * sizeof(int));
-    if (!rs->names || !rs->lens || !rs->ht) die("logan: runs oom");
+    if (!rs->names || !rs->lens || !rs->n_recs || !rs->n_mapped || !rs->ht) die("logan: runs oom");
     for (u64 i = 0; i < rs->hcap; i++) rs->ht[i] = -1;
     rs->last_id = -1;
 }
@@ -820,10 +971,15 @@ static int lj_get_run_id(lj_runs_t *rs, const char *qname) {
         slot = (slot + 1) & rs->hmask;
     }
     if (rs->n == rs->cap) {
+        int old_cap = rs->cap;
         rs->cap *= 2;
         rs->names = realloc(rs->names, (size_t)rs->cap * sizeof(char *));
         rs->lens = realloc(rs->lens, (size_t)rs->cap * sizeof(size_t));
-        if (!rs->names || !rs->lens) die("logan: runs realloc oom");
+        rs->n_recs = realloc(rs->n_recs, (size_t)rs->cap * sizeof(u64));
+        rs->n_mapped = realloc(rs->n_mapped, (size_t)rs->cap * sizeof(u64));
+        if (!rs->names || !rs->lens || !rs->n_recs || !rs->n_mapped) die("logan: runs realloc oom");
+        memset(rs->n_recs + old_cap, 0, (size_t)(rs->cap - old_cap) * sizeof(u64));
+        memset(rs->n_mapped + old_cap, 0, (size_t)(rs->cap - old_cap) * sizeof(u64));
     }
     int id = rs->n++;
     rs->names[id] = strndup(qname, len);
@@ -839,12 +995,56 @@ static void lj_runs_free(lj_runs_t *rs) {
     for (int i = 0; i < rs->n; i++) free(rs->names[i]);
     free(rs->names);
     free(rs->lens);
+    free(rs->n_recs);
+    free(rs->n_mapped);
     free(rs->ht);
+}
+
+static u64 lj_flush_table(lj_tab_t *jt, int keep_rid, FILE *jf_unw, FILE *jf_ka, const lj_runs_t *runs, const ctg_t *ctg) {
+    u64 emitted = 0;
+    lj_tab_t next;
+    u64 keep_est = (keep_rid >= 0) ? 1024 : 1024;
+    if (keep_rid >= 0) {
+        u64 nk = 0;
+        for (u64 i = 0; i < jt->cap; i++) {
+            if (jt->v[i].tid != UINT32_MAX && (int)jt->v[i].rid == keep_rid) nk++;
+        }
+        while (keep_est < nk * 2 + 16) keep_est <<= 1;
+    }
+    lj_init(&next, keep_est);
+    for (u64 i = 0; i < jt->cap; i++) {
+        if (jt->v[i].tid == UINT32_MAX) continue;
+        lj_rec_t *r = &jt->v[i];
+        if (keep_rid >= 0 && (int)r->rid == keep_rid) {
+            lj_rec_t *dst = lj_get(&next, r->tid, r->rid, r->a, r->b);
+            *dst = *r;
+            continue;
+        }
+        if (jf_unw) {
+            fprintf(jf_unw, "%s\t%s\t%u\t%u\t%u\t%u\t%u\n",
+                    runs->names[r->rid], ctg[r->tid].name, r->a, r->b,
+                    r->n_total, r->n_ua, r->max_anchor);
+        }
+        if (jf_ka) {
+            u64 kt = r->n_total ? (u64)floor((double)r->ka_total + 1e-6) : 0;
+            if (r->n_total && kt < 1) kt = 1;
+            u64 ku = r->n_ua ? (u64)floor((double)r->ka_ua + 1e-6) : 0;
+            if (r->n_ua && ku < 1) ku = 1;
+            fprintf(jf_ka, "%s\t%s\t%u\t%u\t%lu\t%lu\t%u\n",
+                    runs->names[r->rid], ctg[r->tid].name, r->a, r->b,
+                    (unsigned long)kt, (unsigned long)ku, r->max_anchor);
+        }
+        emitted++;
+    }
+    free(jt->v);
+    *jt = next;
+    return emitted;
 }
 
 static int cmd_logan(int argc, char **argv) {
     const char *j_unw = NULL, *j_ka = NULL, *b_unw = NULL, *b_ka = NULL, *st_p = NULL;
     int binsz = 1000, mapq_u = 10, min_anchor = 8, no_out = 0;
+    u64 max_junc_mem = 262144;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--junc-unw")) { if (i + 1 >= argc) die("logan: missing --junc-unw arg"); j_unw = argv[++i]; }
         else if (!strcmp(argv[i], "--junc-ka")) { if (i + 1 >= argc) die("logan: missing --junc-ka arg"); j_ka = argv[++i]; }
@@ -854,24 +1054,31 @@ static int cmd_logan(int argc, char **argv) {
         else if (!strcmp(argv[i], "--bin")) { if (i + 1 >= argc) die("logan: missing --bin arg"); binsz = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--mapq-uniq")) { if (i + 1 >= argc) die("logan: missing --mapq-uniq arg"); mapq_u = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--min-anchor")) { if (i + 1 >= argc) die("logan: missing --min-anchor arg"); min_anchor = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--flush-threshold")) { if (i + 1 >= argc) die("logan: missing --flush-threshold arg"); max_junc_mem = strtoull(argv[++i], NULL, 10); }
         else if (!strcmp(argv[i], "--no-out")) no_out = 1;
         else die("logan: unknown flag");
     }
     if (binsz < 1) die("logan: --bin must be >= 1");
+    if (max_junc_mem < 64) max_junc_mem = 64;
 
     double t0 = now_s();
     setvbuf(stdin, NULL, _IOFBF, 1 << 22);
     static char obuf[1 << 22];
     setvbuf(stdout, obuf, _IOFBF, sizeof(obuf));
 
+    FILE *jf_unw = j_unw ? fopen_checked(j_unw, "w", "logan") : NULL;
+    FILE *jf_ka = j_ka ? fopen_checked(j_ka, "w", "logan") : NULL;
+
     ctg_t *ctg = NULL;
     long nctg = 0, cctg = 0;
     u64 nbins = 0;
     u64 *bins_u = NULL, *bins_k = NULL;
     lj_tab_t jt;
-    lj_init(&jt, 1 << 18);
+    lj_init(&jt, 1 << 14);
     lj_runs_t runs;
     lj_runs_init(&runs);
+    u64 total_junc_emitted = 0;
+    int prev_rid = -1;
 
     int jcap = 512;
     long *jA = malloc((size_t)jcap * sizeof(long));
@@ -879,7 +1086,7 @@ static int cmd_logan(int argc, char **argv) {
     long *blks = malloc((size_t)(jcap + 2) * sizeof(long));
     if (!jA || !jB || !blks) die("logan: cigar oom");
 
-    long nrec = 0, nmapped = 0, nprim = 0, nuniq = 0, nspl = 0;
+    long nrec = 0, nmapped = 0, n_unk = 0, nprim = 0, nuniq = 0, nspl = 0;
     char *line = NULL;
     size_t lc = 0;
     ssize_t ln;
@@ -945,6 +1152,9 @@ static int cmd_logan(int argc, char **argv) {
         }
         if (nf < 11) continue;
         int flag = atoi(f[1]);
+        int is_secondary_or_supp = (flag & 0x100) || (flag & 0x800);
+        int rid = lj_get_run_id(&runs, f[0]);
+        if (!is_secondary_or_supp) runs.n_recs[rid]++;
         if (flag & 4) continue;  // drop unmapped BEFORE samtools sort
 
         const char *rname = f[2];
@@ -961,13 +1171,13 @@ static int cmd_logan(int argc, char **argv) {
             }
             if (tid >= 0) { last_tid = tid; last_name = ctg[tid].name; }
         }
-        if (tid < 0) continue;
+        if (tid < 0) { n_unk++; continue; }
 
         nmapped++;
         long pos = atol(f[3]) - 1;
         if (pos < 0) pos = 0;
         int mapq = atoi(f[4]);
-        int primary = !(flag & 0x100) && !(flag & 0x800);
+        int primary = !is_secondary_or_supp;
 
         double ka = 1.0;
         if (nf == 12) {
@@ -983,7 +1193,14 @@ static int cmd_logan(int argc, char **argv) {
         }
 
         if (primary) {
-            int rid = lj_get_run_id(&runs, f[0]);
+            runs.n_mapped[rid]++;
+            if (prev_rid >= 0 && rid != prev_rid && jt.n >= max_junc_mem) {
+                total_junc_emitted += lj_flush_table(&jt, rid, jf_unw, jf_ka, &runs, ctg);
+            } else if (jt.n >= max_junc_mem * 4) {
+                total_junc_emitted += lj_flush_table(&jt, rid, jf_unw, jf_ka, &runs, ctg);
+            }
+            prev_rid = rid;
+
             const char *c = f[5];
             long rp = pos;
             int spliced = 0;
@@ -1035,10 +1252,10 @@ static int cmd_logan(int argc, char **argv) {
                 lj_rec_t *r = lj_get(&jt, (u32)tid, (u32)rid, (u32)jA[q], (u32)jB[q]);
                 int an = (int)(blks[q] < blks[q + 1] ? blks[q] : blks[q + 1]);
                 r->n_total++;
-                r->ka_total += ka;
+                r->ka_total += (float)ka;
                 if (mapq >= mapq_u && an >= min_anchor) {
                     r->n_ua++;
-                    r->ka_ua += ka;
+                    r->ka_ua += (float)ka;
                 }
                 if ((u32)an > r->max_anchor) r->max_anchor = (u32)an;
             }
@@ -1049,43 +1266,14 @@ static int cmd_logan(int argc, char **argv) {
             fwrite(line, 1, (size_t)ln, stdout);
         }
     }
-    fflush(stdout);
+    if (!no_out) close_checked(stdout, "stdout", "logan");
 
-    if (j_unw) {
-        FILE *jf = fopen(j_unw, "w");
-        if (!jf) { perror(j_unw); exit(2); }
-        for (u64 i = 0; i < jt.cap; i++) {
-            if (jt.v[i].tid != UINT32_MAX) {
-                lj_rec_t *r = &jt.v[i];
-                fprintf(jf, "%s\t%s\t%u\t%u\t%u\t%u\t%u\n",
-                        runs.names[r->rid], ctg[r->tid].name, r->a, r->b,
-                        r->n_total, r->n_ua, r->max_anchor);
-            }
-        }
-        fclose(jf);
-    }
-
-    if (j_ka) {
-        FILE *jf = fopen(j_ka, "w");
-        if (!jf) { perror(j_ka); exit(2); }
-        for (u64 i = 0; i < jt.cap; i++) {
-            if (jt.v[i].tid != UINT32_MAX) {
-                lj_rec_t *r = &jt.v[i];
-                u64 kt = r->n_total ? (u64)floor(r->ka_total + 1e-6) : 0;
-                if (r->n_total && kt < 1) kt = 1;
-                u64 ku = r->n_ua ? (u64)floor(r->ka_ua + 1e-6) : 0;
-                if (r->n_ua && ku < 1) ku = 1;
-                fprintf(jf, "%s\t%s\t%u\t%u\t%lu\t%lu\t%u\n",
-                        runs.names[r->rid], ctg[r->tid].name, r->a, r->b,
-                        (unsigned long)kt, (unsigned long)ku, r->max_anchor);
-            }
-        }
-        fclose(jf);
-    }
+    total_junc_emitted += lj_flush_table(&jt, -1, jf_unw, jf_ka, &runs, ctg);
+    if (jf_unw) close_checked(jf_unw, j_unw, "logan");
+    if (jf_ka) close_checked(jf_ka, j_ka, "logan");
 
     if (b_unw) {
-        FILE *bf = fopen(b_unw, "w");
-        if (!bf) { perror(b_unw); exit(2); }
+        FILE *bf = fopen_checked(b_unw, "w", "logan");
         if (bins_u) {
             for (long i = 0; i < nctg; i++) {
                 u64 nb = ctg[i].len / (u64)binsz + 1;
@@ -1095,12 +1283,11 @@ static int cmd_logan(int argc, char **argv) {
                 }
             }
         }
-        fclose(bf);
+        close_checked(bf, b_unw, "logan");
     }
 
     if (b_ka) {
-        FILE *bf = fopen(b_ka, "w");
-        if (!bf) { perror(b_ka); exit(2); }
+        FILE *bf = fopen_checked(b_ka, "w", "logan");
         if (bins_k) {
             for (long i = 0; i < nctg; i++) {
                 u64 nb = ctg[i].len / (u64)binsz + 1;
@@ -1110,15 +1297,24 @@ static int cmd_logan(int argc, char **argv) {
                 }
             }
         }
-        fclose(bf);
+        close_checked(bf, b_ka, "logan");
     }
 
     double elapsed = now_s() - t0;
-    FILE *sf = st_p ? fopen(st_p, "w") : stderr;
-    if (!sf) { perror(st_p); exit(2); }
-    fprintf(sf, "{\"records\":%ld,\"mapped_records\":%ld,\"primary\":%ld,\"primary_unique\":%ld,\"spliced_primary\":%ld,\"per_run_junc_entries\":%lu,\"n_runs\":%d,\"elapsed_s\":%.3f}\n",
-            nrec, nmapped, nprim, nuniq, nspl, (unsigned long)jt.n, runs.n, elapsed);
-    if (st_p) fclose(sf);
+    FILE *sf = st_p ? fopen_checked(st_p, "w", "logan") : stderr;
+    fprintf(sf, "{\"records\":%ld,\"mapped_records\":%ld,\"unknown_rname\":%ld,\"n_sq\":%ld,\"primary\":%ld,\"primary_unique\":%ld,\"spliced_primary\":%ld,\"per_run_junc_entries\":%lu,\"n_runs\":%d,\"run_records\":{",
+            nrec, nmapped, n_unk, nctg, nprim, nuniq, nspl, (unsigned long)total_junc_emitted, runs.n);
+    for (int ri = 0; ri < runs.n; ri++) {
+        if (ri > 0) fputc(',', sf);
+        fprintf(sf, "\"%s\":%lu", runs.names[ri], (unsigned long)runs.n_recs[ri]);
+    }
+    fprintf(sf, "},\"run_mapped\":{");
+    for (int ri = 0; ri < runs.n; ri++) {
+        if (ri > 0) fputc(',', sf);
+        fprintf(sf, "\"%s\":%lu", runs.names[ri], (unsigned long)runs.n_mapped[ri]);
+    }
+    fprintf(sf, "},\"elapsed_s\":%.3f}\n", elapsed);
+    if (st_p) close_checked(sf, st_p, "logan");
 
     free(line);
     free(jA);

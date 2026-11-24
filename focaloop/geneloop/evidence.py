@@ -49,12 +49,20 @@ class JunctionStore:
         if not p.exists() or p.stat().st_size == 0:
             return out
         with open(p) as fh:
-            for line in fh:
-                f = line.rstrip("\n").split("\t")
-                if len(f) < 6:
+            for lineno, line in enumerate(fh, 1):
+                if not line.endswith("\n"):
+                    raise ValueError(f"Truncated junction TSV line {lineno} (missing newline) in {p}")
+                stripped = line.rstrip("\r\n")
+                if not stripped:
                     continue
-                k = (f[0], int(f[1]), int(f[2]))
+                f = stripped.split("\t")
+                if len(f) != 6:
+                    raise ValueError(f"Malformed junction TSV line {lineno} in {p}: expected 6 columns, got {len(f)}")
+                a_i, b_i = int(f[1]), int(f[2])
                 nt, nua, ma = int(f[3]), int(f[4]), int(f[5])
+                if a_i < 0 or b_i < a_i or nt < 0 or nua < 0 or ma < 0:
+                    raise ValueError(f"Invalid negative coordinate/count on line {lineno} in {p}")
+                k = (f[0], a_i, b_i)
                 d = self.ua.get(k)
                 if d is None:
                     d = {}
@@ -110,15 +118,28 @@ class BinStore:
     def ingest_tsv(self, path: str | Path) -> int:
         p = Path(path)
         n = 0
-        if not p.exists():
+        if not p.exists() or p.stat().st_size == 0:
             return 0
         with open(p) as fh:
-            for line in fh:
-                c, b, v = line.rstrip("\n").split("\t")
+            for lineno, line in enumerate(fh, 1):
+                if not line.endswith("\n"):
+                    raise ValueError(f"Truncated bin TSV line {lineno} (missing newline) in {p}")
+                stripped = line.rstrip("\r\n")
+                if not stripped:
+                    continue
+                parts = stripped.split("\t")
+                if len(parts) != 3:
+                    raise ValueError(f"Malformed bin TSV line {lineno} in {p}: expected 3 columns, got {len(parts)}")
+                c, b_s, v_s = parts
+                b_i = int(b_s)
+                v_i = int(v_s)
+                if b_i < 0 or v_i < 0:
+                    raise ValueError(f"Negative bin index or count on line {lineno} in {p}")
                 a = self.arr.get(c)
                 if a is not None:
-                    a[int(b)] += int(v)
-                    n += int(v)
+                    idx = min(b_i, len(a) - 1)
+                    a[idx] += v_i
+                    n += v_i
         self.total += n
         return n
 

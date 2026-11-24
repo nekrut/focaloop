@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import platform
 import shutil
+import stat
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,8 +27,8 @@ ORF_SCOUT_LIB = Path(
 class _COrfCandidate(ctypes.Structure):
     _fields_ = [
         ("contig_idx", ctypes.c_int),
-        ("start", ctypes.c_int),
-        ("end", ctypes.c_int),
+        ("start", ctypes.c_int64),
+        ("end", ctypes.c_int64),
         ("strand", ctypes.c_int),
         ("gc", ctypes.c_float),
         ("dinuc_entropy", ctypes.c_float),
@@ -60,22 +64,65 @@ def _pick_c_compiler() -> tuple[str, bool]:
     return "gcc", True
 
 
-def build_orf_scout(force: bool = False) -> Path:
-    """Compile ``orf_scout.c`` into ``liborf_scout_<platform>_<arch>.so/.dylib`` (portable ISA when requested)."""
-    import sys
-    import tempfile
+def _portable_isa_enabled() -> bool:
+    return os.environ.get("FOCALOOP_PORTABLE_ISA", "1").strip() != "0"
 
+
+def _ensure_private_cache_dir(base: Path) -> Path:
+    uid = os.getuid()
+    if base.is_symlink():
+        raise RuntimeError(f"Native cache path must not be a symlink: {base}")
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = os.lstat(base)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"Native cache path is not a regular directory: {base}")
+    if st.st_uid != uid:
+        raise RuntimeError(f"Native cache directory {base} is not owned by uid {uid}")
+    if (st.st_mode & 0o777) != 0o700:
+        os.chmod(base, 0o700)
+        st = os.lstat(base)
+        if (st.st_mode & 0o777) != 0o700:
+            raise RuntimeError(f"Native cache directory {base} has unsafe mode {oct(st.st_mode & 0o777)}")
+    return base
+
+
+def _secure_user_native_cache() -> Path:
+    uid = os.getuid()
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    root = Path(xdg) if xdg else Path(tempfile.gettempdir())
+    return _ensure_private_cache_dir(root / f"focaloop_geneloop_native_{uid}")
+
+
+def _verify_cached_artifact(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return False
+    if st.st_uid != os.getuid():
+        return False
+    if st.st_mode & 0o022:
+        return False
+    return True
+
+
+def build_orf_scout(force: bool = False) -> Path:
+    """Compile ``orf_scout.c`` into a portable owner-verified per-user cached shared library."""
     env_lib = os.environ.get("ORF_SCOUT_LIB")
     if env_lib and not force and Path(env_lib).is_file():
         return Path(env_lib)
 
     arch = platform.machine().lower()
+    portable = _portable_isa_enabled()
     portable_name = f"liborf_scout_{sys.platform}_{arch}{_LIB_EXT}"
-    if not force:
+    build_dir_env = os.environ.get("FOCALOOP_BUILD_NATIVE_DIR")
+
+    if not force and not build_dir_env and portable:
         for pre_dir in (
+            str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
             os.environ.get("FOCALOOP_NATIVE_CACHE"),
             os.environ.get("FOCALOOP_NATIVE_DIR"),
-            str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
             "/opt/focaloop/native_cache",
         ):
             if pre_dir:
@@ -84,36 +131,45 @@ def build_orf_scout(force: bool = False) -> Path:
                     if cand.is_file():
                         return cand
 
-    build_dir_env = os.environ.get("FOCALOOP_BUILD_NATIVE_DIR")
+    isa_flags: list[str] = []
+    if portable:
+        if arch in ("x86_64", "amd64"):
+            isa_flags = ["-msse4.2", "-mpopcnt"]
+    elif arch in ("x86_64", "amd64"):
+        isa_flags = ["-march=native"]
+
+    src_bytes = ORF_SCOUT_SRC.read_bytes()
+    key_blob = src_bytes + b"\0" + " ".join([sys.platform, arch, *isa_flags]).encode("utf-8")
+    digest = hashlib.sha256(key_blob).hexdigest()[:16]
+
     if build_dir_env:
         target = Path(build_dir_env) / portable_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cache_hit = not force and target.is_file() and target.stat().st_mtime >= ORF_SCOUT_SRC.stat().st_mtime
     elif env_lib:
         target = Path(env_lib)
-    elif os.access(ORF_SCOUT_LIB.parent, os.W_OK) or (not ORF_SCOUT_LIB.parent.exists() and os.access(ORF_SCOUT_LIB.parent.parent, os.W_OK)):
-        target = ORF_SCOUT_LIB
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cache_hit = not force and target.is_file() and target.stat().st_mtime >= ORF_SCOUT_SRC.stat().st_mtime
     else:
-        target = Path(tempfile.gettempdir()) / f"focaloop_geneloop_native_{os.getuid()}" / portable_name
+        cache_dir = _secure_user_native_cache()
+        target = cache_dir / f"liborf_scout_{sys.platform}_{arch}_{digest}{_LIB_EXT}"
+        cache_hit = not force and _verify_cached_artifact(target)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if force or not target.exists() or target.stat().st_mtime < ORF_SCOUT_SRC.stat().st_mtime:
+    if not cache_hit:
         cc, has_omp = _pick_c_compiler()
-        cmd = [cc, "-O3", "-shared", "-fPIC", "-Wall"]
+        cmd = [cc, "-O3", "-shared", "-fPIC", "-Wall", *isa_flags]
         if platform.system() == "Darwin" and "SDKROOT" not in os.environ and "clang" not in Path(cc).name:
             sdk = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True, check=False).stdout.strip()
             if sdk:
                 cmd += ["-isysroot", sdk]
-        if os.environ.get("FOCALOOP_PORTABLE_ISA") == "1":
-            if arch in ("x86_64", "amd64") and sys.platform != "darwin":
-                cmd.extend(["-msse4.2", "-mpopcnt"])
-        elif arch in ("x86_64", "amd64"):
-            cmd.append("-march=native")
         attempts = [["-fopenmp"], []] if has_omp else [[]]
-        tmp_out = target.parent / f".tmp_orf_scout_{os.getpid()}{_LIB_EXT}"
+        tmp_out = target.parent / f".tmp_orf_scout_{os.getpid()}_{digest}{_LIB_EXT}"
         last_err = ""
         try:
             for omp_f in attempts:
                 res = subprocess.run(cmd + omp_f + ["-o", str(tmp_out), str(ORF_SCOUT_SRC), "-lm"], capture_output=True, text=True)
                 if res.returncode == 0 and tmp_out.exists():
+                    os.chmod(tmp_out, 0o700)
                     os.replace(tmp_out, target)
                     return target
                 last_err = res.stderr
@@ -124,37 +180,39 @@ def build_orf_scout(force: bool = False) -> Path:
 
 
 _LOADED_LIB: ctypes.CDLL | None = None
+_LOADED_LIB_PATH: Path | None = None
 
 
 def _load_lib() -> ctypes.CDLL:
-    global _LOADED_LIB
+    global _LOADED_LIB, _LOADED_LIB_PATH
     lib_path = build_orf_scout()
-    if _LOADED_LIB is None:
+    if _LOADED_LIB is None or _LOADED_LIB_PATH != lib_path:
         lib = ctypes.CDLL(str(lib_path))
         lib.scan_orphan_orfs.argtypes = [
-            ctypes.c_int,                                  # n_contigs
-            ctypes.POINTER(ctypes.c_char_p),               # contig_seqs
-            ctypes.POINTER(ctypes.c_int),                  # contig_lens
-            ctypes.POINTER(ctypes.c_int),                  # n_excl_per_contig
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # excl_starts
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # excl_ends
-            ctypes.c_int,                                  # min_orf_bp
-            ctypes.c_float,                                # max_soft_n_frac
-            ctypes.c_float,                                # min_gc
-            ctypes.c_float,                                # max_gc
-            ctypes.c_float,                                # min_entropy
-            ctypes.c_int,                                  # sync_k
-            ctypes.c_int,                                  # sync_s
-            ctypes.c_int,                                  # max_sync_mult
-            ctypes.c_float,                                # min_lowcopy_frac
-            ctypes.c_int,                                  # threads
+            ctypes.c_int,                                    # n_contigs
+            ctypes.POINTER(ctypes.c_char_p),                 # contig_seqs
+            ctypes.POINTER(ctypes.c_int64),                  # contig_lens
+            ctypes.POINTER(ctypes.c_int),                    # n_excl_per_contig
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_int64)),  # excl_starts
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_int64)),  # excl_ends
+            ctypes.c_int,                                    # min_orf_bp
+            ctypes.c_float,                                  # max_soft_n_frac
+            ctypes.c_float,                                  # min_gc
+            ctypes.c_float,                                  # max_gc
+            ctypes.c_float,                                  # min_entropy
+            ctypes.c_int,                                    # sync_k
+            ctypes.c_int,                                    # sync_s
+            ctypes.c_int,                                    # max_sync_mult
+            ctypes.c_float,                                  # min_lowcopy_frac
+            ctypes.c_int,                                    # threads
             ctypes.POINTER(ctypes.POINTER(_COrfCandidate)),  # out_cands
-            ctypes.POINTER(ctypes.c_int),                  # out_count
+            ctypes.POINTER(ctypes.c_int),                    # out_count
         ]
         lib.scan_orphan_orfs.restype = ctypes.c_int
         lib.free_orf_candidates.argtypes = [ctypes.POINTER(_COrfCandidate)]
         lib.free_orf_candidates.restype = None
         _LOADED_LIB = lib
+        _LOADED_LIB_PATH = lib_path
     return _LOADED_LIB
 
 
@@ -174,6 +232,8 @@ def scan_orphan_orfs(
     threads: int = 24,
 ) -> list[OrphanOrf]:
     """Scan nuclear contigs outside ``excluded_by_contig`` for unique/low-copy long canonical ORFs."""
+    if min_orf_bp < 3:
+        raise ValueError(f"min_orf_bp must be >= 3, got {min_orf_bp}")
     lib = _load_lib()
     org = organelle_contigs or set()
     excl_map = excluded_by_contig or {}
@@ -183,29 +243,31 @@ def scan_orphan_orfs(
 
     n_contigs = len(contigs)
     seq_bytes: list[bytes] = []
-    lens = (ctypes.c_int * n_contigs)()
+    lens = (ctypes.c_int64 * n_contigs)()
     n_excl = (ctypes.c_int * n_contigs)()
-    excl_starts_arr = (ctypes.POINTER(ctypes.c_int) * n_contigs)()
-    excl_ends_arr = (ctypes.POINTER(ctypes.c_int) * n_contigs)()
+    excl_starts_arr = (ctypes.POINTER(ctypes.c_int64) * n_contigs)()
+    excl_ends_arr = (ctypes.POINTER(ctypes.c_int64) * n_contigs)()
     keep_alive: list[object] = []
 
     for i, ctg in enumerate(contigs):
-        L = genome.lengths[ctg]
+        L = int(genome.lengths[ctg])
+        if L < 0:
+            raise ValueError(f"Negative contig length {L} for contig {ctg!r}")
         s_b = genome.fetch(ctg, 0, L).encode("ascii")
         seq_bytes.append(s_b)
         lens[i] = len(s_b)
         ivs = merge_intervals(excl_map.get(ctg, []))
         n_excl[i] = len(ivs)
         if ivs:
-            sa = (ctypes.c_int * len(ivs))(*(a for a, _ in ivs))
-            ea = (ctypes.c_int * len(ivs))(*(b for _, b in ivs))
+            sa = (ctypes.c_int64 * len(ivs))(*(int(a) for a, _ in ivs))
+            ea = (ctypes.c_int64 * len(ivs))(*(int(b) for _, b in ivs))
             keep_alive.append(sa)
             keep_alive.append(ea)
             excl_starts_arr[i] = sa
             excl_ends_arr[i] = ea
         else:
-            excl_starts_arr[i] = ctypes.POINTER(ctypes.c_int)()
-            excl_ends_arr[i] = ctypes.POINTER(ctypes.c_int)()
+            excl_starts_arr[i] = ctypes.POINTER(ctypes.c_int64)()
+            excl_ends_arr[i] = ctypes.POINTER(ctypes.c_int64)()
 
     c_seqs = (ctypes.c_char_p * n_contigs)(*seq_bytes)
     out_ptr = ctypes.POINTER(_COrfCandidate)()

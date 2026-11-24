@@ -179,34 +179,81 @@ def prepare_genome(gate_id: str, gate_dir: Path, log: StageLog, gate: dict | Non
 
 _TAXID_RE = re.compile(r"\[taxid=(\d+)\]")
 _ORG_RE = re.compile(r"\[organism=([^\]]+)\]")
+_ODB_HEADER_TAX_RE = re.compile(r"^>?(\d+)(?:_(\d+))?:")
+
+
+def seed_protein_path(seed_dir: Path, gate: dict) -> Path:
+    """Canonical stripped-protein FASTA path under ``seed_dir`` (defaults blank ``exclude_genus`` to ``'target'``)."""
+    excl = str(gate.get("exclude_genus") or "").strip() or "target"
+    return Path(seed_dir) / f"proteins_no_{excl}.faa"
+
+
+def _normalize_exclude_taxid_tokens(raw_taxids: set[int] | set[str] | list | tuple | None, gate: dict | None = None) -> set[str]:
+    tokens: set[str] = set()
+    for item in (raw_taxids or set()):
+        s = str(item).strip()
+        if s:
+            tokens.add(s)
+            tokens.add(s.split("_", 1)[0])
+    if gate:
+        for key in ("taxid", "tax_id"):
+            if gate.get(key) is not None and str(gate[key]).strip():
+                t = str(gate[key]).strip()
+                tokens.add(t)
+                tokens.add(t.split("_", 1)[0])
+        extra = gate.get("exclude_taxids")
+        if isinstance(extra, str):
+            for tok in re.split(r"[\s,;]+", extra):
+                if tok.strip():
+                    tokens.add(tok.strip())
+                    tokens.add(tok.strip().split("_", 1)[0])
+        elif isinstance(extra, (list, tuple, set, frozenset)):
+            for tok in extra:
+                s = str(tok).strip()
+                if s:
+                    tokens.add(s)
+                    tokens.add(s.split("_", 1)[0])
+    return {x for x in tokens if x and x != "0" and not x.startswith("0_")}
 
 
 def strip_genus_proteins(
     src_faa_gz: Path,
     out_faa: Path,
     exclude_genus: str,
-    exclude_taxids: set[int],
+    exclude_taxids: set[int] | set[str],
     species_name: str,
     include_taxons: list[str] | None = None,
+    readthrough_ids_out: set[str] | None = None,
 ) -> dict:
-    """Filter protein bag to ``include_taxons`` (when given, matching EGAPx) and strip target genus/species.
+    """Filter protein bag to ``include_taxons`` and strip target genus/species/taxids (including OrthoDB ``TAXID_N:``).
 
     A header is removed if ANY of:
       * ``include_taxons`` is non-empty and none of the taxon names match ``[<taxon>]`` or ``[organism=<taxon>]``
-      * [organism=<genus> ...]                      (organism field genus match)
-      * [taxid=N] with N in exclude_taxids          (target species taxid)
-      * the token <genus> appears as a whole word anywhere in the header (conservative superset)
+      * ``[organism=<genus> ...]``                  (organism field genus match)
+      * ``[taxid=N]`` or ``>TAXID_M:`` in ``exclude_taxids``
+      * the token ``<genus>`` appears as a whole word anywhere in the header (when ``exclude_genus`` is non-empty)
       * the binomial species name appears anywhere in the header
     """
-    genus_word = re.compile(r"\b" + re.escape(exclude_genus) + r"\b")
-    species_l = species_name.lower()
+    excl_gen_clean = (exclude_genus or "").strip()
+    genus_word = re.compile(r"\b" + re.escape(excl_gen_clean) + r"\b") if excl_gen_clean else None
+    excl_tax_strs = _normalize_exclude_taxid_tokens(exclude_taxids)
+    species_l = (species_name or "").strip().lower()
     inc_re = (
         re.compile(r"\[(?:organism=)?(?:" + "|".join(re.escape(t) for t in include_taxons) + r")\]")
         if include_taxons
         else None
     )
     n_in = n_out = 0
-    by_reason = {"not_in_filter_taxons": 0, "organism_genus": 0, "taxid": 0, "header_genus_token": 0, "species_name": 0}
+    n_odb_tax_headers_kept = 0
+    n_org_headers_kept = 0
+    by_reason = {
+        "not_in_filter_taxons": 0,
+        "organism_genus": 0,
+        "taxid": 0,
+        "orthodb_taxid_prefix": 0,
+        "header_genus_token": 0,
+        "species_name": 0,
+    }
     removed_taxids: dict[str, int] = {}
     keep = False
     with _open_maybe_gz(src_faa_gz) as fin, open(out_faa, "w") as fout:
@@ -214,115 +261,129 @@ def strip_genus_proteins(
             if line.startswith(">"):
                 n_in += 1
                 hdr = line
+                tok0 = hdr[1:].split()[0] if hdr[1:].strip() else ""
+                acc = tok0.split("|")[1] if tok0.startswith("ref|") and "|" in tok0 else tok0
+                odb_m = _ODB_HEADER_TAX_RE.match(tok0)
+                odb_base_tax = odb_m.group(1) if odb_m else ""
+                odb_full_tax = tok0.split(":", 1)[0] if (odb_m and ":" in tok0) else ""
+
                 reason = None
                 if inc_re is not None and not inc_re.search(hdr):
                     reason = "not_in_filter_taxons"
                 m = _ORG_RE.search(hdr)
-                if reason is None and m and m.group(1).split()[0] == exclude_genus:
+                if reason is None and excl_gen_clean and m and m.group(1).split()[0].lower() == excl_gen_clean.lower():
                     reason = "organism_genus"
-                if reason is None:
+                if reason is None and excl_tax_strs:
                     tm = _TAXID_RE.search(hdr)
-                    if tm and int(tm.group(1)) in exclude_taxids:
+                    if tm and tm.group(1) in excl_tax_strs:
                         reason = "taxid"
-                if reason is None and genus_word.search(hdr):
+                    elif (odb_base_tax and odb_base_tax in excl_tax_strs) or (odb_full_tax and odb_full_tax in excl_tax_strs):
+                        reason = "orthodb_taxid_prefix"
+                if reason is None and genus_word is not None and genus_word.search(hdr):
                     reason = "header_genus_token"
                 if reason is None and species_l and species_l in hdr.lower():
                     reason = "species_name"
                 keep = reason is None
                 if keep:
                     n_out += 1
-                    acc = hdr[1:].split()[0]
-                    if acc.startswith("ref|"):
-                        acc = acc.split("|")[1]
+                    if odb_m:
+                        n_odb_tax_headers_kept += 1
+                    if m is not None:
+                        n_org_headers_kept += 1
+                    if readthrough_ids_out is not None and "readthrough" in hdr.lower() and acc:
+                        readthrough_ids_out.add(acc)
                     fout.write(">" + acc + "\n")
                 else:
                     by_reason[reason] += 1
                     if reason != "not_in_filter_taxons":
                         tm = _TAXID_RE.search(hdr)
-                        if tm:
-                            removed_taxids[tm.group(1)] = removed_taxids.get(tm.group(1), 0) + 1
+                        rec_tid = tm.group(1) if tm else (odb_base_tax or "")
+                        if rec_tid:
+                            removed_taxids[rec_tid] = removed_taxids.get(rec_tid, 0) + 1
             elif keep:
                 fout.write(line)
-    # Post-hoc verification pass: zero remaining headers may mention the genus.
-    residual = 0
+    # Post-hoc verification pass: zero remaining headers may match excluded genus or excluded TAXID_N: prefixes.
+    residual_genus = 0
+    residual_taxid = 0
     with open(out_faa) as fh:
         for line in fh:
-            if line.startswith(">") and genus_word.search(line):
-                residual += 1
+            if not line.startswith(">"):
+                continue
+            if genus_word is not None and genus_word.search(line):
+                residual_genus += 1
+            if excl_tax_strs:
+                tok = line[1:].strip().split()[0] if line[1:].strip() else ""
+                om = _ODB_HEADER_TAX_RE.match(tok)
+                if om:
+                    bt = om.group(1)
+                    ft = tok.split(":", 1)[0]
+                    if bt in excl_tax_strs or ft in excl_tax_strs:
+                        residual_taxid += 1
+    residual = residual_genus + residual_taxid
+    if residual > 0:
+        audit_status = "leakage_detected"
+    elif n_out > 0 and n_odb_tax_headers_kept > 0 and n_org_headers_kept == 0 and not excl_tax_strs:
+        audit_status = "unverifiable"
+    else:
+        audit_status = "verified_clean"
     return {
         "source": str(src_faa_gz),
-        "exclude_genus": exclude_genus,
-        "exclude_taxids": sorted(exclude_taxids),
+        "exclude_genus": excl_gen_clean,
+        "exclude_taxids": sorted(excl_tax_strs),
         "include_taxons": list(include_taxons) if include_taxons else None,
         "proteins_pre": n_in,
         "proteins_post": n_out,
         "proteins_removed": n_in - n_out,
         "removed_by_reason": by_reason,
         "removed_taxid_counts_top": dict(sorted(removed_taxids.items(), key=lambda kv: -kv[1])[:20]),
-        "residual_genus_headers_after_strip": residual,
+        "residual_genus_headers_after_strip": residual_genus,
+        "residual_taxid_headers_after_strip": residual_taxid,
+        "leakage_audit_status": audit_status,
     }
 
 
 def leakage_audit(gate: dict, gate_dir: Path, log: StageLog) -> dict:
     seed_dir = gate_dir / "seed"
     seed_dir.mkdir(parents=True, exist_ok=True)
-    excl_genus = gate.get("exclude_genus") or "target"
-    out_faa = seed_dir / f"proteins_no_{excl_genus}.faa"
+    out_faa = seed_protein_path(seed_dir, gate)
     audit_p = seed_dir / "leakage_audit.json"
-    if audit_p.exists() and out_faa.exists():
+    rt_json_p = seed_dir / "readthrough_targets.json"
+    if audit_p.exists() and out_faa.exists() and rt_json_p.exists():
         return json.loads(audit_p.read_text())
     t0 = time.time()
+    rt_ids: set[str] = set()
+    excl_tax_tokens = _normalize_exclude_taxid_tokens(None, gate=gate)
+    raw_excl_genus = str(gate.get("exclude_genus") or "").strip()
+    sp_clean = str(gate.get("species") or "").split(" (")[0].strip()
+
     if gate.get("proteins_path"):
         src = Path(gate["proteins_path"])
-        if gate.get("exclude_genus"):
-            res = strip_genus_proteins(
-                src,
-                out_faa,
-                gate["exclude_genus"],
-                {int(gate["taxid"])} if gate.get("taxid") is not None else set(),
-                gate.get("species", "").split(" (")[0],
-                include_taxons=gate.get("proteins_filter_taxons"),
-            )
-        else:
-            n_in = 0
-            with _open_maybe_gz(src) as fin, open(out_faa, "w") as fout:
-                for line in fin:
-                    if line.startswith(">"):
-                        n_in += 1
-                        acc = line[1:].split()[0]
-                        if acc.startswith("ref|"):
-                            acc = acc.split("|")[1]
-                        fout.write(">" + acc + "\n")
-                    else:
-                        fout.write(line)
-            res = {
-                "source": str(src),
-                "exclude_genus": "",
-                "exclude_taxids": [],
-                "include_taxons": None,
-                "proteins_pre": n_in,
-                "proteins_post": n_in,
-                "proteins_removed": 0,
-                "removed_by_reason": {},
-                "removed_taxid_counts_top": {},
-                "residual_genus_headers_after_strip": 0,
-            }
+        res = strip_genus_proteins(
+            src,
+            out_faa,
+            raw_excl_genus,
+            excl_tax_tokens,
+            sp_clean,
+            include_taxons=gate.get("proteins_filter_taxons"),
+            readthrough_ids_out=rt_ids,
+        )
     elif gate.get("egapx_protein_bin"):
         src = BUILD_ROOT / "proteins" / gate["egapx_protein_bin"]
         res = strip_genus_proteins(
             src,
             out_faa,
-            gate["exclude_genus"],
-            {int(gate["taxid"])},
-            gate["species"].split(" (")[0],
+            raw_excl_genus,
+            excl_tax_tokens,
+            sp_clean,
             include_taxons=gate.get("proteins_filter_taxons"),
+            readthrough_ids_out=rt_ids,
         )
     else:
         out_faa.write_text("")
         res = {
             "source": "",
-            "exclude_genus": excl_genus,
-            "exclude_taxids": [],
+            "exclude_genus": raw_excl_genus or "target",
+            "exclude_taxids": sorted(excl_tax_tokens),
             "include_taxons": None,
             "proteins_pre": 0,
             "proteins_post": 0,
@@ -330,13 +391,25 @@ def leakage_audit(gate: dict, gate_dir: Path, log: StageLog) -> dict:
             "removed_by_reason": {},
             "removed_taxid_counts_top": {},
             "residual_genus_headers_after_strip": 0,
+            "residual_taxid_headers_after_strip": 0,
+            "leakage_audit_status": "verified_clean",
         }
-    res["self_protein_leakage"] = res["residual_genus_headers_after_strip"] != 0
+    res["readthrough_proteins"] = len(rt_ids)
+    res["self_protein_leakage"] = (
+        res.get("residual_genus_headers_after_strip", 0) + res.get("residual_taxid_headers_after_strip", 0)
+    ) != 0
+    if res["self_protein_leakage"]:
+        raise RuntimeError(
+            f"Leakage audit detected residual excluded headers after stripping {out_faa}: {res}"
+        )
     res["tiberius_training_audit"] = tiberius_training_audit(gate)
     if out_faa.stat().st_size > 0:
         _run_faidx(out_faa)
     else:
         Path(str(out_faa) + ".fai").write_text("")
+    rt_tmp = rt_json_p.with_name(f".{rt_json_p.name}.tmp.{os.getpid()}")
+    rt_tmp.write_text(json.dumps({"ids": sorted(rt_ids)}, indent=1))
+    os.replace(rt_tmp, rt_json_p)
     audit_p.write_text(json.dumps(res, indent=1))
     rec = StageRecord(name="leakage_strip", wall_seconds=time.time() - t0, extra=res)
     log.append(rec)
@@ -497,6 +570,37 @@ def gpu_available() -> bool:
         return False
 
 
+def _safe_extract_tar(tf, dest: Path) -> None:
+    """Extract only validated regular files and directories strictly inside ``dest`` (rejecting traversal/links)."""
+    dest_resolved = dest.resolve()
+    members = tf.getmembers()
+    for m in members:
+        name = m.name or ""
+        if not name or name.startswith("/") or name.startswith("\\"):
+            raise ValueError(f"Unsafe absolute path in Tiberius weights archive: {name!r}")
+        rel_parts = Path(name).parts
+        if ".." in rel_parts:
+            raise ValueError(f"Unsafe parent-directory traversal in Tiberius weights archive: {name!r}")
+        if not (m.isfile() or m.isdir()):
+            raise ValueError(f"Disallowed non-regular tar member (symlink/hardlink/device) in weights archive: {name!r}")
+        target_p = (dest_resolved / name).resolve()
+        if target_p != dest_resolved and dest_resolved not in target_p.parents:
+            raise ValueError(f"Tar member escapes destination directory: {name!r}")
+    try:
+        tf.extractall(dest_resolved, members=members, filter="data")
+    except TypeError:
+        for m in members:
+            out_p = (dest_resolved / m.name).resolve()
+            if m.isdir():
+                out_p.mkdir(parents=True, exist_ok=True)
+            elif m.isfile():
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                src_fh = tf.extractfile(m)
+                if src_fh is not None:
+                    with src_fh, open(out_p, "wb") as dst_fh:
+                        shutil.copyfileobj(src_fh, dst_fh)
+
+
 def discover_tiberius_weights(model_cfg: str, explicit_weights: str | Path | None = None) -> Path | None:
     """Discover unpacked Tiberius model weights directory (with weights.h5 / model_config.json)."""
     cands_names = _TIBERIUS_WEIGHT_NAMES.get(model_cfg, (model_cfg, f"{model_cfg}_weights"))
@@ -519,8 +623,12 @@ def discover_tiberius_weights(model_cfg: str, explicit_weights: str | Path | Non
 
             if tarfile.is_tarfile(ep):
                 dest = Path(tempfile.mkdtemp(prefix="tiberius_weights_"))
-                with tarfile.open(ep, "r:*") as tf:
-                    tf.extractall(dest)
+                try:
+                    with tarfile.open(ep, "r:*") as tf:
+                        _safe_extract_tar(tf, dest)
+                except Exception:
+                    shutil.rmtree(dest, ignore_errors=True)
+                    raise
                 if _is_weights_dir(dest):
                     return dest.resolve()
                 for sub in dest.iterdir():
@@ -777,9 +885,16 @@ def run_tiberius(
         "input_sha256": input_sha256,
         **(extra_meta or {}),
     }
-    log.append(rec)
     if rc != 0:
+        log.append(rec)
         raise RuntimeError(f"Tiberius failed rc={rc}; see {out_dir}/tiberius_{tag}.log")
+    if not gtf.is_file():
+        log.append(rec)
+        raise RuntimeError(
+            f"Tiberius exited with rc=0 without writing output GTF {gtf}; check Tiberius runtime and {out_dir}/tiberius_{tag}.log"
+        )
+    rec.extra["n_transcripts"] = len(load_tiberius(gtf))
+    log.append(rec)
     done.write_text(json.dumps({**rec.to_dict(), "input_sha256": input_sha256}))
     return rec
 
@@ -840,11 +955,10 @@ def run_miniprot(
     g = Genome(genome_fa)
     genome_bp = sum(g.lengths.values())
     shards = _shard_contigs(g.lengths, max_shard_bp) if max_shard_bp > 0 else [list(g.lengths)]
-    extra_mp = []
-    if outs is not None:
-        extra_mp += ["--outs", str(outs)]
-    if outn is not None:
-        extra_mp += ["--outn", str(outn)]
+    eff_outs = float(outs) if outs is not None else 0.97
+    eff_outn = int(outn) if outn is not None else 1000
+    eff_intron = miniprot_max_intron(genome_bp)
+    extra_mp = ["--outs", str(eff_outs), "--outn", str(eff_outn)]
     eff_threads = len(cpuset) if cpuset else threads
     taskset_unavail = False
     if not Path(proteins).is_file() or Path(proteins).stat().st_size == 0 or genome_bp == 0:
@@ -858,7 +972,8 @@ def run_miniprot(
         mpi = out_dir / "genome.mpi"
         cmd1, unav1 = wrap_taskset_cmd(["miniprot", "-t", str(eff_threads), "-d", str(mpi), str(genome_fa)], cpuset)
         cmd2, unav2 = wrap_taskset_cmd(
-            ["miniprot", "-t", str(eff_threads), "-I", *extra_mp, "--gff-only", str(mpi), str(proteins)], cpuset
+            ["miniprot", "-t", str(eff_threads), "-G", str(eff_intron), *extra_mp, "--gff-only", str(mpi), str(proteins)],
+            cpuset,
         )
         taskset_unavail = unav1 or unav2
         with open(out_dir / "miniprot_index.log", "w") as lf:
@@ -871,14 +986,14 @@ def run_miniprot(
             "mode": "full",
             "n_shards": 1,
             "threads": eff_threads,
-            "outs": outs,
-            "outn": outn,
+            "outs": eff_outs,
+            "outn": eff_outn,
+            "eff_max_intron": eff_intron,
             "gff_bytes": gff.stat().st_size,
         }
         if taskset_unavail:
             rec.extra["taskset_unavailable"] = True
     else:
-        eff_intron = miniprot_max_intron(genome_bp)
         prepared_shards: list[tuple[int, Path, Path, Path, dict[str, tuple[str, int, int]]]] = []
         for si, ctgs in enumerate(shards):
             s_fa = out_dir / f"shard_{si}.fna"
@@ -940,7 +1055,7 @@ def run_miniprot(
         u_tot = sum(v[0] for v in shard_results.values())
         s_tot = sum(v[1] for v in shard_results.values())
         taskset_unavail = any(v[2] for v in shard_results.values())
-        n_kept = lift_miniprot_gff3(bucket_gffs, gff)
+        n_kept = lift_miniprot_gff3(bucket_gffs, gff, sec_ratio=eff_outs, max_rank=eff_outn)
         for s_gff, _ in bucket_gffs:
             s_gff.unlink(missing_ok=True)
         rec.cpu_user, rec.cpu_sys = u_tot, s_tot
@@ -949,6 +1064,8 @@ def run_miniprot(
             "n_shards": len(shards),
             "concurrent_shards": concurrent_shards,
             "max_shard_bp": max_shard_bp,
+            "outs": eff_outs,
+            "outn": eff_outn,
             "eff_max_intron": eff_intron,
             "n_kept_alignments": n_kept,
             "gff_bytes": gff.stat().st_size,
@@ -1133,96 +1250,132 @@ def lift_miniprot_gff3(
     sec_ratio: float = 0.7,
     max_rank: int = 30,
 ) -> int:
-    """Lift window-local miniprot GFF3 records back to parent contig coordinates and reconcile cross-bucket Ranks."""
-    raw_blocks: list[tuple[float, str, str, int, int, str, tuple[tuple[int, int], ...], list[list[str]]]] = []
-    seen_exact: set[tuple[str, str, str, tuple[tuple[int, int], ...]]] = set()
+    """Two-pass byte-offset lift of window-local miniprot GFF3 records back to parent contig coordinates."""
+    by_tid: dict[str, list[tuple[float, str, int, int, int, int]]] = {}
+    seen_exact: set[bytes] = set()
 
-    def _flush(cur_mrna: list[str] | None, cur_children: list[list[str]], wmap: dict[str, tuple[str, int, int]]) -> None:
-        if cur_mrna is None or not cur_children:
+    def _index_block(
+        b_idx: int,
+        byte_start: int,
+        byte_end: int,
+        cur_mrna: list[str] | None,
+        cds_local: list[tuple[int, int]],
+        has_children: bool,
+        wmap: dict[str, tuple[str, int, int]],
+    ) -> None:
+        if cur_mrna is None or not has_children or not cds_local:
             return
         wid = cur_mrna[0]
         if wid not in wmap:
             return
         ctg, w_off, _ = wmap[wid]
-        m_line = list(cur_mrna)
-        m_line[0] = ctg
-        m_s = int(m_line[3]) + w_off
-        m_e = int(m_line[4]) + w_off
-        m_line[3], m_line[4] = str(m_s), str(m_e)
-        score = float(m_line[5]) if m_line[5] != "." else 0.0
-        attrs = dict(kv.split("=", 1) for kv in m_line[8].split(";") if "=" in kv)
-        tgt_parts = attrs.get("Target", "").split()
-        if not tgt_parts:
+        m_s = int(cur_mrna[3]) + w_off
+        score = float(cur_mrna[5]) if cur_mrna[5] != "." else 0.0
+        strand = cur_mrna[6]
+        tid = ""
+        for kv in cur_mrna[8].split(";"):
+            if kv.startswith("Target="):
+                tparts = kv[7:].split()
+                if tparts:
+                    tid = tparts[0]
+                break
+        if not tid:
             return
-        tid = tgt_parts[0]
-        lifted_children: list[list[str]] = []
-        cds_coords: list[tuple[int, int]] = []
-        for ch in cur_children:
-            c_line = list(ch)
-            c_line[0] = ctg
-            cs = int(c_line[3]) + w_off
-            ce = int(c_line[4]) + w_off
-            c_line[3], c_line[4] = str(cs), str(ce)
-            lifted_children.append(c_line)
-            if c_line[2] in ("CDS", "stop_codon"):
-                cds_coords.append((cs - 1, ce))
-        if not cds_coords:
+        chain = merge_intervals((cs + w_off - 1, ce + w_off) for cs, ce in cds_local)
+        if not chain:
             return
-        chain = tuple(merge_intervals(cds_coords))
-        dedup_key = (ctg, m_line[6], tid, chain)
-        if dedup_key in seen_exact:
+        h = hashlib.blake2b(digest_size=12)
+        h.update(f"{ctg}\0{strand}\0{tid}\0".encode("utf-8"))
+        for a, b in chain:
+            h.update(f"{a}:{b},".encode("ascii"))
+        dkey = h.digest()
+        if dkey in seen_exact:
             return
-        seen_exact.add(dedup_key)
-        raw_blocks.append((score, tid, ctg, m_s, m_e, m_line[6], chain, [m_line] + lifted_children))
+        seen_exact.add(dkey)
+        by_tid.setdefault(tid, []).append((score, ctg, m_s, b_idx, byte_start, byte_end - byte_start))
 
-    for gff_p, wmap in bucket_gffs:
+    for b_idx, (gff_p, wmap) in enumerate(bucket_gffs):
         if not gff_p.exists():
             continue
         cur_m: list[str] | None = None
-        cur_c: list[list[str]] = []
-        with open(gff_p) as fh:
-            for line in fh:
-                if not line or line[0] == "#":
+        cds_loc: list[tuple[int, int]] = []
+        has_ch = False
+        blk_off = 0
+        with open(gff_p, "rb") as fh:
+            while True:
+                line_off = fh.tell()
+                raw = fh.readline()
+                if not raw:
+                    end_off = fh.tell()
+                    _index_block(b_idx, blk_off, end_off, cur_m, cds_loc, has_ch, wmap)
+                    break
+                if raw.startswith(b"#") or not raw.strip():
                     continue
-                f = line.rstrip("\n").split("\t")
+                line = raw.decode("utf-8", errors="replace")
+                f = line.rstrip("\r\n").split("\t")
                 if len(f) < 9:
                     continue
                 if f[2] == "mRNA":
-                    _flush(cur_m, cur_c, wmap)
+                    _index_block(b_idx, blk_off, line_off, cur_m, cds_loc, has_ch, wmap)
                     cur_m = f
-                    cur_c = []
+                    cds_loc = []
+                    has_ch = False
+                    blk_off = line_off
                 elif f[2] in ("CDS", "stop_codon", "exon"):
-                    cur_c.append(f)
-        _flush(cur_m, cur_c, wmap)
+                    has_ch = True
+                    if f[2] in ("CDS", "stop_codon"):
+                        cds_loc.append((int(f[3]), int(f[4])))
 
-    by_tid: dict[str, list] = {}
-    for blk in raw_blocks:
-        by_tid.setdefault(blk[1], []).append(blk)
-
-    kept: list[tuple[str, int, float, str, int, list[list[str]]]] = []
+    seen_exact.clear()
+    kept: list[tuple[str, int, float, str, int, int, int, int]] = []
     for tid, blks in by_tid.items():
-        blks.sort(key=lambda b: (-b[0], b[2], b[3]))
+        blks.sort(key=lambda b: (-b[0], b[1], b[2]))
         best = blks[0][0]
         rank = 0
-        for b in blks:
-            if best > 0 and b[0] < sec_ratio * best:
+        for score, ctg, m_s, b_idx, byte_off, byte_len in blks:
+            if best > 0 and score < sec_ratio * best:
                 continue
             rank += 1
             if rank > max_rank:
                 break
-            kept.append((b[2], b[3], -b[0], tid, rank, b[7]))
+            kept.append((ctg, m_s, -score, tid, rank, b_idx, byte_off, byte_len))
+    by_tid.clear()
 
     kept.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-    with open(out_gff, "w") as out:
-        out.write("##gff-version 3\n")
-        for idx, (_ctg, _ms, _neg_sc, _tid, rank, lines) in enumerate(kept, 1):
-            mp_id = f"MP{idx:06d}"
-            m_line = lines[0]
-            m_line[8] = _rewrite_attr(m_line[8], mp_id, rank, is_mrna=True)
-            out.write("\t".join(m_line) + "\n")
-            for c_line in lines[1:]:
-                c_line[8] = _rewrite_attr(c_line[8], mp_id, rank, is_mrna=False)
-                out.write("\t".join(c_line) + "\n")
+    open_handles: dict[int, Any] = {}
+    try:
+        with open(out_gff, "w") as out:
+            out.write("##gff-version 3\n")
+            for idx, (_ctg, _ms, _neg_sc, _tid, rank, b_idx, byte_off, byte_len) in enumerate(kept, 1):
+                fh_b = open_handles.get(b_idx)
+                if fh_b is None:
+                    fh_b = open(bucket_gffs[b_idx][0], "rb")
+                    open_handles[b_idx] = fh_b
+                wmap = bucket_gffs[b_idx][1]
+                fh_b.seek(byte_off)
+                chunk_txt = fh_b.read(byte_len).decode("utf-8", errors="replace")
+                mp_id = f"MP{idx:06d}"
+                for raw_ln in chunk_txt.splitlines():
+                    if not raw_ln or raw_ln[0] == "#":
+                        continue
+                    f = raw_ln.split("\t")
+                    if len(f) < 9:
+                        continue
+                    ft = f[2]
+                    if ft not in ("mRNA", "CDS", "stop_codon", "exon"):
+                        continue
+                    ctg_real, w_off, _ = wmap[f[0]]
+                    f[0] = ctg_real
+                    f[3] = str(int(f[3]) + w_off)
+                    f[4] = str(int(f[4]) + w_off)
+                    f[8] = _rewrite_attr(f[8], mp_id, rank, is_mrna=(ft == "mRNA"))
+                    out.write("\t".join(f) + "\n")
+    finally:
+        for fh_b in open_handles.values():
+            try:
+                fh_b.close()
+            except OSError:
+                pass
     return len(kept)
 
 
@@ -1521,7 +1674,7 @@ def run_targeted_miniprot(
             _acct("miniprot_index", w1, u1, s1)
             with open(b_gff, "w") as fo, open(out_dir / "miniprot.log", "a") as lf:
                 _, w2, u2, s2 = run_cmd(
-                    ["miniprot", "-t", str(threads), "-G", str(g_max), "--gff-only", str(b_mpi), str(b_faa)],
+                    ["miniprot", "-t", str(threads), "-G", str(g_max), "--outs", "0.7", "--outn", "30", "--gff-only", str(b_mpi), str(b_faa)],
                     stdout=fo,
                     stderr=lf,
                 )
@@ -1795,6 +1948,61 @@ def _ovl(a0: int, a1: int, b0: int, b1: int) -> bool:
     return a0 < b1 and b0 < a1
 
 
+def _cds_block_components(items: list, get_key, get_cds) -> list[list]:
+    """Group items by ``get_key(item)`` (contig, strand) and partition into CDS-block-overlapping components."""
+    by_cs: dict[tuple[str, str], list] = {}
+    for it in items:
+        by_cs.setdefault(get_key(it), []).append(it)
+    out: list[list] = []
+    for cs in sorted(by_cs):
+        grp = by_cs[cs]
+        m = len(grp)
+        if m == 1:
+            out.append(grp)
+            continue
+        parent = list(range(m))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(x: int, y: int) -> None:
+            rx, ry = _find(x), _find(y)
+            if rx != ry:
+                if rx < ry:
+                    parent[ry] = rx
+                else:
+                    parent[rx] = ry
+
+        ex_list: list[tuple[int, int, int]] = []
+        for idx, it in enumerate(grp):
+            for a, b in get_cds(it):
+                if b > a:
+                    ex_list.append((a, b, idx))
+        ex_list.sort(key=lambda r: (r[0], r[1]))
+        cur_end = -1
+        cur_owner = -1
+        for a, b, idx in ex_list:
+            if cur_owner >= 0 and a < cur_end:
+                _union(cur_owner, idx)
+                if b > cur_end:
+                    cur_end = b
+            else:
+                cur_owner = idx
+                cur_end = b
+        comps_by_root: dict[int, list] = {}
+        for idx, it in enumerate(grp):
+            comps_by_root.setdefault(_find(idx), []).append(it)
+        comps = sorted(
+            comps_by_root.values(),
+            key=lambda cl: (min(a for it in cl for a, _b in get_cds(it)), max(b for it in cl for _a, b in get_cds(it))),
+        )
+        out.extend(comps)
+    return out
+
+
 def partition_loci(
     tiberius: list[Transcript],
     hits: list[ProteinHit],
@@ -1803,29 +2011,14 @@ def partition_loci(
     min_hit_cov: float = 0.8,
     miniprot_only_min_quality: float = 0.6,
 ) -> list[Locus]:
-    """Cluster Tiberius CDS models and miniprot chains per strand; classify each cluster."""
-    items: list[tuple[str, str, int, int, str, object]] = []
+    """Cluster Tiberius CDS models and miniprot chains per strand by CDS-block overlap; classify each cluster."""
+    items: list[tuple[str, str, int, int, str, object, tuple[tuple[int, int], ...]]] = []
     for t in tiberius:
         if t.cds:
-            items.append((t.contig, t.strand, t.cds_start, t.cds_end, "T", t))
+            items.append((t.contig, t.strand, t.cds_start, t.cds_end, "T", t, tuple(sorted(t.cds))))
     for h in hits:
-        items.append((h.contig, h.strand, h.start, h.end, "M", h))
-    items.sort(key=lambda x: (x[0], x[1], x[2]))
-    clusters: list[list] = []
-    cur: list = []
-    cur_end = -1
-    key = None
-    for it in items:
-        k = (it[0], it[1])
-        if cur and (k != key or it[2] >= cur_end):
-            clusters.append(cur)
-            cur = []
-            cur_end = -1
-        cur.append(it)
-        key = k
-        cur_end = max(cur_end, it[3])
-    if cur:
-        clusters.append(cur)
+        items.append((h.contig, h.strand, h.start, h.end, "M", h, tuple(sorted(h.cds))))
+    clusters = _cds_block_components(items, lambda x: (x[0], x[1]), lambda x: x[6])
 
     loci: list[Locus] = []
     n = 0
@@ -1844,11 +2037,11 @@ def partition_loci(
             loci.append(Locus(f"L{n:06d}", ctg, strand, start, end, UNSETTLED, "miniprot_only", [], hs))
             continue
         # Split/fusion: a Tiberius model overlapping >=2 mutually non-overlapping good protein chains,
-        # or >=2 Tiberius models overlapped by one good protein chain.
+        # or >=2 Tiberius models overlapped by one good protein chain (by CDS-block overlap).
         category = None
         locked_model = None
         for t in tibs:
-            ov = [h for h in good_hits if _ovl(t.cds_start, t.cds_end, h.start, h.end)]
+            ov = [h for h in good_hits if interval_overlap_bp(t.cds, h.cds) > 0]
             ov.sort(key=lambda h: h.start)
             disjoint = 0
             last_end = -1
@@ -1859,7 +2052,7 @@ def partition_loci(
             if disjoint >= 2:
                 category = "split_fusion"
         for h in good_hits:
-            ov_t = [t for t in tibs if _ovl(t.cds_start, t.cds_end, h.start, h.end)]
+            ov_t = [t for t in tibs if interval_overlap_bp(t.cds, h.cds) > 0]
             if len(ov_t) >= 2:
                 category = "split_fusion"
         if category is None:
@@ -2363,22 +2556,7 @@ def safe_lock_miniprot_loci(
     tight = zoom_preset in ("tight_v1", "tight_v2")
 
     base_hits = [h for h in hits if (not tight or h.quality >= 0.50)]
-    sorted_hits = sorted(base_hits, key=lambda h: (h.contig, h.strand, h.start))
-    clusters: list[list[ProteinHit]] = []
-    cur: list[ProteinHit] = []
-    cur_end = -1
-    cur_key: tuple[str, str] | None = None
-    for h in sorted_hits:
-        k = (h.contig, h.strand)
-        if cur and (k != cur_key or h.start >= cur_end):
-            clusters.append(cur)
-            cur = []
-            cur_end = -1
-        cur.append(h)
-        cur_key = k
-        cur_end = max(cur_end, h.end)
-    if cur:
-        clusters.append(cur)
+    clusters = _cds_block_components(base_hits, lambda h: (h.contig, h.strand), lambda h: h.cds)
 
     strong_juncs_by_ctg = (
         scout_juncs.by_contig(min_support=5, canonical_only=True)
@@ -2547,7 +2725,16 @@ def filter_non_safelock_tiberius(
     safe_idx = LocusIndex([(l.contig, l.start, l.end, l) for l in safe_loci])
     kept: list[Transcript] = []
     for t in tiberius:
-        ov_safe = [l for l in safe_idx.overlapping(t.contig, t.cds_start, t.cds_end) if l.strand == t.strand]
+        ov_safe = [
+            l
+            for l in safe_idx.overlapping(t.contig, t.cds_start, t.cds_end)
+            if l.strand == t.strand
+            and (
+                getattr(l, "locked_model", None) is None
+                or not l.locked_model.cds
+                or interval_overlap_bp(t.cds, l.locked_model.cds) > 0
+            )
+        ]
         if not ov_safe:
             kept.append(t)
             continue
