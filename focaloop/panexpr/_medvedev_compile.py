@@ -162,7 +162,11 @@ def compile_c_lib(name: str, c_path: str | Path, extra_flags: list[str] | None =
         )
         out_path = cache_dir / lib_name
         if out_path.exists() and not verify_native_artifact(out_path, require_current_uid=True):
-            raise RuntimeError(f"Refusing untrusted cached shared library {out_path}")
+            lst = os.lstat(out_path)
+            if not stat.S_ISLNK(lst.st_mode) and stat.S_ISREG(lst.st_mode) and lst.st_uid == os.getuid():
+                out_path.unlink(missing_ok=True)
+            else:
+                raise RuntimeError(f"Refusing untrusted cached shared library {out_path}")
         if not out_path.exists():
             cc = find_c_compiler()
             if not cc:

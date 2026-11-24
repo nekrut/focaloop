@@ -1154,9 +1154,13 @@ def get_fast_lib() -> ctypes.CDLL | None:
             )
             so_path = cache_dir / fname
             if so_path.exists() and not verify_native_artifact(so_path, require_current_uid=True):
-                _TRIED = True
-                _LIB = None
-                return None
+                lst = os.lstat(so_path)
+                if not stat.S_ISLNK(lst.st_mode) and stat.S_ISREG(lst.st_mode) and lst.st_uid == os.getuid():
+                    so_path.unlink(missing_ok=True)
+                else:
+                    _TRIED = True
+                    _LIB = None
+                    return None
             if not so_path.exists():
                 cc = _find_compiler()
                 if not cc:

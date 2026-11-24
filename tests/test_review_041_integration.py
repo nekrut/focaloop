@@ -61,7 +61,7 @@ def test_cross_worktree_expressionloop_holdout_and_zoom_query_roundtrip(tmp_path
         reads=reads,
         read_ids=read_ids,
         contrast="condition:treated:control",
-        max_bytes_pct=0.35,
+        max_byte_fraction=0.35,
         out_de=tmp_path / "de.tsv",
         out_report=tmp_path / "rep.html",
         state_dir=state_dir,
@@ -81,35 +81,52 @@ def test_cross_worktree_expressionloop_holdout_and_zoom_query_roundtrip(tmp_path
     run_query(state_arc, "condition:treated:control", "human", q_tbl, q_ver, mode="contrast", out_report=q_rep)
     verdict = json.loads(q_ver.read_text(encoding="utf-8"))
     assert verdict.get("holdout_available") is True
-    assert verdict["holdout_estimate"] != verdict["discovery_estimate"]
+    qv = verdict["verdict"]
+    assert qv["holdout_estimate"] is not None
+    assert qv["holdout_estimate"] != qv["discovery_estimate"]
 
 
 def test_cross_worktree_variationloop_nocall_and_diploid_fst_roundtrip(tmp_path: pathlib.Path) -> None:
     """Verify VariationLoop (wt3) site_nocalls.parquet + diploid 2N-1 Fst round-trip cleanly into Query (wt1)."""
+    import random
+
     td = REPO_ROOT / "tools" / "focaloop" / "test-data" / "variationloop"
-    # Build a 2-contig reference where contig_b has zero reads in group_b2 so site_nocalls excludes uncovered sites
     ref_txt = (td / "ref_chr20_mini.fa").read_text(encoding="utf-8")
     seq_lines = [ln.strip() for ln in ref_txt.splitlines() if not ln.startswith(">")]
     seq_a = "".join(seq_lines)
+    rng = random.Random(42)
+    seq_extra = "".join(rng.choice("ACGT") for _ in range(3000))
     ref2 = tmp_path / "ref_two_ctg.fa"
-    ref2.write_text(f">chr20_mini\n{seq_a}\n>chr_extra\n{seq_a[:3000]}\n", encoding="utf-8")
+    ref2.write_text(f">chr20_mini\n{seq_a}\n>chr_extra\n{seq_extra}\n", encoding="utf-8")
 
-    # Mutate a read set on chr_extra for group A only while group B has reads ONLY on chr20_mini
-    mut_seq = list(seq_a[500:650])
+    # Variant on chr_extra covered ONLY in popA (popB has DP=0 on chr_extra -> recorded in site_nocalls.parquet)
+    rc_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+    mut_seq = list(seq_extra[1000:1150])
     mut_seq[70] = "T" if mut_seq[70] != "T" else "G"
     mut_r1 = "".join(mut_seq)
-    rc_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
-    mut_r2 = seq_a[750:900].translate(rc_map)[::-1]
+    mut_r2 = seq_extra[1250:1400].translate(rc_map)[::-1]
 
-    def _make_pair(prefix: str, include_extra: bool) -> tuple[pathlib.Path, pathlib.Path]:
+    def _make_wt_chr20_pair(prefix: str) -> tuple[pathlib.Path, pathlib.Path]:
+        wt1, wt2 = [], []
+        for idx_w, pos in enumerate(range(100, len(seq_a) - 450, 35)):
+            s1 = seq_a[pos : pos + 150]
+            s2 = seq_a[pos + 200 : pos + 350].translate(rc_map)[::-1]
+            wt1.append(f"@wt_{idx_w}/1\n{s1}\n+\n{'I'*150}\n".encode("ascii"))
+            wt2.append(f"@wt_{idx_w}/2\n{s2}\n+\n{'I'*150}\n".encode("ascii"))
+        p1 = tmp_path / f"{prefix}_R1.fastq.gz"
+        p2 = tmp_path / f"{prefix}_R2.fastq.gz"
+        with gzip.open(p1, "wb") as f1, gzip.open(p2, "wb") as f2:
+            f1.write(b"".join(wt1))
+            f2.write(b"".join(wt2))
+        return p1, p2
+
+    def _make_popa_pair(prefix: str) -> tuple[pathlib.Path, pathlib.Path]:
         r1_raw = gzip.decompress((td / "sample_R1.fastq.gz").read_bytes())
         r2_raw = gzip.decompress((td / "sample_R2.fastq.gz").read_bytes())
-        extra1 = []
-        extra2 = []
-        if include_extra:
-            for i in range(40):
-                extra1.append(f"@extra_{i}/1\n{mut_r1}\n+\n{'I'*len(mut_r1)}\n".encode("ascii"))
-                extra2.append(f"@extra_{i}/2\n{mut_r2}\n+\n{'I'*len(mut_r2)}\n".encode("ascii"))
+        extra1, extra2 = [], []
+        for i in range(40):
+            extra1.append(f"@extra_{i}/1\n{mut_r1}\n+\n{'I'*len(mut_r1)}\n".encode("ascii"))
+            extra2.append(f"@extra_{i}/2\n{mut_r2}\n+\n{'I'*len(mut_r2)}\n".encode("ascii"))
         p1 = tmp_path / f"{prefix}_R1.fastq.gz"
         p2 = tmp_path / f"{prefix}_R2.fastq.gz"
         with gzip.open(p1, "wb") as f1, gzip.open(p2, "wb") as f2:
@@ -117,10 +134,10 @@ def test_cross_worktree_variationloop_nocall_and_diploid_fst_roundtrip(tmp_path:
             f2.write(r2_raw + b"".join(extra2))
         return p1, p2
 
-    a1_r1, a1_r2 = _make_pair("a1", True)
-    a2_r1, a2_r2 = _make_pair("a2", True)
-    b1_r1, b1_r2 = _make_pair("b1", False)
-    b2_r1, b2_r2 = _make_pair("b2", False)
+    a1_r1, a1_r2 = _make_popa_pair("a1")
+    a2_r1, a2_r2 = _make_popa_pair("a2")
+    b1_r1, b1_r2 = _make_wt_chr20_pair("b1")
+    b2_r1, b2_r2 = _make_wt_chr20_pair("b2")
 
     groups_tsv = tmp_path / "groups.tsv"
     groups_tsv.write_text(
@@ -153,7 +170,9 @@ def test_cross_worktree_variationloop_nocall_and_diploid_fst_roundtrip(tmp_path:
     assert "chr_extra" not in fst_txt
     verdict = json.loads(q_ver.read_text(encoding="utf-8"))
     assert verdict.get("holdout_available") is False
-    assert verdict.get("confirmed") is False
+    assert verdict["verdict"]["confirmed"] is False
+    assert verdict["verdict"]["holdout_estimate"] is None
+    assert verdict["verdict"]["alpha_wealth_after"] == pytest.approx(0.045)
 
 
 def test_clean_git_archive_wheel_and_validate_blueprint(tmp_path: pathlib.Path) -> None:
