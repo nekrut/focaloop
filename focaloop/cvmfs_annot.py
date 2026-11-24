@@ -258,6 +258,9 @@ def _extract_gene_key(attrs: str, ctg: str, start: str, end: str) -> str:
     return f"{ctg}:{start}-{end}"
 
 
+_CIRCULAR_ATTR_RE = re.compile(r"(?:^|;)Is_circular=true(?:;|$)", re.IGNORECASE)
+
+
 def verify_annotation_against_fasta(
     annot_path: str | Path,
     fasta_lengths: dict[str, int],
@@ -275,6 +278,8 @@ def verify_annotation_against_fasta(
     all_genes: set[str] = set()
     matched_genes: set[str] = set()
     unmatched_contigs: set[str] = set()
+    circular_contigs: set[str] = set()
+    deferred_wrap: list[tuple[str, int, int, str]] = []
     n_features = 0
     n_matched_features = 0
     n_oob = 0
@@ -287,16 +292,19 @@ def verify_annotation_against_fasta(
             parts = line.rstrip("\r\n").split("\t")
             if len(parts) < 9:
                 continue
+            ctg = parts[0]
             ftype = parts[2]
+            attrs = parts[8]
+            if _CIRCULAR_ATTR_RE.search(attrs):
+                circular_contigs.add(ctg)
             if ftype not in ("exon", "CDS", "gene", "transcript", "mRNA"):
                 continue
-            ctg = parts[0]
             try:
                 start = int(parts[3])
                 end = int(parts[4])
             except ValueError:
                 continue
-            gid = _extract_gene_key(parts[8], ctg, parts[3], parts[4])
+            gid = _extract_gene_key(attrs, ctg, parts[3], parts[4])
 
             n_features += 1
             all_genes.add(gid)
@@ -304,13 +312,24 @@ def verify_annotation_against_fasta(
             if ctg_len is None:
                 unmatched_contigs.add(ctg)
                 continue
-            if start < 1 or end < start or end > ctg_len:
+            if 1 <= start <= ctg_len and start <= end <= ctg_len:
+                n_matched_features += 1
+                matched_genes.add(gid)
+            elif 1 <= start <= ctg_len and ctg_len < end <= 2 * ctg_len:
+                deferred_wrap.append((ctg, start, end, gid))
+            else:
                 n_oob += 1
                 if len(oob_examples) < 5:
                     oob_examples.append(f"{ctg}:{start}-{end} (contig_len={ctg_len})")
-                continue
+
+    for ctg, start, end, gid in deferred_wrap:
+        if ctg in circular_contigs:
             n_matched_features += 1
             matched_genes.add(gid)
+        else:
+            n_oob += 1
+            if len(oob_examples) < 5:
+                oob_examples.append(f"{ctg}:{start}-{end} (contig_len={fasta_lengths[ctg]})")
 
     denom = max(raw_total_genes or 0, len(all_genes))
     matched_frac = (len(matched_genes) / denom) if denom > 0 else 0.0
@@ -329,13 +348,41 @@ def verify_annotation_against_fasta(
     }
 
 
-def _url_exists(url: str, timeout: float = 15.0) -> bool:
+def _url_exists(url: str, timeout: float = 15.0, retries: int = 3) -> bool:
+    """Probe URL availability with retries; return False only on HTTP 404/410 and raise on network/5xx errors."""
     sess = _ipv4_session()
-    try:
-        r = sess.head(url, allow_redirects=True, timeout=timeout)
-        return r.status_code == 200
-    except Exception:
-        return False
+    n_tries = max(1, int(retries))
+    last_err: Exception | str = "unknown error"
+    for attempt in range(n_tries):
+        try:
+            r = sess.head(url, allow_redirects=True, timeout=timeout)
+            code = int(r.status_code)
+            if code == 200:
+                return True
+            if code in (404, 410):
+                return False
+            if code == 405:
+                rg = sess.get(url, headers={"Range": "bytes=0-0"}, stream=True, allow_redirects=True, timeout=timeout)
+                try:
+                    gcode = int(rg.status_code)
+                    if gcode in (200, 206):
+                        return True
+                    if gcode in (404, 410):
+                        return False
+                    last_err = f"HTTP {gcode}"
+                finally:
+                    rg.close()
+            else:
+                last_err = f"HTTP {code}"
+                if code not in (408, 429, 500, 502, 503, 504):
+                    raise RuntimeError(f"Unexpected HTTP {code} probing {url}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_err = exc
+        if attempt + 1 < n_tries:
+            time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(f"Failed probing {url} after {n_tries} attempt(s): {last_err}")
 
 
 def _try_ucsc_refseq_gtf(
@@ -392,19 +439,22 @@ def _try_ucsc_refseq_gtf(
     )
     chosen_track: str | None = None
     chosen_path: Path | None = None
-    for track_name, fname in tracks:
-        local_p = root / fname
-        if local_p.is_file() and local_p.stat().st_size > 0:
-            chosen_track = track_name
-            chosen_path = local_p
-            break
-        url = f"{_UCSC_GOLDENPATH}/{ucsc_dbkey}/bigZips/genes/{fname}"
-        if _url_exists(url):
-            _emit(log, f"Downloading UCSC {track_name} GTF for {ucsc_dbkey}...")
-            _download_file(url, local_p)
-            chosen_track = track_name
-            chosen_path = local_p
-            break
+    try:
+        for track_name, fname in tracks:
+            local_p = root / fname
+            if local_p.is_file() and local_p.stat().st_size > 0:
+                chosen_track = track_name
+                chosen_path = local_p
+                break
+            url = f"{_UCSC_GOLDENPATH}/{ucsc_dbkey}/bigZips/genes/{fname}"
+            if _url_exists(url):
+                _emit(log, f"Downloading UCSC {track_name} GTF for {ucsc_dbkey}...")
+                _download_file(url, local_p)
+                chosen_track = track_name
+                chosen_path = local_p
+                break
+    except Exception as exc:
+        return None, f"Failed probing or downloading UCSC gene GTF track for {ucsc_dbkey} ({exc})"
 
     if chosen_path is None or chosen_track is None:
         return None, f"No prebuilt UCSC gene GTF track is available for {ucsc_dbkey}"
@@ -754,7 +804,12 @@ def _try_ncbi_refseq_gff(
                     continue
 
                 gff_url = f"{base_url}/{asm_dir}_genomic.gff.gz"
-                if not _url_exists(gff_url):
+                try:
+                    gff_ok = _url_exists(gff_url)
+                except Exception as exc:
+                    diagnostics.append(f"{asm_dir} GFF3 probe failed ({exc})")
+                    continue
+                if not gff_ok:
                     diagnostics.append(
                         f"{asm_dir} matches contig lengths ({100.0 * bp_frac:.1f}% bp) but NCBI no longer hosts its GFF3 "
                         f"(latest annotated RefSeq revision is {latest_acc})"

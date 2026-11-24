@@ -138,43 +138,60 @@ def probe_logan_runs(
     }
 
 
-def fetch_ena_run_lengths(runs: Sequence[str], timeout: float = 30.0) -> dict[str, dict[str, Any]]:
-    """Query ENA filereport in chunks for read_count, base_count, library_layout, and fastq_bytes."""
-    clean_runs = [str(r).strip().upper() for r in runs if is_insdc_run(str(r))]
+def fetch_ena_run_lengths(
+    runs: Sequence[str],
+    timeout: float = 30.0,
+    *,
+    retries: int = 3,
+    max_workers: int = 8,
+) -> dict[str, dict[str, Any]]:
+    """Query ENA filereport one accession per request with retries/backoff and safe per-row parsing."""
+    clean_runs: list[str] = []
+    seen: set[str] = set()
+    for r in runs:
+        s = str(r or "").strip().upper()
+        if is_insdc_run(s) and s not in seen:
+            seen.add(s)
+            clean_runs.append(s)
     if not clean_runs:
         return {}
-    sess = _ipv4_session()
-    out: dict[str, dict[str, Any]] = {}
-    for i in range(0, len(clean_runs), 40):
-        chunk = ",".join(clean_runs[i : i + 40])
-        url = (
-            "https://www.ebi.ac.uk/ena/portal/api/filereport?"
-            f"accession={chunk}&result=read_run"
-            "&fields=run_accession,read_count,base_count,library_layout,fastq_bytes&format=tsv"
-        )
-        try:
-            r = sess.get(url, timeout=timeout)
-            r.raise_for_status()
-            lines = r.text.strip().splitlines()
-            if len(lines) < 2:
+
+    def _parse_rows(text: str) -> dict[str, dict[str, Any]]:
+        lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+        if len(lines) < 2:
+            raise ValueError("ENA filereport returned header-only or empty response")
+        hdr = [h.strip() for h in lines[0].split("\t")]
+        idx = {h: j for j, h in enumerate(hdr)}
+        if "run_accession" not in idx:
+            raise ValueError("ENA filereport missing run_accession header")
+        parsed_rows: dict[str, dict[str, Any]] = {}
+        for ln in lines[1:]:
+            p = ln.split("\t")
+            if len(p) <= idx["run_accession"]:
                 continue
-            hdr = lines[0].split("\t")
-            idx = {h: j for j, h in enumerate(hdr)}
-            for ln in lines[1:]:
-                p = ln.split("\t")
-                if len(p) < len(hdr):
-                    continue
+            try:
                 acc = p[idx["run_accession"]].strip().upper()
-                rc = int(p[idx["read_count"]] or 0)
-                bc = int(p[idx["base_count"]] or 0)
-                lay = p[idx["library_layout"]].strip().upper()
-                fb_raw = p[idx.get("fastq_bytes", -1)] if "fastq_bytes" in idx else ""
-                fb = sum(int(x) for x in fb_raw.split(";") if x.strip().isdigit())
+                if not is_insdc_run(acc):
+                    continue
+                rc_s = p[idx["read_count"]].strip() if "read_count" in idx and idx["read_count"] < len(p) else ""
+                bc_s = p[idx["base_count"]].strip() if "base_count" in idx and idx["base_count"] < len(p) else ""
+                rc = int(float(rc_s)) if rc_s else 0
+                bc = int(float(bc_s)) if bc_s else 0
+                lay = (
+                    p[idx["library_layout"]].strip().upper()
+                    if "library_layout" in idx and idx["library_layout"] < len(p)
+                    else ""
+                )
+                fb_raw = (
+                    p[idx["fastq_bytes"]].strip()
+                    if "fastq_bytes" in idx and idx["fastq_bytes"] < len(p)
+                    else ""
+                )
+                fb = sum(int(x) for x in re.split(r"[;,]", fb_raw) if x.strip().isdigit())
                 mates = 2 if lay == "PAIRED" else 1
                 read_len = (bc / (rc * mates)) if (rc > 0 and bc > 0) else 100.0
-                # Exact 31-mer occurrences emitted per sequenced fragment: mates * max(1, read_len - 30)
                 kmers_per_frag = max(2.0, mates * max(1.0, read_len - 30.0))
-                out[acc] = {
+                parsed_rows[acc] = {
                     "read_count": rc,
                     "base_count": bc,
                     "fastq_bytes": fb,
@@ -183,6 +200,36 @@ def fetch_ena_run_lengths(runs: Sequence[str], timeout: float = 30.0) -> dict[st
                     "read_len": round(read_len, 2),
                     "kmers_per_frag": round(kmers_per_frag, 2),
                 }
-        except Exception:
-            continue
+            except (ValueError, TypeError, IndexError):
+                continue
+        if not parsed_rows:
+            raise ValueError("ENA filereport contained zero valid run rows")
+        return parsed_rows
+
+    def _fetch_single(acc: str) -> dict[str, dict[str, Any]]:
+        url = (
+            "https://www.ebi.ac.uk/ena/portal/api/filereport?"
+            f"accession={acc}&result=read_run"
+            "&fields=run_accession,read_count,base_count,library_layout,fastq_bytes&format=tsv"
+        )
+        sess = _ipv4_session()
+        n_tries = max(1, int(retries))
+        for attempt in range(n_tries):
+            try:
+                r = sess.get(url, timeout=timeout)
+                r.raise_for_status()
+                return _parse_rows(r.text)
+            except Exception:
+                if attempt + 1 < n_tries:
+                    time.sleep(0.5 * (attempt + 1))
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    if len(clean_runs) == 1 or max_workers <= 1:
+        for acc in clean_runs:
+            out.update(_fetch_single(acc))
+    else:
+        with ThreadPoolExecutor(max_workers=min(int(max_workers), len(clean_runs))) as ex:
+            for item in ex.map(_fetch_single, clean_runs):
+                out.update(item)
     return out

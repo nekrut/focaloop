@@ -1,0 +1,8 @@
+include Makefile
+include README.md
+include pyproject.toml
+include LICENSE*
+recursive-include scripts *.py
+recursive-include blueprints *.yml *.md
+recursive-include focaloop *.c *.h *.fa *.fasta *.tsv *.json
+global-exclude __pycache__ *.py[cod] *.so *.dylib .DS_Store

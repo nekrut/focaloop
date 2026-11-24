@@ -11,15 +11,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import math
-from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Iterable, Literal, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 import pyarrow as pa
 
+from . import blueprint as _blueprint_mod
 from .state import (
     BAIT_PREFILTER_SCHEMA,
     FocaloopStateStore,
@@ -28,6 +30,28 @@ from .state import (
     RESIDUAL_SPANS_SCHEMA,
     STEERING_DECISION_SCHEMA,
 )
+
+
+def _install_packaged_blueprint_search_hook() -> None:
+    """Ensure ``blueprint_search_path`` checks packaged ``focaloop/blueprints`` and ``sys.prefix`` installs."""
+    if getattr(_blueprint_mod, "_packaged_search_installed", False):
+        return
+    orig_search = _blueprint_mod.blueprint_search_path
+
+    def _extended_blueprint_search_path() -> list[Path]:
+        paths = list(orig_search())
+        pkg_bp = Path(_blueprint_mod.__file__).resolve().parent / "blueprints"
+        prefix_bp = Path(sys.prefix) / "share" / "focaloop" / "blueprints"
+        for extra in (pkg_bp, prefix_bp):
+            if extra not in paths:
+                paths.append(extra)
+        return paths
+
+    _blueprint_mod.blueprint_search_path = _extended_blueprint_search_path  # type: ignore[assignment]
+    _blueprint_mod._packaged_search_installed = True  # type: ignore[attr-defined]
+
+
+_install_packaged_blueprint_search_hook()
 
 K_DEFAULT = 31
 _LUT = np.full(256, 255, dtype=np.uint8)
@@ -449,11 +473,12 @@ class QueryVerdict:
     hypothesis_spec: str
     discovery_estimate: float
     discovery_pvalue: float
-    holdout_estimate: float
-    holdout_pvalue: float
+    holdout_estimate: float | None
+    holdout_pvalue: float | None
     alpha_allocated: float
     alpha_wealth_after: float
     confirmed: bool
+    holdout_available: bool = True
 
 
 class HypothesisLedger:
@@ -473,16 +498,20 @@ class HypothesisLedger:
         self.discovery_reward = discovery_reward
         self.holdout_alpha = holdout_alpha
         self._query_index = 0
+        self._seen_specs: set[str] = set()
 
     @classmethod
     def from_store(cls, store: FocaloopStateStore, **kwargs: float) -> "HypothesisLedger":
-        """Resume alpha-wealth and query index from a persisted `hypothesis_ledger` table."""
+        """Resume alpha-wealth, query index, and previously evaluated specs from ``hypothesis_ledger``."""
         ledger = cls(**kwargs)
         if store.exists("hypothesis_ledger"):
             tbl = store.read("hypothesis_ledger")
             if tbl.num_rows:
                 ledger.wealth = float(tbl.column("alpha_wealth_after")[-1].as_py())
                 ledger._query_index = int(tbl.column("query_index")[-1].as_py())
+                for s in tbl.column("hypothesis_spec").to_pylist():
+                    if s:
+                        ledger._seen_specs.add(str(s).strip())
         return ledger
 
     def evaluate_query(
@@ -492,29 +521,73 @@ class HypothesisLedger:
         hypothesis_spec: str,
         discovery_estimate: float,
         discovery_pvalue: float,
-        holdout_estimate: float,
-        holdout_pvalue: float,
+        holdout_estimate: float | None = None,
+        holdout_pvalue: float | None = None,
         store: FocaloopStateStore | None = None,
+        *,
+        holdout_available: bool = True,
+        allow_reward: bool = True,
     ) -> QueryVerdict:
         self._query_index += 1
-        alpha_j = self.wealth * self.spend_fraction
-        same_sign = (discovery_estimate == 0.0 and holdout_estimate == 0.0) or (
-            (discovery_estimate > 0.0) == (holdout_estimate > 0.0)
+        spec_norm = str(hypothesis_spec or "").strip()
+        is_repeat_spec = bool(spec_norm and spec_norm in self._seen_specs)
+        is_primary_seed = (
+            str(query_id) == "q0001"
+            and str(actor).startswith("focaloop-")
+            and spec_norm.endswith((":primary_discovery", ":logan_primary"))
         )
-        confirmed = (discovery_pvalue <= alpha_j) and (holdout_pvalue <= self.holdout_alpha) and same_sign
-        self.wealth = self.wealth - alpha_j + (self.discovery_reward if confirmed else 0.0)
+
+        d_est = float(discovery_estimate) if discovery_estimate is not None and math.isfinite(float(discovery_estimate)) else 0.0
+        d_p = float(discovery_pvalue) if discovery_pvalue is not None and math.isfinite(float(discovery_pvalue)) else 1.0
+
+        eff_holdout_avail = bool(
+            holdout_available
+            and not is_primary_seed
+            and holdout_estimate is not None
+            and holdout_pvalue is not None
+            and math.isfinite(float(holdout_estimate))
+            and math.isfinite(float(holdout_pvalue))
+        )
+
+        if is_primary_seed:
+            alpha_j = 0.0
+            confirmed = False
+            reward = 0.0
+            h_est_out: float | None = None
+            h_p_out: float | None = None
+        else:
+            alpha_j = self.wealth * self.spend_fraction
+            if eff_holdout_avail:
+                h_est_f = float(holdout_estimate)  # type: ignore[arg-type]
+                h_p_f = float(holdout_pvalue)  # type: ignore[arg-type]
+                same_sign = (d_est > 0.0 and h_est_f > 0.0) or (d_est < 0.0 and h_est_f < 0.0)
+                confirmed = (d_p <= alpha_j) and (h_p_f <= self.holdout_alpha) and same_sign
+                reward = self.discovery_reward if (confirmed and allow_reward and not is_repeat_spec) else 0.0
+                h_est_out = h_est_f
+                h_p_out = h_p_f
+            else:
+                confirmed = False
+                reward = 0.0
+                h_est_out = None
+                h_p_out = None
+
+        if spec_norm:
+            self._seen_specs.add(spec_norm)
+        self.wealth = max(0.0, self.wealth - alpha_j + reward)
+
         verdict = QueryVerdict(
             query_index=self._query_index,
             query_id=query_id,
             actor=actor,
             hypothesis_spec=hypothesis_spec,
-            discovery_estimate=discovery_estimate,
-            discovery_pvalue=discovery_pvalue,
-            holdout_estimate=holdout_estimate,
-            holdout_pvalue=holdout_pvalue,
+            discovery_estimate=d_est,
+            discovery_pvalue=d_p,
+            holdout_estimate=h_est_out,
+            holdout_pvalue=h_p_out,
             alpha_allocated=alpha_j,
             alpha_wealth_after=self.wealth,
             confirmed=confirmed,
+            holdout_available=eff_holdout_avail,
         )
         if store is not None:
             store.append(

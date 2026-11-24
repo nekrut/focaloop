@@ -358,6 +358,12 @@ def cmd_query(a: argparse.Namespace) -> int:
         out = run_query(a.state_dir, contrast, actor, a.out_table, a.out_verdict, hypothesis, a.mode,
                         a.out_state_archive, a.alpha_budget, a.n_perm, out_report=a.out_report, design=design,
                         subset=subset)
+    except MemoryError:
+        _err(
+            "Out of memory while executing Focaloop Query. "
+            "Restrict the query region with --hypothesis (for example, chr1:1-1000000) or filter samples with --subset."
+        )
+        return EXIT_ERROR
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         _err(str(exc))
         return EXIT_ERROR

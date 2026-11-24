@@ -110,7 +110,7 @@ focaloop query
     </outputs>
     <tests>
         <test expect_num_outputs="4">
-            <param name="state" value="panexpr_state.tar.zst" ftype="data"/>
+            <param name="state" value="expressionloop_query_state.focaloop.tar.zst" ftype="data"/>
             <conditional name="query_type">
                 <param name="mode" value="contrast"/>
                 <param name="factor_name" value="condition"/>
@@ -119,12 +119,50 @@ focaloop query
             </conditional>
             <output name="query_table">
                 <assert_contents>
-                    <has_text text="g2"/>
+                    <has_text text="gene_id&#9;gene_name&#9;ortholog_bridge&#9;baseMean&#9;log2FoldChange&#9;lfcSE_deseq2&#9;lfcSE_total"/>
+                    <has_text text="GENE_00"/>
+                    <has_text text="DE_after_zoom"/>
                 </assert_contents>
             </output>
             <output name="verdict">
                 <assert_contents>
                     <has_text text="&quot;new_bytes&quot;: 0"/>
+                    <has_text text="&quot;zoom_evidence_used&quot;: true"/>
+                    <has_text text="&quot;holdout_available&quot;: true"/>
+                </assert_contents>
+            </output>
+            <output name="query_report">
+                <assert_contents>
+                    <has_text text="0 B"/>
+                    <has_text text="ExpressionLoop"/>
+                </assert_contents>
+            </output>
+            <output name="state_out">
+                <assert_contents>
+                    <has_size min="1000"/>
+                </assert_contents>
+            </output>
+        </test>
+        <test expect_num_outputs="4">
+            <param name="state" value="expressionloop_query_state.focaloop.tar.zst" ftype="data"/>
+            <conditional name="query_type">
+                <param name="mode" value="contrast"/>
+                <param name="factor_name" value="condition"/>
+                <param name="group_a" value="treated"/>
+                <param name="group_b" value="control"/>
+                <param name="subset" value="batch=b1"/>
+                <param name="hypothesis" value="GENE_01"/>
+            </conditional>
+            <output name="query_table">
+                <assert_contents>
+                    <has_text text="GENE_01"/>
+                    <has_text text="log2FoldChange"/>
+                </assert_contents>
+            </output>
+            <output name="verdict">
+                <assert_contents>
+                    <has_text text="&quot;n_samples_queried&quot;: 4"/>
+                    <has_text text="&quot;top_gene&quot;: &quot;GENE_01&quot;"/>
                 </assert_contents>
             </output>
             <output name="query_report">
@@ -139,21 +177,57 @@ focaloop query
             </output>
         </test>
         <test expect_num_outputs="4">
-            <param name="state" value="malariavar_state.tar.zst" ftype="data"/>
+            <param name="state" value="variationloop_query_state.focaloop.tar.zst" ftype="data"/>
             <conditional name="query_type">
                 <param name="mode" value="fst"/>
-                <param name="group_column" value="site"/>
-                <param name="group_a" value="Ghana"/>
-                <param name="group_b" value="Mali"/>
+                <param name="group_column" value="group"/>
+                <param name="group_a" value="north"/>
+                <param name="group_b" value="south"/>
             </conditional>
             <output name="query_table">
                 <assert_contents>
-                    <has_text text="hudson_fst"/>
+                    <has_text text="chrom&#9;pos&#9;ref&#9;alt&#9;af_group_a&#9;af_group_b&#9;delta_af&#9;hudson_fst&#9;n_group_a&#9;n_group_b"/>
+                    <has_text text="chr1&#9;1000"/>
                 </assert_contents>
             </output>
             <output name="verdict">
                 <assert_contents>
                     <has_text text="&quot;mode&quot;: &quot;fst&quot;"/>
+                    <has_text text="&quot;holdout_available&quot;: false"/>
+                    <has_text text="&quot;confirmed&quot;: false"/>
+                </assert_contents>
+            </output>
+            <output name="query_report">
+                <assert_contents>
+                    <has_text text="0 B"/>
+                    <has_text text="VariationLoop"/>
+                </assert_contents>
+            </output>
+            <output name="state_out">
+                <assert_contents>
+                    <has_size min="1000"/>
+                </assert_contents>
+            </output>
+        </test>
+        <test expect_num_outputs="4">
+            <param name="state" value="variationloop_query_state.focaloop.tar.zst" ftype="data"/>
+            <conditional name="query_type">
+                <param name="mode" value="fst"/>
+                <param name="group_column" value="group"/>
+                <param name="group_a" value="north"/>
+                <param name="group_b" value="south"/>
+                <param name="subset" value="year=2024"/>
+                <param name="hypothesis" value="chr1:500-1500"/>
+            </conditional>
+            <output name="query_table">
+                <assert_contents>
+                    <has_text text="chr1&#9;1000"/>
+                </assert_contents>
+            </output>
+            <output name="verdict">
+                <assert_contents>
+                    <has_text text="&quot;informative_sites&quot;: 1"/>
+                    <has_text text="&quot;new_bytes&quot;: 0"/>
                 </assert_contents>
             </output>
             <output name="query_report">
@@ -178,8 +252,8 @@ focaloop query
 **How it works**
 
 1. **Offline recomputation:** Focaloop Query opens your saved state bundle (which already contains per-sample counts, variant calls, and sample group metadata) and disables network access completely while running your requested comparison.
-2. **Full-table computation:** For an **ExpressionLoop** state, it refits the differential expression model across every gene for your new group comparison (and optional updated design formula). For a multi-group **VariationLoop** state, it computes per-site alternate allele frequencies, allele-frequency differences, and Hudson Fst across your two selected sub-cohorts plus a permutation p-value.
-3. **Holdout check and cumulative error budget:** Running many follow-up tests on the same dataset increases the risk of false positives. Focaloop guards against repeated-testing bias by checking the focal hit against an independent held-out slice of reads (when stored in the bundle) and debiting a small share of a cumulative significance error budget (default `0.05`) recorded in the state bundle's ledger.
+2. **Full-table computation:** For an **ExpressionLoop** state, it refits the differential expression model across every gene for your new group comparison (incorporating saved borderline-gene zoom counts when `zoom_context.json` is present). For a multi-group **VariationLoop** state, it computes per-site alternate allele frequencies, allele-frequency differences, and chromosome-adjusted Hudson Fst across called samples in your two selected sub-cohorts plus a permutation p-value.
+3. **Holdout check and cumulative error budget:** Running many follow-up tests on the same dataset increases the risk of false positives. Focaloop guards against repeated-testing bias by debiting a small share of a cumulative significance error budget (default `0.05`) recorded in the state bundle's ledger. When an independent held-out read slice is present in the bundle with at least 4 reads on the focal gene (`holdout_available: true`), matching-direction replication on library-size-normalized held-out counts confirms the hit (`confirmed: true`). When no independent holdout slice is stored (such as VariationLoop population Fst bundles or fully read archives), `holdout_available` and `confirmed` are reported as `false` without substituting discovery statistics.
 4. **Updated state export:** Every query outputs an **Updated state bundle** with the new test recorded in its ledger. Pass that updated bundle into your next **Focaloop Query** call so your cumulative error budget stays properly tracked across a sequence of follow-up questions.
 
 **Compatible vs. incompatible state bundles**
@@ -218,7 +292,7 @@ focaloop query
 **Outputs**
 
 1. **Query results (`query_table.tsv`):** Full gene-level differential expression table (ExpressionLoop state) or per-variant allele-frequency and Hudson Fst table (VariationLoop state).
-2. **Validation summary (`verdict.json`):** Machine-readable summary confirming zero network bytes transferred (`new_bytes: 0`), headline effect size, whether the focal test was confirmed (`confirmed`), and remaining statistical error budget (`wealth_after`).
+2. **Validation summary (`verdict.json`):** Machine-readable summary confirming zero network bytes transferred (`new_bytes: 0`), headline effect size, whether an independent holdout check was available (`holdout_available`), whether Stage-5 zoom counts were used (`zoom_evidence_used`), whether the focal test was confirmed (`confirmed`), and remaining statistical error budget (`wealth_after`).
 3. **HTML report:** Self-contained visual summary showing `0 B` transferred, headline statistics, remaining significance budget, and top rows of the results table.
 4. **Updated state bundle (`updated_state.focaloop.tar.zst`):** Copy of the input state archive with this query appended to the statistical test ledger. Use this output as the input to your next **Focaloop Query** run.
 

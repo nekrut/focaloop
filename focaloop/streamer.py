@@ -282,6 +282,7 @@ class FastqBlockReader:
         self.block_index = 0
         self._gz: bool | None = None
         self._d = None
+        self._in_member = False
         self._rem = b""
         self.reads_emitted = 0
 
@@ -299,20 +300,42 @@ class FastqBlockReader:
 
     def _decode(self, raw: bytes, final: bool) -> bytes:
         if self._gz is None:
+            if not raw:
+                self._gz = False
+                return b""
             self._gz = raw[:2] == b"\x1f\x8b"
             if self._gz:
                 self._d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                self._in_member = False
+            else:
+                lead = raw.lstrip()[:16].lower()
+                if lead.startswith((b"<!doctype", b"<html", b"<?xml", b"<head", b"<body")):
+                    raise ValueError(f"FASTQ source {self.run_id!r} appears to be HTML/XML rather than FASTQ")
+                if raw[:4] in (b"\x28\xb5\x2f\xfd", b"CRAM") or raw[:3] == b"BZh" or raw[:6] == b"\xfd7zXZ\x00":
+                    raise ValueError(f"Unsupported compressed/binary format in FASTQ source {self.run_id!r}")
         if not self._gz:
             return raw
         out = bytearray()
         data = raw
-        while data:
-            out += self._d.decompress(data)
-            if self._d.eof:
-                data = self._d.unused_data
-                self._d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-            else:
-                data = b""
+        try:
+            while data:
+                self._in_member = True
+                out += self._d.decompress(data)
+                if self._d.eof:
+                    trailing = self._d.unused_data
+                    self._d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    self._in_member = False
+                    data = trailing
+                else:
+                    data = b""
+            if final and self._d is not None:
+                out += self._d.flush()
+                if self._in_member and not self._d.eof:
+                    raise ValueError(
+                        f"Truncated gzip member in FASTQ source {self.run_id!r} at compressed byte {self.consumed_bytes}"
+                    )
+        except zlib.error as exc:
+            raise ValueError(f"Corrupt gzip FASTQ stream in {self.run_id!r}: {exc}") from exc
         return bytes(out)
 
     def next_block(self) -> FastqBlock | None:
@@ -322,10 +345,19 @@ class FastqBlockReader:
         raw = self.source.read_range(start, start + self.block_bytes)
         self.consumed_bytes += len(raw)
         text = self._rem + self._decode(raw, self.exhausted)
+        if not text and self.exhausted:
+            idx = self.block_index
+            self.block_index += 1
+            part = "holdout" if is_holdout_block(self.run_id, idx, self.holdout_fraction, self.salt) else "discovery"
+            return FastqBlock(self.run_id, idx, part, start, start + len(raw), [], [])
         lines = text.split(b"\n")
         if self.exhausted:
-            while lines and lines[-1] == b"":
+            while lines and lines[-1] in (b"", b"\r"):
                 lines.pop()
+            if len(lines) % 4 != 0:
+                raise ValueError(
+                    f"Truncated FASTQ record at EOF in {self.run_id!r} ({len(lines) % 4} trailing line(s))"
+                )
             n_complete = len(lines) // 4
         else:
             n_complete = (len(lines) - 1) // 4
@@ -334,10 +366,20 @@ class FastqBlockReader:
         reads: list[str] = []
         names: list[str] = []
         for i in range(0, used, 4):
-            seq = lines[i + 1].strip()
-            if seq:
-                reads.append(seq.decode("ascii", "replace").upper())
-                names.append(lines[i][1:].split(b" ")[0].decode("ascii", "replace"))
+            hdr = lines[i].rstrip(b"\r")
+            seq = lines[i + 1].rstrip(b"\r")
+            plus = lines[i + 2].rstrip(b"\r")
+            qual = lines[i + 3].rstrip(b"\r")
+            if not hdr.startswith(b"@") or len(hdr) < 2:
+                raise ValueError(f"Malformed FASTQ header line in {self.run_id!r}: {hdr[:80]!r}")
+            if not plus.startswith(b"+"):
+                raise ValueError(f"Malformed FASTQ '+' separator line in {self.run_id!r}: {plus[:80]!r}")
+            if not seq or len(seq) != len(qual):
+                raise ValueError(
+                    f"FASTQ sequence/quality length mismatch in {self.run_id!r} ({len(seq)} vs {len(qual)})"
+                )
+            reads.append(seq.decode("ascii", "replace").upper())
+            names.append(hdr[1:].split()[0].decode("ascii", "replace"))
         self.reads_emitted += len(reads)
         idx = self.block_index
         self.block_index += 1

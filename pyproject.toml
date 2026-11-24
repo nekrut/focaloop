@@ -41,6 +41,7 @@ focaloop = "focaloop.cli:main"
 [tool.setuptools]
 packages = [
     "focaloop",
+    "focaloop.blueprints",
     "focaloop.panexpr",
     "focaloop.panexpr.csrc",
     "focaloop.malariavar",
@@ -51,7 +52,11 @@ packages = [
     "focaloop.geneloop.data",
 ]
 
+[tool.setuptools.package-dir]
+"focaloop.blueprints" = "blueprints"
+
 [tool.setuptools.package-data]
+"focaloop.blueprints" = ["*/*.yml", "*.yml", "*.md"]
 "focaloop.panexpr" = ["*.c", "*.h"]
 "focaloop.panexpr.csrc" = ["*.c", "*.h"]
 "focaloop.malariavar.native" = ["*.c", "*.h"]

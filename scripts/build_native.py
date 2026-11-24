@@ -97,28 +97,32 @@ def _compile(
             omp_attempts = [["-fopenmp"], []]
 
     last_err = ""
-    for omp in omp_attempts:
-        cmd = [
-            *cc_cmd,
-            *cflags,
-            "-O3",
-            *sh_flags,
-            *isa_flags,
-            *inc,
-            *(f for f in omp if not f.startswith("-l")),
-            *(str(s) for s in sources),
-            *ldflags,
-            *(f for f in omp if f.startswith("-l")),
-            *link_libs,
-            "-o",
-            str(output),
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0 and output.is_file():
-            if not shared:
-                os.chmod(output, 0o755)
-            return
-        last_err = res.stderr.strip()
+    tmp_out = output.parent / f".tmp_{output.name}_{os.getpid()}"
+    try:
+        for omp in omp_attempts:
+            cmd = [
+                *cc_cmd,
+                *cflags,
+                "-O3",
+                *sh_flags,
+                *isa_flags,
+                *inc,
+                *(f for f in omp if not f.startswith("-l")),
+                *(str(s) for s in sources),
+                *ldflags,
+                *(f for f in omp if f.startswith("-l")),
+                *link_libs,
+                "-o",
+                str(tmp_out),
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0 and tmp_out.is_file():
+                os.chmod(tmp_out, 0o755)
+                os.replace(tmp_out, output)
+                return
+            last_err = res.stderr.strip()
+    finally:
+        tmp_out.unlink(missing_ok=True)
     raise RuntimeError(f"Failed compiling {output.name}:\n{last_err}")
 
 
@@ -138,12 +142,13 @@ def build_all(prefix: Path | None, cache_dir: Path | None, bin_dir: Path | None,
 
     if cache_dir is None:
         if prefix is None:
-            raise ValueError("Provide --prefix or --cache-dir")
+            prefix = Path(sys.prefix)
         cache_dir = prefix / "share" / "focaloop" / "native_cache"
     if bin_dir is None and prefix is not None:
         bin_dir = prefix / "bin"
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(cache_dir, 0o755)
     if bin_dir is not None:
         bin_dir.mkdir(parents=True, exist_ok=True)
 

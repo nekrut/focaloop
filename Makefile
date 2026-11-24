@@ -1,5 +1,5 @@
 PYTHON ?= python3
-PREFIX ?= /usr/local
+PREFIX ?= $(shell "$(PYTHON)" -c "import sys; print(sys.prefix)")
 FOCALOOP_PORTABLE_ISA ?= 1
 
 .PHONY: all install-native install clean

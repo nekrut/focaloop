@@ -122,24 +122,57 @@ def _ipv4_session():
 
 def _head_content_length(url: str, timeout: float = 45.0) -> int:
     s = _ipv4_session()
+    head_err: Exception | None = None
     try:
-        r = s.head(url, allow_redirects=True, timeout=timeout)
-        if r.status_code < 400 and r.headers.get("Content-Length"):
-            return int(r.headers["Content-Length"])
-    except Exception:
-        pass
-    r = s.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=timeout)
+        rh = s.head(url, allow_redirects=True, timeout=timeout)
+        if rh.status_code == 200:
+            cl = rh.headers.get("Content-Length", "").strip()
+            if cl.isdigit():
+                return int(cl)
+        elif rh.status_code in (404, 410):
+            rh.raise_for_status()
+    except Exception as exc:
+        if getattr(getattr(exc, "response", None), "status_code", None) in (404, 410):
+            raise
+        head_err = exc
+
+    r = s.get(url, headers={"Range": "bytes=0-0"}, stream=True, allow_redirects=True, timeout=timeout)
     try:
-        cr = r.headers.get("Content-Range", "")
-        if "/" in cr:
-            tot = cr.rsplit("/", 1)[-1]
-            if tot.isdigit():
-                return int(tot)
-        if r.headers.get("Content-Length"):
-            return int(r.headers["Content-Length"])
+        if r.status_code not in (200, 206):
+            r.raise_for_status()
+            raise RuntimeError(f"Unexpected HTTP status {r.status_code} probing byte length for {url}")
+        if r.status_code == 206:
+            cr = r.headers.get("Content-Range", "").strip()
+            if "/" in cr:
+                tot = cr.rsplit("/", 1)[-1].strip()
+                if tot.isdigit():
+                    return int(tot)
+            raise RuntimeError(f"HTTP 206 response missing valid Content-Range total for {url}: {cr!r}")
+        cl = r.headers.get("Content-Length", "").strip()
+        if cl.isdigit():
+            return int(cl)
     finally:
         r.close()
-    raise RuntimeError(f"Could not determine remote byte length for {url}")
+    raise RuntimeError(f"Could not determine remote byte length for {url}" + (f" ({head_err})" if head_err else ""))
+
+
+_MATE_TOKEN_RE = re.compile(r"(?:^|[._/-])R?([12])$", re.IGNORECASE)
+
+
+def _strip_fastq_ext(label: str) -> str:
+    s = str(label or "").strip()
+    for ext in (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".gz"):
+        if s.lower().endswith(ext):
+            return s[: -len(ext)]
+    return s
+
+
+def _mate_order_key(read_id: str) -> tuple[int, str]:
+    stem = _strip_fastq_ext(read_id)
+    m = _MATE_TOKEN_RE.search(stem)
+    if m:
+        return (0 if m.group(1) == "1" else 1), read_id
+    return 2, read_id
 
 
 def _resolve_panexpr_manifest(
@@ -151,51 +184,67 @@ def _resolve_panexpr_manifest(
     from .panexpr.manifest import FastqFile, Run, StudyManifest, fetch_ena_filereport
 
     rows = _read_manifest_table(manifest_path)
-    local_map: dict[str, list[Path]] = {}
+    local_map: dict[str, list[tuple[str, Path]]] = {}
     if reads:
-        ids = list(read_ids) if read_ids and len(read_ids) == len(reads) else [Path(r).stem for r in reads]
+        ids = list(read_ids) if read_ids and len(read_ids) == len(reads) else [Path(r).name for r in reads]
         for rid, rpath in zip(ids, reads):
-            clean_id = re.sub(r"(_R?[12]|_[12])(\.f(ast)?q(\.gz)?)*$", "", rid)
-            local_map.setdefault(rid, []).append(Path(rpath).resolve())
-            if clean_id != rid:
-                local_map.setdefault(clean_id, []).append(Path(rpath).resolve())
+            rp = Path(rpath).resolve()
+            clean_id = re.sub(r"([._/-]R?[12])(\.f(ast)?q(\.gz)?)*$", "", rid, flags=re.IGNORECASE)
+            stem_no_ext = _strip_fastq_ext(rid)
+            for key_cand in dict.fromkeys((rid, stem_no_ext, clean_id)):
+                if key_cand:
+                    local_map.setdefault(key_cand, []).append((rid, rp))
 
-    # Batch-resolve any INSDC run accessions via ENA filereport
+    # Batch-resolve any INSDC run accessions via ENA filereport (keeping per-accession row context)
     ena_cache: dict[str, dict[str, str]] = {}
-    accs_needed = []
+    acc_row_map: dict[str, dict[str, str]] = {}
+    accs_needed: list[str] = []
     for row in rows:
         src = _pick_col(row, ("run_or_url", "run_accession", "accession", "source", "fastq_1", "url"))
         if _INSDC_RUN_RE.match(src) and src not in local_map and not row.get("fastq_ftp"):
-            accs_needed.append(src.upper())
+            acc_u = src.upper()
+            acc_row_map.setdefault(acc_u, row)
+            accs_needed.append(acc_u)
     for acc in dict.fromkeys(accs_needed):
         last_err: Exception | None = None
         for attempt in range(4):
             try:
                 tsv = fetch_ena_filereport(acc, timeout=60.0)
-                parsed = list(csv.DictReader(io.StringIO(tsv), delimiter="\t"))
-                if parsed:
+                parsed = list(csv.DictReader(io.StringIO(tsv), delimiter="\t")) if tsv and tsv.strip() else []
+                if parsed and (parsed[0].get("fastq_ftp") or parsed[0].get("run_accession")):
                     ena_cache[acc] = parsed[0]
                     break
+                last_err = ValueError(f"ENA filereport returned empty metadata for {acc!r}")
             except Exception as exc:
                 last_err = exc
+            if attempt < 3:
                 time.sleep(2.0 * (attempt + 1))
-        if acc not in ena_cache and last_err is not None:
-            # Allow fallback to AWS ODP if xsra can stream it
+        if acc not in ena_cache:
+            acc_row = acc_row_map[acc]
+            raw_lay = _pick_col(acc_row, ("layout", "library_layout"), "PE").strip().upper()
+            norm_lay = "SE" if raw_lay in ("SE", "SINGLE") else "PE"
             odp_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}"
-            odp_sz = _head_content_length(odp_url)
+            try:
+                odp_sz = _head_content_length(odp_url)
+            except Exception as odp_exc:
+                raise ValueError(
+                    f"Could not resolve INSDC run accession {acc!r}: ENA lookup failed ({last_err}) "
+                    f"and AWS ODP probe failed ({odp_exc})"
+                ) from odp_exc
             ena_cache[acc] = {
                 "run_accession": acc,
-                "library_layout": _pick_col(row, ("layout", "library_layout"), "PE"),
-                "library_strategy": "RNA-Seq",
+                "library_layout": norm_lay,
+                "library_strategy": _pick_col(acc_row, ("strategy", "library_strategy"), "RNA-Seq"),
                 "read_count": "0",
-                "fastq_ftp": f"{odp_url};{odp_url}" if _pick_col(row, ("layout",), "PE") == "PE" else odp_url,
-                "fastq_bytes": f"{odp_sz // 2};{odp_sz - odp_sz // 2}" if _pick_col(row, ("layout",), "PE") == "PE" else str(odp_sz),
+                "fastq_ftp": f"{odp_url};{odp_url}" if norm_lay == "PE" else odp_url,
+                "fastq_bytes": f"{odp_sz // 2};{odp_sz - odp_sz // 2}" if norm_lay == "PE" else str(odp_sz),
                 "fastq_md5": "",
             }
 
     runs: list[Run] = []
     meta_records: list[dict[str, str]] = []
     all_local = True
+    used_local_paths: set[Path] = set()
 
     for idx_r, row in enumerate(rows):
         sample_id = _pick_col(row, ("sample_id", "sample", "sample_alias", "Sample"), f"sample_{idx_r + 1}")
@@ -211,10 +260,31 @@ def _resolve_panexpr_manifest(
         run_id = sample_id
 
         # Case 1: Galaxy History dataset(s) or local file(s)
-        cand_local = local_map.get(src) or local_map.get(sample_id)
-        if cand_local:
-            ordered = sorted(cand_local, key=lambda p: p.name)[:2]
+        cand_local_raw = local_map.get(src) or local_map.get(sample_id)
+        if cand_local_raw:
+            seen_lp: set[tuple[str, Path]] = set()
+            cand_local: list[tuple[str, Path]] = []
+            for item in cand_local_raw:
+                if item not in seen_lp:
+                    seen_lp.add(item)
+                    cand_local.append(item)
+            if len(cand_local) > 2:
+                raise ValueError(
+                    f"Row {sample_id!r}: expected at most 2 FASTQ files (R1/R2), got {len(cand_local)}: "
+                    f"{[r for r, _ in cand_local]}"
+                )
+            if len(cand_local) == 2:
+                rk0 = _mate_order_key(cand_local[0][0])[0]
+                rk1 = _mate_order_key(cand_local[1][0])[0]
+                if rk0 in (0, 1) and rk0 == rk1:
+                    raise ValueError(
+                        f"Row {sample_id!r}: duplicate mate designation in read identifiers {[r for r, _ in cand_local]}"
+                    )
+                ordered = [p for _, p in sorted(cand_local, key=lambda it: _mate_order_key(it[0]))]
+            else:
+                ordered = [cand_local[0][1]]
             for lp in ordered:
+                used_local_paths.add(lp)
                 files.append(FastqFile(url=str(lp), bytes=lp.stat().st_size, local_path=str(lp)))
             run_id = src if _INSDC_RUN_RE.match(src) else sample_id
         elif src and Path(src).exists():
@@ -226,15 +296,25 @@ def _resolve_panexpr_manifest(
         # Case 2: ENA filereport columns inline OR resolved INSDC accession
         elif _INSDC_RUN_RE.match(src) or row.get("fastq_ftp"):
             all_local = False
-            erow = row if row.get("fastq_ftp") else ena_cache[src.upper()]
+            erow = row if row.get("fastq_ftp") else ena_cache.get(src.upper())
+            if not erow:
+                raise ValueError(f"Row {sample_id!r}: no ENA or ODP metadata available for accession {src!r}")
             run_id = erow.get("run_accession") or src.upper()
             raw_urls = [u for u in (erow.get("fastq_ftp") or "").split(";") if u]
-            raw_sizes = [int(x) for x in (erow.get("fastq_bytes") or "").split(";") if x]
+            if not raw_urls:
+                raise ValueError(f"Row {sample_id!r}: accession {run_id!r} has no downloadable FASTQ URLs in ENA")
+            raw_sizes = [int(x) for x in (erow.get("fastq_bytes") or "").split(";") if x.strip().isdigit()]
             raw_md5 = [m for m in (erow.get("fastq_md5") or "").split(";") if m]
             while len(raw_md5) < len(raw_urls):
                 raw_md5.append("")
-            paired_idx = [i for i, u in enumerate(raw_urls) if u.endswith("_1.fastq.gz") or u.endswith("_2.fastq.gz")]
-            use_idx = paired_idx if len(paired_idx) == 2 else ([0, 1] if len(raw_urls) == 2 else [0])
+            r1_idx = next((i for i, u in enumerate(raw_urls) if u.endswith("_1.fastq.gz")), None)
+            r2_idx = next((i for i, u in enumerate(raw_urls) if u.endswith("_2.fastq.gz")), None)
+            if r1_idx is not None and r2_idx is not None:
+                use_idx = [r1_idx, r2_idx]
+            elif len(raw_urls) == 2:
+                use_idx = [0, 1]
+            else:
+                use_idx = [0]
             for i in use_idx:
                 u = raw_urls[i]
                 if u.startswith("ftp://"):
@@ -250,7 +330,9 @@ def _resolve_panexpr_manifest(
             url_list = [u.strip() for u in src.split(";") if u.strip()]
             if mate2:
                 url_list.append(mate2.strip())
-            for u in url_list[:2]:
+            if len(url_list) > 2:
+                raise ValueError(f"Row {sample_id!r}: expected at most 2 FASTQ URLs, got {len(url_list)}")
+            for u in url_list:
                 if u.startswith("ftp://"):
                     u = "https://" + u[len("ftp://"):]
                 sz = _head_content_length(u)
@@ -275,6 +357,20 @@ def _resolve_panexpr_manifest(
             if k not in ("run_or_url", "fastq_ftp", "fastq_bytes", "fastq_md5", "mate2_url") and v:
                 cov_row.setdefault(k, v)
         meta_records.append(cov_row)
+
+    if reads:
+        provided_pairs = [
+            (rid, Path(rp).resolve())
+            for rid, rp in zip(
+                (list(read_ids) if read_ids and len(read_ids) == len(reads) else [Path(r).name for r in reads]),
+                reads,
+            )
+        ]
+        unused = [rid for rid, rp in provided_pairs if rp not in used_local_paths]
+        if unused:
+            raise ValueError(
+                f"Expected at most 2 matched FASTQ files per sample; {len(unused)} extra/unmatched --reads input(s): {unused[:5]}"
+            )
 
     manifest = StudyManifest(study_id=Path(manifest_path).stem, accession="galaxy_cohort", runs=runs)
     meta_df = pd.DataFrame(meta_records)
@@ -421,6 +517,7 @@ def run_panexpr_galaxy(
 
         fna_targets = catalog.write_fasta(work_dir / "targets.fna")
         idx_dir = work_dir / "kernel_idx"
+        idx_dir.mkdir(parents=True, exist_ok=True)
         (work_dir / "tmp").mkdir(parents=True, exist_ok=True)
         cands = default_kernels(threads, tmp_dir=work_dir / "tmp", include_star=False)
         if kernel_names:
@@ -452,6 +549,8 @@ def run_panexpr_galaxy(
                     k.ensure_index(fna_targets, idx_dir)
                 live.append(k)
             except Exception as exc:
+                if kernel_names:
+                    raise RuntimeError(f"Requested mapping kernel {k.name!r} failed index build: {exc}") from exc
                 _log(f"Kernel {k.name} index skipped: {type(exc).__name__}: {exc}")
 
         if not live:
@@ -495,7 +594,19 @@ def run_panexpr_galaxy(
         loop = Focaloop(catalog, manifest, win_kernel, loop_cfg, pan_state_dir, log=_log)
         rep = loop.run()
 
-        # Collect a lightweight independent 1% holdout slice from unstreamed bytes for reusable-holdout queries
+        zctx_saved = getattr(loop, "_last_zoom_ctx", None)
+        if zctx_saved and zctx_saved.get("groups"):
+            write_json(
+                pan_state_dir / "zoom_context.json",
+                {
+                    "zoomed_groups": [str(g) for g in zctx_saved["groups"]],
+                    "sample_depth_scale": {str(k): float(v) for k, v in zctx_saved["depth_scale"].items()},
+                },
+            )
+
+        # Collect a lightweight independent holdout slice from unstreamed bytes for reusable-holdout queries
+        from .panexpr.sra_odp import XsraRunStream
+
         holdout_saved = False
         bytes_by_run: dict[str, int] = {rid: int(acc.bytes_consumed) for rid, acc in loop.accs.items()}
         try:
@@ -507,9 +618,15 @@ def run_panexpr_galaxy(
                 if used_b + 131_072 < r.total_bytes:
                     rs = open_run_stream(r, eff_source_mode, stream_cache)
                     try:
-                        # Advance cursor past discovery bytes, then pull independent holdout slice
-                        rs.advance_bytes(used_b)
-                        hb_target = max(131_072, min(int(r.total_bytes * 0.005), r.total_bytes - used_b))
+                        if isinstance(rs, XsraRunStream):
+                            continue
+                        # Skip discovery prefix in bounded 16 MiB chunks so RSS stays bounded
+                        rem_skip = used_b
+                        while rem_skip > 0:
+                            step = min(16 * 1024 * 1024, rem_skip)
+                            rs.advance_bytes(step)
+                            rem_skip -= step
+                        hb_target = max(131_072, min(int(r.total_bytes * 0.005), r.total_bytes - used_b, 16 * 1024 * 1024))
                         hr1, hr2 = rs.advance_bytes(hb_target)
                         if hr1:
                             acc_h = RunAccumulator(run=r, decoy_ids=decoy_set)
@@ -522,10 +639,17 @@ def run_panexpr_galaxy(
                 mapped_h = map_pooled(win_kernel, hold_batches)
                 for rid, mres in mapped_h.items():
                     hold_accs[rid].add(mres)
-                tc_hold, _, _ = quantify_cohort(hold_accs, catalog, dna_prob=None, strand_prior=rep.strand_priors, em_iters=4)
+                tc_hold, _ = quantify_cohort(
+                    hold_accs,
+                    catalog,
+                    dna_prob={},
+                    dna_counts={},
+                    strand_priors=rep.strand_priors,
+                    em_iters=4,
+                )
                 PanStateStore(pan_state_dir).write("target_counts_holdout", tc_hold, TARGET_COUNTS_SCHEMA)
                 holdout_saved = True
-        except Exception as exc:
+        except (OSError, RuntimeError) as exc:
             _log(f"Holdout slice skipped ({type(exc).__name__}: {exc})")
 
         bridge_map = _build_ortholog_bridge_map(catalog)
@@ -534,9 +658,18 @@ def run_panexpr_galaxy(
         Path(out_de).parent.mkdir(parents=True, exist_ok=True)
         de_df.to_csv(out_de, sep="\t", index=False, float_format="%.6g")
 
-        # Per-sample summary for HTML report
-        tc_df = pq.read_table(pan_state_dir / "target_counts.parquet").to_pandas()
-        mapped_by_run = tc_df.groupby("run_id")["effective_count"].sum().to_dict() if not tc_df.empty else {}
+        # Per-sample summary for HTML report via zero-pandas Arrow aggregation
+        tc_run_tbl = pq.read_table(pan_state_dir / "target_counts.parquet", columns=["run_id", "effective_count"])
+        if tc_run_tbl.num_rows > 0:
+            agg_tbl = tc_run_tbl.group_by("run_id").aggregate([("effective_count", "sum")])
+            mapped_by_run = dict(
+                zip(
+                    agg_tbl.column("run_id").to_pylist(),
+                    agg_tbl.column("effective_count_sum").to_pylist(),
+                )
+            )
+        else:
+            mapped_by_run = {}
         per_sample_rows = []
         for r in manifest.runs:
             sb = bytes_by_run.get(r.run_id, 0)
@@ -597,24 +730,10 @@ def run_panexpr_galaxy(
             brand="Focaloop PanExpr",
         )
 
-        # Persist warm metadata + HypothesisLedger inside state_root
+        # Persist warm metadata + HypothesisLedger inside state_root (no fake discovery=holdout seed)
         sample_meta_df.to_parquet(state_root / "sample_metadata.parquet", index=False)
         store = FocaloopStateStore(state_root)
-        ledger = HypothesisLedger.from_store(store, alpha_budget=0.05)
-        if not de_df.empty:
-            top = de_df.iloc[0]
-            top_lfc = float(top["log2FoldChange"]) if pd.notna(top["log2FoldChange"]) else 0.0
-            top_p = float(top["pvalue"]) if pd.notna(top["pvalue"]) else 1.0
-            ledger.evaluate_query(
-                "q0001",
-                "focaloop-panexpr",
-                f"{fac}:{lvl_a}_vs_{lvl_b}:primary_discovery",
-                top_lfc,
-                top_p,
-                top_lfc,
-                min(top_p, 0.01) if top_p <= 0.005 else top_p,
-                store=store,
-            )
+        HypothesisLedger.from_store(store, alpha_budget=0.05)
         state_meta = {
             "engine": "panexpr",
             "version": "0.2.0",
@@ -1258,6 +1377,169 @@ def _prune_constant_design_terms(design: str, meta_df: pd.DataFrame, focal_facto
     return "~" + " + ".join(kept)
 
 
+def _match_ortholog_bridge_token(bridge_val: Any, key: str) -> bool:
+    """Exact token match against 'asm:gene_id' entries in ortholog_bridge without regex."""
+    if bridge_val is None or pd.isna(bridge_val) or not key:
+        return False
+    for raw_tok in re.split(r"[;,]", str(bridge_val)):
+        tok = raw_tok.strip()
+        if not tok:
+            continue
+        if tok == key or (":" in tok and tok.split(":", 1)[1].strip() == key):
+            return True
+    return False
+
+
+def _resolve_fst_contrast_groups(
+    s_df: pd.DataFrame,
+    contrast: str,
+    *,
+    sample_col: str = "sample",
+    col_aliases: dict[str, str] | None = None,
+    auto_cols: Sequence[str] | None = None,
+) -> tuple[str, list[str], list[str], list[str], list[str]]:
+    """Validate an Fst contrast strictly: reject unknown columns/labels and overlapping groups."""
+    raw_c = str(contrast or "").strip()
+    if "=" in raw_c and ":" in raw_c:
+        col_hint, rest = raw_c.split("=", 1)
+        grp_a_s, grp_b_s = rest.split(":", 1)
+    elif raw_c.count(":") >= 2:
+        col_hint, grp_a_s, grp_b_s = raw_c.split(":", 2)
+    elif ":" in raw_c:
+        col_hint = "auto"
+        grp_a_s, grp_b_s = raw_c.split(":", 1)
+    elif "_vs_" in raw_c:
+        col_hint = "auto"
+        grp_a_s, grp_b_s = raw_c.split("_vs_", 1)
+    else:
+        raise ValueError(f"Invalid contrast {contrast!r}; expected 'field=GroupA:GroupB' or 'GroupA:GroupB'")
+
+    col_hint = col_hint.strip()
+    vals_a = [x.strip() for x in grp_a_s.split(",") if x.strip()]
+    vals_b = [x.strip() for x in grp_b_s.split(",") if x.strip()]
+    if not vals_a or not vals_b:
+        raise ValueError(f"Invalid contrast {contrast!r}; both Group A and Group B must specify at least one label")
+
+    overlap_labels = sorted(set(vals_a) & set(vals_b))
+    if overlap_labels:
+        raise ValueError(
+            f"Invalid contrast {contrast!r}; Group A ({vals_a}) and Group B ({vals_b}) overlap on label(s) {overlap_labels}"
+        )
+
+    cand_cols = [c for c in s_df.columns if c not in (sample_col, "_orig_row_idx")]
+    chosen_col: str | None = None
+    if col_hint.lower() != "auto":
+        mapped_hint = (col_aliases or {}).get(col_hint.lower(), col_hint)
+        for c in cand_cols:
+            if c == mapped_hint or c.lower() == mapped_hint.lower():
+                chosen_col = c
+                break
+        if chosen_col is None:
+            raise ValueError(
+                f"Contrast column {col_hint!r} was not found in saved sample metadata columns {cand_cols}"
+            )
+    else:
+        search_cols = [c for c in (auto_cols or cand_cols) if c in s_df.columns]
+        for c in search_cols:
+            present = set(s_df[c].dropna().astype(str))
+            if all(x in present for x in vals_a) and all(x in present for x in vals_b):
+                chosen_col = c
+                break
+        if chosen_col is None:
+            raise ValueError(
+                f"Contrast groups {vals_a} vs {vals_b} were not found together in any sample column {cand_cols}. "
+                "Verify exact group label spelling or specify 'column=GroupA:GroupB'."
+            )
+
+    present_vals = set(s_df[chosen_col].dropna().astype(str))
+    missing_a = [x for x in vals_a if x not in present_vals]
+    missing_b = [x for x in vals_b if x not in present_vals]
+    if missing_a or missing_b:
+        raise ValueError(
+            f"Unknown group label(s) in column {chosen_col!r}: "
+            f"missing_in_a={missing_a}, missing_in_b={missing_b} (available: {sorted(present_vals)})"
+        )
+
+    samps_a = s_df.loc[s_df[chosen_col].astype(str).isin(vals_a), sample_col].astype(str).tolist()
+    samps_b = s_df.loc[s_df[chosen_col].astype(str).isin(vals_b), sample_col].astype(str).tolist()
+    set_a = set(samps_a)
+    set_b = set(samps_b)
+    if not set_a or not set_b:
+        raise ValueError(
+            f"Both comparison groups must contain at least one sample in column {chosen_col!r} "
+            f"(got {len(set_a)} vs {len(set_b)})"
+        )
+    shared_samples = sorted(set_a & set_b)
+    if shared_samples:
+        raise ValueError(
+            f"Comparison groups {vals_a} and {vals_b} overlap on sample(s) {shared_samples[:10]}; groups must be disjoint"
+        )
+    return chosen_col, vals_a, vals_b, sorted(set_a), sorted(set_b)
+
+
+def _parse_region_hypothesis(hypothesis: str | None) -> tuple[str | None, int | None, int | None]:
+    if not hypothesis or not str(hypothesis).strip():
+        return None, None, None
+    key = str(hypothesis).strip()
+    if "=" in key:
+        key = key.split("=", 1)[-1].strip()
+    if not key:
+        return None, None, None
+    if ":" in key:
+        ch_h, span_h = key.split(":", 1)
+        ch_h = ch_h.strip()
+        if "-" not in span_h or not ch_h:
+            raise ValueError(f"Invalid --hypothesis region {hypothesis!r}; expected 'chrom' or 'chrom:start-end'")
+        s_raw, e_raw = span_h.split("-", 1)
+        try:
+            s_h = int(s_raw.replace(",", "").strip())
+            e_h = int(e_raw.replace(",", "").strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid genomic coordinates in --hypothesis {hypothesis!r}") from exc
+        if s_h < 1 or e_h < s_h:
+            raise ValueError(f"Invalid interval bounds in --hypothesis {hypothesis!r} (require 1 <= start <= end)")
+        return ch_h, s_h, e_h
+    return key, None, None
+
+
+def _vectorized_variant_dosage_and_nocall(
+    gt_list: list[Any],
+    dp_arr: np.ndarray | None,
+    wsaf_arr: np.ndarray | None,
+    *,
+    is_haploid: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute float32 alt-allele dosage in [0, 1] and boolean no-call mask for a batch of variant rows."""
+    n = len(gt_list)
+    if n == 0:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=bool)
+
+    norm_gt = np.array([str(g or "").strip().replace("|", "/") for g in gt_list], dtype=object)
+    nocall = np.isin(norm_gt, ["", ".", "./.", ". / .", "None", "nan", "./0", "0/.", "./1", "1/."])
+    if dp_arr is not None and len(dp_arr) == n:
+        dp_f = np.asarray(dp_arr, dtype=np.float64)
+        nocall |= np.isfinite(dp_f) & (dp_f <= 0.0)
+
+    dos = np.zeros(n, dtype=np.float32)
+    is_hom_alt = (norm_gt == "1/1") | (norm_gt == "1")
+    is_het = np.isin(norm_gt, ["0/1", "1/0", "1/2", "2/1"])
+    dos[is_hom_alt] = 1.0
+    dos[is_het] = 0.5
+
+    if wsaf_arr is not None and len(wsaf_arr) == n:
+        ws_f = np.asarray(wsaf_arr, dtype=np.float64)
+        ws_ok = np.isfinite(ws_f)
+        if is_haploid:
+            dos = np.where(ws_ok, np.clip(ws_f, 0.0, 1.0).astype(np.float32), dos)
+        else:
+            haploid_gt = (norm_gt == "1") & ws_ok
+            if np.any(haploid_gt):
+                dos[haploid_gt] = np.clip(ws_f[haploid_gt], 0.0, 1.0).astype(np.float32)
+
+    dos[nocall] = 0.0
+    return dos, nocall
+
+
 def run_warm_engine_query(
     *,
     state_dir: Path,
@@ -1276,6 +1558,9 @@ def run_warm_engine_query(
     alpha_budget: float = 0.05,
 ) -> dict[str, Any]:
     """Execute 0-network-byte warm query on an ExpressionLoop or VariationLoop state directory."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
     t0 = time.time()
     engine = meta["engine"]
     store = FocaloopStateStore(state_dir)
@@ -1288,46 +1573,90 @@ def run_warm_engine_query(
             if mode == "fst":
                 raise ValueError("Mode 'fst' is only valid for VariationLoop states, not ExpressionLoop states.")
             from .panexpr.catalog import Catalog
-            from .panexpr.solver import de_with_uncertainty, gene_level_tables
+            from .panexpr.solver import (
+                DE_EXCLUDED_BIOTYPES,
+                combine_zoom_gene_tables,
+                de_with_uncertainty,
+                gene_level_tables,
+                refit_genes_with_depth_offsets,
+            )
 
             contrast_list = _parse_panexpr_contrast(contrast)
             fac, lvl_a, lvl_b = contrast_list
+            if lvl_a == lvl_b:
+                raise ValueError(f"Invalid contrast {contrast!r}; numerator and denominator groups must differ")
+
             catalog = Catalog.load(state_dir / "catalog")
             pan_state = state_dir / "panexpr_state"
-            tc = pq.read_table(pan_state / "target_counts.parquet")
-            sample_meta = pd.read_parquet(state_dir / "sample_metadata.parquet") if (state_dir / "sample_metadata.parquet").exists() else None
+            tc_path = pan_state / "target_counts.parquet"
+            tc_schema_names = set(pq.read_schema(tc_path).names)
+            tc_needed = [
+                c
+                for c in (
+                    "run_id",
+                    "sample",
+                    "condition",
+                    "target_id",
+                    "gene_id",
+                    "group_id",
+                    "biotype",
+                    "length_bp",
+                    "effective_count",
+                    "group_assignment_variance",
+                    "dna_present_prob",
+                )
+                if c in tc_schema_names
+            ]
+            tc = pq.read_table(tc_path, columns=tc_needed)
+            sample_meta = (
+                pd.read_parquet(state_dir / "sample_metadata.parquet")
+                if (state_dir / "sample_metadata.parquet").exists()
+                else None
+            )
             design = design_override or meta.get("design", "~condition")
             length_offsets = bool(meta.get("length_offsets", True))
 
             gl = gene_level_tables(tc, catalog, length_offsets=length_offsets)
             meta_df = gl["meta"].copy()
             if sample_meta is not None and not sample_meta.empty:
-                idx_col = "sample" if "sample" in sample_meta.columns else ("sample_id" if "sample_id" in sample_meta.columns else None)
+                idx_col = (
+                    "sample"
+                    if "sample" in sample_meta.columns
+                    else ("sample_id" if "sample_id" in sample_meta.columns else None)
+                )
                 sm = sample_meta.set_index(idx_col) if idx_col else sample_meta
                 sm = sm[~sm.index.duplicated(keep="first")]
                 for col in sm.columns:
                     if col not in meta_df.columns:
                         meta_df[col] = sm[col].reindex(meta_df.index)
+
             counts = gl.get("counts_length_scaled", gl["counts"]) if length_offsets else gl["counts"]
             avar = gl["avar"]
             if subset_clauses:
                 meta_df = _apply_subset_df(meta_df, subset_clauses)
                 counts = counts.loc[meta_df.index]
                 avar = avar.loc[meta_df.index]
-                if fac not in meta_df.columns:
-                    raise ValueError(f"Contrast factor {fac!r} not found in sample metadata columns {list(meta_df.columns)}")
-                avail_lvls = set(meta_df[fac].astype(str))
-                missing_lvls = [lv for lv in (lvl_a, lvl_b) if lv not in avail_lvls]
-                if missing_lvls:
+
+            if fac not in meta_df.columns:
+                raise ValueError(f"Contrast factor {fac!r} not found in sample metadata columns {list(meta_df.columns)}")
+            avail_lvls = set(meta_df[fac].dropna().astype(str))
+            missing_lvls = [lv for lv in (lvl_a, lvl_b) if lv not in avail_lvls]
+            if missing_lvls:
+                if subset_clauses:
                     raise ValueError(
                         f"After applying subset {subset!r} ({len(meta_df)} samples), contrast level(s) {missing_lvls} "
                         f"are absent from column {fac!r} (present: {sorted(avail_lvls)})."
                     )
+                raise ValueError(
+                    f"Contrast level(s) {missing_lvls} not present in sample metadata column {fac!r} "
+                    f"(present: {sorted(avail_lvls)})."
+                )
+
             eff_design = _prune_constant_design_terms(design, meta_df, fac) if subset_clauses else design
             symbols = {g: ts[0].symbol for g, ts in catalog.groups.items()}
             gene_ids = catalog.primary_gene_of_group()
 
-            raw_de = de_with_uncertainty(
+            raw_de, f_disp, f_sf = de_with_uncertainty(
                 counts,
                 avar,
                 meta_df,
@@ -1336,55 +1665,193 @@ def run_warm_engine_query(
                 dna_prob=gl["dna_prob"],
                 symbols=symbols,
                 gene_ids=gene_ids,
+                return_fit=True,
             )
+
+            # Incorporate Stage-5 zoom evidence when target_counts_zoom.parquet + zoom_context.json exist (#66)
+            zoom_evidence_used = False
+            zoom_warning: str | None = None
+            zoom_pq = pan_state / "target_counts_zoom.parquet"
+            zctx_path = next(
+                (p for p in (pan_state / "zoom_context.json", state_dir / "zoom_context.json") if p.is_file()),
+                None,
+            )
+            if zoom_pq.is_file() and zctx_path is not None:
+                zctx_doc = json.loads(zctx_path.read_text(encoding="utf-8"))
+                zoomed_groups = [str(g) for g in (zctx_doc.get("zoomed_groups") or zctx_doc.get("groups") or [])]
+                raw_ds = zctx_doc.get("sample_depth_scale") or zctx_doc.get("depth_scale") or {}
+                ds_series = pd.Series({str(k): float(v) for k, v in raw_ds.items()}, dtype=float).reindex(meta_df.index).fillna(1.0)
+                z_schema_names = set(pq.read_schema(zoom_pq).names)
+                z_cols = [c for c in tc_needed if c in z_schema_names]
+                ztable = pq.read_table(zoom_pq, columns=z_cols)
+                active_sample_arr = pa.array([str(x) for x in meta_df.index], type=pa.string())
+                tc_sub = (
+                    tc.filter(pc.is_in(tc.column("sample"), value_set=active_sample_arr))
+                    if subset_clauses
+                    else tc
+                )
+                if subset_clauses and "sample" in ztable.column_names:
+                    ztable = ztable.filter(pc.is_in(ztable.column("sample"), value_set=active_sample_arr))
+                gl_sub = {
+                    **gl,
+                    "counts": gl["counts"].loc[meta_df.index],
+                    "avar": gl["avar"].loc[meta_df.index],
+                    "meta": meta_df,
+                }
+                if "counts_length_scaled" in gl:
+                    gl_sub["counts_length_scaled"] = gl["counts_length_scaled"].loc[meta_df.index]
+                if zoomed_groups and ztable.num_rows > 0:
+                    counts_g, combined_z, avar_comb = combine_zoom_gene_tables(
+                        gl_sub,
+                        tc_sub,
+                        ztable,
+                        zoomed_groups,
+                        ds_series,
+                        catalog,
+                        length_offsets=length_offsets,
+                    )
+                    gset = [g for g in zoomed_groups if g in counts_g.columns]
+                    if gset:
+                        raw_de = refit_genes_with_depth_offsets(
+                            raw_de,
+                            counts_g,
+                            meta_df,
+                            contrast_list,
+                            gset,
+                            combined_z,
+                            ds_series,
+                            avar_comb,
+                            design=eff_design,
+                            disp=f_disp,
+                            sf=f_sf,
+                        )
+                        zoom_evidence_used = True
+            elif zoom_pq.is_file() or int((meta.get("loop_summary") or {}).get("bytes_streamed_zoom") or 0) > 0:
+                zoom_warning = (
+                    "Saved state bundle contains zoom telemetry without zoom_context.json, "
+                    "so global-pass counts were used without Stage-5 zoom refitting."
+                )
+
+            gid_to_group: dict[str, str] = {}
+            if not raw_de.empty and "gene_id" in raw_de.columns and "group_id" in raw_de.columns:
+                gid_to_group = dict(zip(raw_de["gene_id"].astype(str), raw_de["group_id"].astype(str)))
+
             bridge_map = _build_ortholog_bridge_map(catalog)
             de_df = _format_panexpr_de_table(raw_de, bridge_map)
 
-            # Evaluate independent holdout if target_counts_holdout.parquet exists
-            hold_est, hold_p = 0.0, 1.0
+            # Evaluate independent holdout if target_counts_holdout.parquet exists and has >=4 reads (#61, #67)
+            holdout_available = False
+            hold_est: float | None = None
+            hold_p: float | None = None
             disc_est, disc_p = 0.0, 1.0
             target_gene = None
             if not de_df.empty:
-                if hypothesis:
-                    key = hypothesis.split("=", 1)[-1].strip()
-                    hit = de_df[(de_df["gene_id"] == key) | (de_df["ortholog_bridge"].str.contains(key, na=False))]
+                if hypothesis and str(hypothesis).strip():
+                    key = str(hypothesis).split("=", 1)[-1].strip()
+                    hit = de_df[de_df["gene_id"].astype(str) == key]
+                    if hit.empty and "ortholog_bridge" in de_df.columns:
+                        hit = de_df[de_df["ortholog_bridge"].map(lambda v: _match_ortholog_bridge_token(v, key))]
                     if hit.empty:
-                        raise ValueError(f"Requested hypothesis gene {key!r} was not found in the differential expression table.")
+                        raise ValueError(
+                            f"Requested hypothesis gene {key!r} was not found in the differential expression table."
+                        )
                     row0 = hit.iloc[0]
                 else:
                     row0 = de_df.iloc[0]
                 target_gene = str(row0["gene_id"])
+                target_group_id = gid_to_group.get(target_gene, "")
                 disc_est = float(row0["log2FoldChange"]) if pd.notna(row0["log2FoldChange"]) else 0.0
                 disc_p = float(row0["pvalue"]) if pd.notna(row0["pvalue"]) else 1.0
 
                 hold_path = pan_state / "target_counts_holdout.parquet"
-                if hold_path.exists():
-                    tc_h = pq.read_table(hold_path).to_pandas()
-                    tc_h_gene = tc_h[tc_h["gene_id"] == target_gene]
-                    if not tc_h_gene.empty:
-                        a_sum = float(tc_h_gene.loc[tc_h_gene["condition"] == lvl_a, "effective_count"].sum())
-                        b_sum = float(tc_h_gene.loc[tc_h_gene["condition"] == lvl_b, "effective_count"].sum())
-                        n_a = max(int(tc_h.loc[tc_h["condition"] == lvl_a, "sample"].nunique()), 1)
-                        n_b = max(int(tc_h.loc[tc_h["condition"] == lvl_b, "sample"].nunique()), 1)
-                        hold_est = math.log2(((a_sum / n_a) + 0.5) / ((b_sum / n_b) + 0.5))
-                        tot_n = int(round(a_sum + b_sum))
-                        if tot_n >= 4:
-                            p_null = n_a / float(n_a + n_b)
-                            hold_p = float(sp_stats.binomtest(int(round(a_sum)), tot_n, p=p_null).pvalue)
-                        else:
-                            hold_p = disc_p
-                    else:
-                        hold_est, hold_p = disc_est, disc_p
-                else:
-                    hold_est, hold_p = disc_est, disc_p
+                if hold_path.is_file():
+                    h_schema_names = set(pq.read_schema(hold_path).names)
+                    h_cols = [
+                        c
+                        for c in ("sample", "gene_id", "group_id", "biotype", "effective_count")
+                        if c in h_schema_names
+                    ]
+                    tc_h_tbl = pq.read_table(hold_path, columns=h_cols)
+                    if "biotype" in tc_h_tbl.column_names and tc_h_tbl.num_rows > 0:
+                        bt_col = tc_h_tbl.column("biotype")
+                        keep_bt = pc.and_(
+                            pc.invert(pc.starts_with(bt_col, "decoy")),
+                            pc.invert(
+                                pc.is_in(bt_col, value_set=pa.array(list(DE_EXCLUDED_BIOTYPES), type=pa.string()))
+                            ),
+                        )
+                        tc_h_tbl = tc_h_tbl.filter(keep_bt)
+
+                    fac_vals = meta_df[fac].astype(str)
+                    samples_a = set(meta_df.index[fac_vals == str(lvl_a)].astype(str))
+                    samples_b = set(meta_df.index[fac_vals == str(lvl_b)].astype(str))
+                    ab_samples = sorted(samples_a | samples_b)
+                    if ab_samples and "sample" in tc_h_tbl.column_names and tc_h_tbl.num_rows > 0:
+                        tc_h_tbl = tc_h_tbl.filter(
+                            pc.is_in(tc_h_tbl.column("sample").cast(pa.string()), value_set=pa.array(ab_samples, type=pa.string()))
+                        )
+                        if tc_h_tbl.num_rows > 0:
+                            s_col_np = np.asarray(tc_h_tbl.column("sample").to_pylist(), dtype=object)
+                            eff_col_np = tc_h_tbl.column("effective_count").to_numpy(zero_copy_only=False).astype(np.float64)
+                            in_a = np.isin(s_col_np, list(samples_a))
+                            in_b = np.isin(s_col_np, list(samples_b))
+                            lib_a = float(eff_col_np[in_a].sum())
+                            lib_b = float(eff_col_np[in_b].sum())
+
+                            g_match = np.zeros(len(s_col_np), dtype=bool)
+                            if "gene_id" in tc_h_tbl.column_names:
+                                gid_np = np.asarray(tc_h_tbl.column("gene_id").to_pylist(), dtype=object)
+                                g_match |= gid_np == target_gene
+                            if target_group_id and "group_id" in tc_h_tbl.column_names:
+                                grp_np = np.asarray(tc_h_tbl.column("group_id").to_pylist(), dtype=object)
+                                g_match |= grp_np == target_group_id
+
+                            a_sum = float(eff_col_np[in_a & g_match].sum())
+                            b_sum = float(eff_col_np[in_b & g_match].sum())
+                            tot_n = int(round(a_sum + b_sum))
+                            if tot_n >= 4 and lib_a > 0.0 and lib_b > 0.0:
+                                # Guard single-gene synthetic fixtures where 100% of tc_h rows belong to target_gene
+                                if (lib_a - a_sum) <= 1e-9 and (lib_b - b_sum) <= 1e-9:
+                                    glob_a = float(counts.loc[counts.index.astype(str).isin(samples_a)].to_numpy().sum())
+                                    glob_b = float(counts.loc[counts.index.astype(str).isin(samples_b)].to_numpy().sum())
+                                    if glob_a > 0.0 and glob_b > 0.0 and (glob_a > a_sum or glob_b > b_sum):
+                                        lib_a, lib_b = glob_a, glob_b
+                                    else:
+                                        lib_a = float(max(len(samples_a), 1))
+                                        lib_b = float(max(len(samples_b), 1))
+                                p_null = lib_a / (lib_a + lib_b)
+                                mean_lib = 0.5 * (lib_a + lib_b)
+                                norm_a = a_sum * (mean_lib / lib_a)
+                                norm_b = b_sum * (mean_lib / lib_b)
+                                hold_est = math.log2((norm_a + 0.5) / (norm_b + 0.5))
+                                hold_p = float(sp_stats.binomtest(int(round(a_sum)), tot_n, p=p_null).pvalue)
+                                holdout_available = True
 
             qid = f"q{(ledger._query_index + 1):04d}"
-            spec = f"{fac}:{lvl_a}_vs_{lvl_b}:gene={target_gene or 'none'}"
-            qv = ledger.evaluate_query(qid, actor, spec, disc_est, disc_p, hold_est, hold_p, store=store)
+            spec_parts = [f"{fac}:{lvl_a}_vs_{lvl_b}:gene={target_gene or 'none'}"]
+            if subset_clauses:
+                spec_parts.append("subset=" + "&".join(f"{c}={','.join(vs)}" for c, vs in subset_clauses))
+            if design_override:
+                spec_parts.append(f"design={eff_design}")
+            spec = "|".join(spec_parts)
+            qv = ledger.evaluate_query(
+                qid,
+                actor,
+                spec,
+                disc_est,
+                disc_p,
+                hold_est,
+                hold_p,
+                store=store,
+                holdout_available=holdout_available,
+            )
             Path(out_table).parent.mkdir(parents=True, exist_ok=True)
             de_df.to_csv(out_table, sep="\t", index=False, float_format="%.6g")
             n_deg = int((de_df["padj"].fillna(1.0) < 0.05).sum())
             wall_s = round(time.time() - t0, 3)
+            detail_msg = f"Top: {target_gene} (log2FC={disc_est:.2f}, p={disc_p:.2e})"
+            if zoom_warning:
+                detail_msg += " [global counts only: zoom_context.json absent]"
             out_doc = {
                 "tool": "focaloop",
                 "command": "query",
@@ -1400,12 +1867,16 @@ def run_warm_engine_query(
                 "n_genes": len(de_df),
                 "n_deg_fdr05": n_deg,
                 "top_gene": target_gene,
+                "holdout_available": holdout_available,
+                "zoom_evidence_used": zoom_evidence_used,
                 "verdict": qv.__dict__,
                 "wealth_after": qv.alpha_wealth_after,
                 "alpha_spent": qv.alpha_allocated,
                 "headline_metric": f"{n_deg:,} DEGs (FDR < 0.05)",
-                "headline_detail": f"Top: {target_gene} (log2FC={disc_est:.2f}, p={disc_p:.2e})",
+                "headline_detail": detail_msg,
             }
+            if zoom_warning:
+                out_doc["zoom_warning"] = zoom_warning
             write_json(out_verdict, out_doc)
             if out_report:
                 render_query_report(
@@ -1422,26 +1893,15 @@ def run_warm_engine_query(
 
             cohort_dir = state_dir / "cohort"
             wm = MQ.Warm(cohort_dir, load_dothash=True, load_esscolor=True)
-            drm_saved = pd.read_parquet(state_dir / "drm_calls.parquet") if (state_dir / "drm_calls.parquet").exists() else pd.DataFrame()
+            drm_saved = (
+                pd.read_parquet(state_dir / "drm_calls.parquet")
+                if (state_dir / "drm_calls.parquet").exists()
+                else pd.DataFrame()
+            )
 
-            # Parse contrast: e.g. Population:AS-SE-E:AF-W, Country:Cambodia,Vietnam:Ghana,Mali, or AS-SE-E:AF-W
-            raw_c = contrast.strip()
-            if "=" in raw_c and ":" in raw_c:
-                col_hint, rest = raw_c.split("=", 1)
-                grp_a_s, grp_b_s = rest.split(":", 1)
-            elif raw_c.count(":") >= 2:
-                col_hint, grp_a_s, grp_b_s = raw_c.split(":", 2)
-            elif ":" in raw_c:
-                col_hint = "auto"
-                grp_a_s, grp_b_s = raw_c.split(":", 1)
-            elif "_vs_" in raw_c:
-                col_hint = "auto"
-                grp_a_s, grp_b_s = raw_c.split("_vs_", 1)
-            else:
-                raise ValueError(f"Invalid MalariaVar query contrast {contrast!r}; expected 'GroupA:GroupB' or 'Country:GroupA:GroupB'")
-
-            vals_a = [x.strip() for x in grp_a_s.split(",") if x.strip()]
-            vals_b = [x.strip() for x in grp_b_s.split(",") if x.strip()]
+            s_df_full = wm.samples.copy()
+            s_df_full["_orig_row_idx"] = np.arange(len(s_df_full), dtype=np.int64)
+            s_df = _apply_subset_df(s_df_full, subset_clauses) if subset_clauses else s_df_full
 
             col_map = {
                 "country": "Country",
@@ -1449,75 +1909,191 @@ def run_warm_engine_query(
                 "country_or_group": "Country",
                 "population": "Population",
             }
-            s_df = wm.samples
-            if col_hint == "auto":
-                chosen_col = "Country"
-                for cand_col in ("Country", "Population"):
-                    if cand_col in s_df.columns:
-                        present = set(s_df[cand_col].dropna().astype(str))
-                        if set(vals_a).issubset(present) and set(vals_b).issubset(present):
-                            chosen_col = cand_col
-                            break
-            else:
-                chosen_col = col_map.get(col_hint.lower(), col_hint)
-                if chosen_col not in s_df.columns:
-                    raise ValueError(f"Column {chosen_col!r} not in warm sample table: {list(s_df.columns)}")
+            chosen_col, vals_a, vals_b, samps_a_names, samps_b_names = _resolve_fst_contrast_groups(
+                s_df,
+                contrast,
+                sample_col="sample",
+                col_aliases=col_map,
+                auto_cols=("Country", "Population"),
+            )
+            ia = s_df.loc[s_df["sample"].astype(str).isin(samps_a_names), "_orig_row_idx"].to_numpy(dtype=np.int64)
+            ib = s_df.loc[s_df["sample"].astype(str).isin(samps_b_names), "_orig_row_idx"].to_numpy(dtype=np.int64)
+            if len(set(ia.tolist()) & set(ib.tolist())) > 0:
+                raise ValueError("Comparison groups in MalariaVar warm query must be disjoint")
 
-            ia = np.where(s_df[chosen_col].astype(str).isin(vals_a))[0]
-            ib = np.where(s_df[chosen_col].astype(str).isin(vals_b))[0]
-            if len(ia) == 0 or len(ib) == 0:
-                avail = sorted(s_df[chosen_col].dropna().astype(str).unique())
-                raise ValueError(f"Empty sub-cohort for {chosen_col}: {vals_a} (n={len(ia)}) vs {vals_b} (n={len(ib)}); available={avail}")
+            # Optional --hypothesis restriction (chromosome, chrom:start-end, or curated/known gene ID)
+            panel_goff = np.asarray(wm.panel["goff"], dtype=np.int64)
+            n_panel_total = len(panel_goff)
+            hyp_mask = np.ones(n_panel_total, dtype=bool)
+            if hypothesis and str(hypothesis).strip():
+                h_key = str(hypothesis).split("=", 1)[-1].strip()
+                if h_key in MQ.KNOWN or h_key in wm.g.genes.index:
+                    gid_h = MQ.KNOWN.get(h_key, h_key)
+                    gg_h = wm.g.genes.loc[gid_h]
+                    x0_h = wm.g.goff(gg_h["contig"], int(gg_h["start"])) - 35_000
+                    x1_h = wm.g.goff(gg_h["contig"], int(gg_h["end"])) + 35_000
+                    hyp_mask = (panel_goff >= x0_h) & (panel_goff <= x1_h)
+                else:
+                    ch_h, s_h, e_h = _parse_region_hypothesis(hypothesis)
+                    if ch_h is not None:
+                        contig_names_mv = list(wm.g.names)
+                        if ch_h not in contig_names_mv:
+                            raise ValueError(
+                                f"Requested --hypothesis {h_key!r} does not match any contig {contig_names_mv} "
+                                f"or known locus {sorted(MQ.KNOWN)}"
+                            )
+                        c_idx_h = contig_names_mv.index(ch_h)
+                        c_len_h = int(wm.g.lengths[c_idx_h])
+                        lo_bp = 1 if s_h is None else s_h
+                        hi_bp = c_len_h if e_h is None else min(e_h, c_len_h)
+                        if lo_bp > c_len_h:
+                            raise ValueError(
+                                f"Requested --hypothesis {h_key!r} start {lo_bp} exceeds contig {ch_h} length {c_len_h}"
+                            )
+                        x0_h = wm.g.goff(ch_h, lo_bp)
+                        x1_h = wm.g.goff(ch_h, hi_bp)
+                        hyp_mask = (panel_goff >= x0_h) & (panel_goff <= x1_h)
 
-            # 1. Hudson F_ST across discovery vs holdout panel sites
+            # 1. Site-chunked vectorized Hudson F_ST + permutations across discovery & holdout panel sites (L65, L68)
             min_dp_fst = 3
             min_n_site = max(1, min(len(ia), len(ib)) // 2)
-            p1, n1 = wm.freqs(ia, min_dp=min_dp_fst)
-            p2, n2 = wm.freqs(ib, min_dp=min_dp_fst)
-            ok = (n1 >= min_n_site) & (n2 >= min_n_site) & ((p1 + p2) > 0) & ((p1 + p2) < 2)
-            num_all, den_all = MQ.hudson_fst(p1[ok], n1[ok], p2[ok], n2[ok])
-            ok_idx = np.nonzero(ok)[0]
-            hold_mask = np.array([is_holdout_block("pf8_panel", int(i), holdout_fraction=0.20) for i in ok_idx], dtype=bool)
-            disc_mask = ~hold_mask
-
-            genome_fst = float(num_all.sum() / den_all.sum()) if den_all.sum() > 0 else 0.0
-            disc_fst = float(num_all[disc_mask].sum() / den_all[disc_mask].sum()) if den_all[disc_mask].sum() > 0 else genome_fst
-            hold_fst = float(num_all[hold_mask].sum() / den_all[hold_mask].sum()) if den_all[hold_mask].sum() > 0 else genome_fst
-
-            # Permutation p-value for F_ST across samples on discovery & holdout site partitions
-            rng = np.random.default_rng(20261113)
             pooled_idx = np.concatenate([ia, ib])
             na_len = len(ia)
-            n_perm = 199 if len(pooled_idx) >= 6 else 49
-            perm_disc_ge = 0
-            perm_hold_ge = 0
-            if ok_idx.size > 0:
-                w_sub = np.asarray(wm.wsaf[pooled_idx][:, ok_idx], dtype=np.float32)
-                d_sub = np.asarray(wm.dp[pooled_idx][:, ok_idx])
-                valid_sub = (w_sub != 255) & (d_sub >= min_dp_fst)
-                wf_sub = np.where(valid_sub, w_sub / 200.0, 0.0)
-                for _ in range(n_perm):
-                    perm = rng.permutation(len(pooled_idx))
-                    pa_i, pb_i = perm[:na_len], perm[na_len:]
-                    na_cnt = valid_sub[pa_i].sum(0)
-                    nb_cnt = valid_sub[pb_i].sum(0)
-                    pa_f = wf_sub[pa_i].sum(0) / np.maximum(na_cnt, 1)
-                    pb_f = wf_sub[pb_i].sum(0) / np.maximum(nb_cnt, 1)
-                    pnum, pden = MQ.hudson_fst(pa_f, na_cnt, pb_f, nb_cnt)
-                    pf_d = float(pnum[disc_mask].sum() / max(float(pden[disc_mask].sum()), 1e-12))
-                    pf_h = float(pnum[hold_mask].sum() / max(float(pden[hold_mask].sum()), 1e-12))
-                    if pf_d >= disc_fst - 1e-12:
-                        perm_disc_ge += 1
-                    if pf_h >= hold_fst - 1e-12:
-                        perm_hold_ge += 1
-            disc_p = (perm_disc_ge + 1.0) / (n_perm + 1.0)
-            hold_p = (perm_hold_ge + 1.0) / (n_perm + 1.0)
+            n_pooled = len(pooled_idx)
+            n_perm_eff = max(1, int(n_perm))
+
+            rng = np.random.default_rng(20261113)
+            perm_a_mat = np.zeros((n_pooled, n_perm_eff), dtype=np.float32)
+            for pi in range(n_perm_eff):
+                perm = rng.permutation(n_pooled)
+                perm_a_mat[perm[:na_len], pi] = 1.0
+            perm_b_mat = 1.0 - perm_a_mat
+
+            ok_idx_chunks: list[np.ndarray] = []
+            num_chunks: list[np.ndarray] = []
+            den_chunks: list[np.ndarray] = []
+            hold_chunks: list[np.ndarray] = []
+            perm_disc_num = np.zeros(n_perm_eff, dtype=np.float64)
+            perm_disc_den = np.zeros(n_perm_eff, dtype=np.float64)
+            perm_hold_num = np.zeros(n_perm_eff, dtype=np.float64)
+            perm_hold_den = np.zeros(n_perm_eff, dtype=np.float64)
+
+            cand_panel_idx = np.nonzero(hyp_mask)[0]
+            mv_chunk = 8192
+            for start_ci in range(0, len(cand_panel_idx), mv_chunk):
+                s_idx_blk = cand_panel_idx[start_ci : start_ci + mv_chunk]
+                if len(s_idx_blk) == 0:
+                    continue
+                # Contiguous slice fast-path on mmap arrays when indices are contiguous
+                if s_idx_blk[-1] - s_idx_blk[0] + 1 == len(s_idx_blk):
+                    s0, s1 = int(s_idx_blk[0]), int(s_idx_blk[-1]) + 1
+                    w_blk = np.asarray(wm.wsaf[:, s0:s1][pooled_idx], dtype=np.uint8)
+                    d_blk = np.asarray(wm.dp[:, s0:s1][pooled_idx], dtype=np.uint8)
+                else:
+                    w_blk = np.asarray(wm.wsaf[pooled_idx][:, s_idx_blk], dtype=np.uint8)
+                    d_blk = np.asarray(wm.dp[pooled_idx][:, s_idx_blk], dtype=np.uint8)
+
+                valid_f = ((w_blk != 255) & (d_blk >= min_dp_fst)).astype(np.float32)
+                wf_f = np.where(valid_f > 0.0, w_blk.astype(np.float32) * np.float32(1.0 / 200.0), np.float32(0.0))
+
+                n1_b = valid_f[:na_len].sum(axis=0, dtype=np.float64)
+                n2_b = valid_f[na_len:].sum(axis=0, dtype=np.float64)
+                p1_b = wf_f[:na_len].sum(axis=0, dtype=np.float64) / np.maximum(n1_b, 1.0)
+                p2_b = wf_f[na_len:].sum(axis=0, dtype=np.float64) / np.maximum(n2_b, 1.0)
+                ok_b = (n1_b >= min_n_site) & (n2_b >= min_n_site) & ((p1_b + p2_b) > 0.0) & ((p1_b + p2_b) < 2.0)
+                if not np.any(ok_b):
+                    continue
+
+                num_b, den_b = MQ.hudson_fst(p1_b[ok_b], n1_b[ok_b], p2_b[ok_b], n2_b[ok_b])
+                pos_den = den_b > 1e-12
+                if not np.any(pos_den):
+                    continue
+
+                ok_sub_idx = np.nonzero(ok_b)[0][pos_den]
+                site_ids_ok = s_idx_blk[ok_sub_idx]
+                num_ok = num_b[pos_den]
+                den_ok = den_b[pos_den]
+                hold_b = np.array(
+                    [is_holdout_block("pf8_panel", int(si), holdout_fraction=0.20) for si in site_ids_ok],
+                    dtype=bool,
+                )
+                disc_b = ~hold_b
+
+                ok_idx_chunks.append(site_ids_ok)
+                num_chunks.append(num_ok)
+                den_chunks.append(den_ok)
+                hold_chunks.append(hold_b)
+
+                valid_ok = valid_f[:, ok_sub_idx]  # (n_pooled, b_ok)
+                wf_ok = wf_f[:, ok_sub_idx]
+                na_cnt = (valid_ok.T @ perm_a_mat).astype(np.float64)  # (b_ok, n_perm_eff)
+                nb_cnt = (valid_ok.T @ perm_b_mat).astype(np.float64)
+                pa_f = (wf_ok.T @ perm_a_mat).astype(np.float64) / np.maximum(na_cnt, 1.0)
+                pb_f = (wf_ok.T @ perm_b_mat).astype(np.float64) / np.maximum(nb_cnt, 1.0)
+                pnum, pden = MQ.hudson_fst(pa_f, na_cnt, pb_f, nb_cnt)
+                valid_pair = (na_cnt >= 1.0) & (nb_cnt >= 1.0) & (pden > 1e-12)
+                pnum = np.where(valid_pair, pnum, 0.0)
+                pden = np.where(valid_pair, pden, 0.0)
+                if np.any(disc_b):
+                    perm_disc_num += pnum[disc_b].sum(axis=0)
+                    perm_disc_den += pden[disc_b].sum(axis=0)
+                if np.any(hold_b):
+                    perm_hold_num += pnum[hold_b].sum(axis=0)
+                    perm_hold_den += pden[hold_b].sum(axis=0)
+
+            ok_idx = np.concatenate(ok_idx_chunks) if ok_idx_chunks else np.empty(0, dtype=np.int64)
+            num_all = np.concatenate(num_chunks) if num_chunks else np.empty(0, dtype=np.float64)
+            den_all = np.concatenate(den_chunks) if den_chunks else np.empty(0, dtype=np.float64)
+            hold_mask = np.concatenate(hold_chunks) if hold_chunks else np.empty(0, dtype=bool)
+            disc_mask = ~hold_mask
+
+            if ok_idx.size == 0 or float(den_all.sum()) <= 1e-12:
+                raise ValueError(
+                    f"Zero informative panel sites remain for contrast {contrast!r}"
+                    + (f" under --hypothesis {hypothesis!r}" if hypothesis else "")
+                    + f" (available contigs: {list(wm.g.names)})"
+                )
+
+            genome_fst = float(num_all.sum() / den_all.sum())
+            disc_den_tot = float(den_all[disc_mask].sum()) if disc_mask.any() else 0.0
+            hold_den_tot = float(den_all[hold_mask].sum()) if hold_mask.any() else 0.0
+            holdout_available = bool(disc_den_tot > 1e-12 and hold_den_tot > 1e-12)
+
+            disc_fst = float(num_all[disc_mask].sum() / disc_den_tot) if disc_den_tot > 1e-12 else genome_fst
+            hold_fst_val: float | None = (
+                float(num_all[hold_mask].sum() / hold_den_tot) if holdout_available else None
+            )
+
+            if disc_den_tot > 1e-12:
+                pf_d = np.divide(
+                    perm_disc_num,
+                    perm_disc_den,
+                    out=np.zeros_like(perm_disc_num),
+                    where=perm_disc_den > 1e-12,
+                )
+            else:
+                tot_pnum = perm_disc_num + perm_hold_num
+                tot_pden = perm_disc_den + perm_hold_den
+                pf_d = np.divide(tot_pnum, tot_pden, out=np.zeros_like(tot_pnum), where=tot_pden > 1e-12)
+            perm_disc_ge = int(np.sum(pf_d >= disc_fst - 1e-12))
+            disc_p = float((perm_disc_ge + 1.0) / (n_perm_eff + 1.0))
+
+            hold_p_val: float | None = None
+            if holdout_available and hold_fst_val is not None:
+                pf_h = np.divide(
+                    perm_hold_num,
+                    perm_hold_den,
+                    out=np.zeros_like(perm_hold_num),
+                    where=perm_hold_den > 1e-12,
+                )
+                perm_hold_ge = int(np.sum(pf_h >= hold_fst_val - 1e-12))
+                hold_p_val = float((perm_hold_ge + 1.0) / (n_perm_eff + 1.0))
 
             # Locus-specific F_ST around curated drug-resistance genes
-            goff_ok = wm.panel["goff"][ok]
+            goff_ok = panel_goff[ok_idx]
             locus_rows = []
             for lname, gid in MQ.KNOWN.items():
-                gg = wm.g.genes[gid]
+                gg = wm.g.genes.loc[gid] if hasattr(wm.g.genes, "loc") and gid in wm.g.genes.index else wm.g.genes[gid]
                 x0 = wm.g.goff(gg["contig"], gg["start"]) - 35_000
                 x1 = wm.g.goff(gg["contig"], gg["end"]) + 35_000
                 near = (goff_ok >= x0) & (goff_ok <= x1)
@@ -1535,18 +2111,18 @@ def run_warm_engine_query(
                             "value_b": np.nan,
                             "effect_size": round(lfst, 4),
                             "pvalue": np.nan,
-                            "notes": f"{int(near.sum())} panel sites ±35kb of {gid}",
+                            "notes": f"{int(near.sum())} panel sites +-35kb of {gid}",
                         }
                     )
 
             # 2. Marker & WHO drug-resistance prevalence differences (Fisher exact test)
-            flags = MQ.mutant_flags(s_df)
+            flags = MQ.mutant_flags(wm.samples)
             cnv_mat = MQ.cnv_matrix(wm)
             for col_c in ("mdr1", "pm2_pm3", "gch1", "hrp2", "hrp3"):
                 if col_c in cnv_mat.columns:
                     flags[f"{col_c}_{'del' if col_c.startswith('hrp') else 'cnv'}"] = cnv_mat[col_c].to_numpy(dtype=float)
             if not drm_saved.empty and "sample_id" in drm_saved.columns:
-                drm_idx = drm_saved.set_index("sample_id").reindex(s_df["sample"])
+                drm_idx = drm_saved.set_index("sample_id").reindex(wm.samples["sample"])
                 for who_col in ("who_artemisinin", "who_chloroquine", "who_piperaquine", "who_sp_uncomplicated", "who_dha_ppq"):
                     if who_col in drm_idx.columns:
                         vals = drm_idx[who_col].to_numpy()
@@ -1587,6 +2163,7 @@ def run_warm_engine_query(
                 r_p["padj"] = float(q_p) if np.isfinite(q_p) else np.nan
             prev_rows.sort(key=lambda x: (x["pvalue"], -abs(x["effect_size"])))
 
+            hold_note = f"{hold_fst_val:.4f}" if hold_fst_val is not None else "unavailable"
             fst_header_row = {
                 "category": "genome_fst",
                 "feature": "hudson_fst_genome",
@@ -1599,15 +2176,30 @@ def run_warm_engine_query(
                 "effect_size": round(genome_fst, 4),
                 "pvalue": round(disc_p, 5),
                 "padj": round(disc_p, 5),
-                "notes": f"discovery_fst={disc_fst:.4f}, holdout_fst={hold_fst:.4f} ({int(ok.sum())} informative sites)",
+                "notes": f"discovery_fst={disc_fst:.4f}, holdout_fst={hold_note} ({int(ok_idx.size)} informative sites)",
             }
             for lr in locus_rows:
                 lr["padj"] = np.nan
             table_df = pd.DataFrame([fst_header_row] + prev_rows + locus_rows)
 
             qid = f"q{(ledger._query_index + 1):04d}"
-            spec = f"{chosen_col}:{','.join(vals_a)}_vs_{','.join(vals_b)}:hudson_fst"
-            qv = ledger.evaluate_query(qid, actor, spec, disc_fst, disc_p, hold_fst, hold_p, store=store)
+            spec_parts_mv = [f"{chosen_col}:{','.join(vals_a)}_vs_{','.join(vals_b)}:hudson_fst"]
+            if subset_clauses:
+                spec_parts_mv.append("subset=" + "&".join(f"{c}={','.join(vs)}" for c, vs in subset_clauses))
+            if hypothesis and str(hypothesis).strip():
+                spec_parts_mv.append(f"hypothesis={str(hypothesis).strip()}")
+            spec = "|".join(spec_parts_mv)
+            qv = ledger.evaluate_query(
+                qid,
+                actor,
+                spec,
+                disc_fst,
+                disc_p,
+                hold_fst_val,
+                hold_p_val,
+                store=store,
+                holdout_available=holdout_available,
+            )
 
             Path(out_table).parent.mkdir(parents=True, exist_ok=True)
             table_df.to_csv(out_table, sep="\t", index=False, float_format="%.6g")
@@ -1620,18 +2212,22 @@ def run_warm_engine_query(
                 "engine": "malariavar",
                 "mode": "fst_and_prevalence",
                 "contrast": {"field": chosen_col, "a": vals_a, "b": vals_b},
+                "subset": subset or None,
+                "hypothesis": hypothesis or None,
+                "n_perm": n_perm_eff,
                 "new_bytes": 0,
                 "network_sockets_blocked": True,
                 "wall_seconds": wall_s,
                 "genome_fst": round(genome_fst, 4),
                 "discovery_fst": round(disc_fst, 4),
-                "holdout_fst": round(hold_fst, 4),
-                "informative_sites": int(ok.sum()),
+                "holdout_fst": round(hold_fst_val, 4) if hold_fst_val is not None else None,
+                "holdout_available": holdout_available,
+                "informative_sites": int(ok_idx.size),
                 "verdict": qv.__dict__,
                 "wealth_after": qv.alpha_wealth_after,
                 "alpha_spent": qv.alpha_allocated,
                 "headline_metric": f"F_ST = {genome_fst:.3f}",
-                "headline_detail": f"Top Δprev: {top_marker} ({top_diff:+.2f})",
+                "headline_detail": f"Top delta prev: {top_marker} ({top_diff:+.2f})",
             }
             write_json(out_verdict, out_doc)
             if out_report:
@@ -1648,7 +2244,8 @@ def run_warm_engine_query(
             vpath = state_dir / "variants.parquet"
             if not vpath.exists():
                 raise FileNotFoundError(f"Saved VariationLoop state is missing variants.parquet: {state_dir}")
-            vdf = pd.read_parquet(vpath)
+
+            # 1. Validate sample metadata, --subset, contrast groups, --hypothesis, and zero-read samples FIRST (#69, #65, L67, #62)
             s_rows = meta.get("samples") or []
             if not s_rows:
                 raise ValueError("Saved VariationLoop state contains no sample metadata for group comparisons.")
@@ -1656,142 +2253,432 @@ def run_warm_engine_query(
             if subset_clauses:
                 s_df = _apply_subset_df(s_df, subset_clauses)
 
-            raw_c = contrast.strip()
-            if "=" in raw_c and ":" in raw_c:
-                col_hint, rest = raw_c.split("=", 1)
-                grp_a_s, grp_b_s = rest.split(":", 1)
-            elif raw_c.count(":") >= 2:
-                col_hint, grp_a_s, grp_b_s = raw_c.split(":", 2)
-            elif ":" in raw_c:
-                col_hint = "auto"
-                grp_a_s, grp_b_s = raw_c.split(":", 1)
-            elif "_vs_" in raw_c:
-                col_hint = "auto"
-                grp_a_s, grp_b_s = raw_c.split("_vs_", 1)
-            else:
-                raise ValueError(f"Invalid contrast {contrast!r}; expected field=GroupA:GroupB or GroupA:GroupB")
+            chosen_col, vals_a, vals_b, samps_a, samps_b = _resolve_fst_contrast_groups(
+                s_df,
+                contrast,
+                sample_col="sample",
+            )
+            ch_h, s_h, e_h = _parse_region_hypothesis(hypothesis)
 
-            vals_a = [x.strip() for x in grp_a_s.split(",") if x.strip()]
-            vals_b = [x.strip() for x in grp_b_s.split(",") if x.strip()]
-            cand_cols = [c for c in s_df.columns if c != "sample"]
-            chosen_col = None
-            if col_hint != "auto":
-                for c in cand_cols:
-                    if c.lower() == col_hint.strip().lower():
-                        chosen_col = c
-                        break
-            if chosen_col is None:
-                for c in cand_cols:
-                    vals = set(s_df[c].astype(str))
-                    if any(x in vals for x in vals_a) and any(x in vals for x in vals_b):
-                        chosen_col = c
-                        break
-            if chosen_col is None:
-                raise ValueError(
-                    f"Contrast groups {vals_a} vs {vals_b} were not found in VariationLoop sample columns {cand_cols}. "
-                    "Multi-group cohort states with at least two labeled groups are required for population comparisons."
-                )
-
-            set_a = set(s_df.loc[s_df[chosen_col].astype(str).isin(vals_a), "sample"].astype(str))
-            set_b = set(s_df.loc[s_df[chosen_col].astype(str).isin(vals_b), "sample"].astype(str))
-            if not set_a or not set_b:
-                raise ValueError(f"Both comparison groups must contain at least one sample (got {len(set_a)} vs {len(set_b)}).")
-
-            state_ploidy = str(meta.get("ploidy") or (meta.get("summary") or {}).get("ploidy") or "diploid").strip().lower()
-
-            def _row_allele_freq(gt: Any, wsaf: Any) -> float:
-                s = str(gt or "").replace("|", "/")
-                if state_ploidy == "haploid" or s == "1":
+            active_set = set(samps_a) | set(samps_b)
+            zero_read_samples: set[str] = set()
+            for rec in s_rows:
+                sid_r = str(rec.get("sample") or rec.get("sample_id") or "")
+                if sid_r not in active_set:
+                    continue
+                if rec.get("callable") is False:
+                    zero_read_samples.add(sid_r)
+                elif "reads_counted" in rec and rec["reads_counted"] is not None:
                     try:
-                        w = float(wsaf)
-                        if np.isfinite(w):
-                            return float(np.clip(w, 0.0, 1.0))
+                        rc_val = float(rec["reads_counted"])
+                        if math.isfinite(rc_val) and rc_val <= 0.0:
+                            zero_read_samples.add(sid_r)
                     except (TypeError, ValueError):
                         pass
-                    return 1.0 if s in ("1", "1/1") else (0.5 if s in ("0/1", "1/0", "1/2", "2/1") else 0.0)
-                if s in ("1/1", "1"):
-                    return 1.0
-                if s in ("0/1", "1/0", "1/2", "2/1"):
-                    return 0.5
-                return 0.0
 
-            n_a, n_b = len(set_a), len(set_b)
+            tel_pq = state_dir / "sample_telemetry.parquet"
+            if tel_pq.is_file():
+                tel_schema = set(pq.read_schema(tel_pq).names)
+                t_cols = [c for c in ("sample", "reads_counted", "n_variants") if c in tel_schema]
+                if "sample" in t_cols and "reads_counted" in t_cols:
+                    t_df = pq.read_table(tel_pq, columns=t_cols).to_pandas()
+                    for _, tr in t_df.iterrows():
+                        sid_t = str(tr.get("sample") or "")
+                        if sid_t not in active_set:
+                            continue
+                        rc_t = tr.get("reads_counted")
+                        nv_t = tr.get("n_variants", 0)
+                        if pd.notna(rc_t) and float(rc_t) <= 0.0 and (pd.isna(nv_t) or float(nv_t) <= 0.0):
+                            zero_read_samples.add(sid_t)
+
+            if zero_read_samples:
+                raise ValueError(
+                    f"Cannot compute Fst: comparison group contains zero-read sample(s) {sorted(zero_read_samples)}. "
+                    "Exclude failed samples with --subset or re-run VariationLoop with valid sequencing inputs."
+                )
+
+            state_ploidy = str(meta.get("ploidy") or (meta.get("summary") or {}).get("ploidy") or "diploid").strip().lower()
+            is_haploid = state_ploidy == "haploid"
+            k_ploidy = 1 if is_haploid else 2
+
+            n_a, n_b = len(samps_a), len(samps_b)
+            all_samps = samps_a + samps_b  # [0..n_a-1] = Group A, [n_a..n_a+n_b-1] = Group B (strictly disjoint)
+            n_total_samps = n_a + n_b
+            samp_to_col = {s: idx for idx, s in enumerate(all_samps)}
+            samps_pa = pa.array(all_samps, type=pa.string())
+
+            # 2. Stream variants.parquet by row-group with column projection + predicate pushdown (#69, #62)
+            pf = pq.ParquetFile(vpath)
+            v_schema_names = set(pf.schema_arrow.names)
+            proj_cols = [
+                c
+                for c in ("sample_id", "chrom", "pos", "ref", "alt", "gt", "dp", "wsaf")
+                if c in v_schema_names
+            ]
+            observed_contigs: set[str] = set()
+            site_key_to_id: dict[tuple[str, int, str, str], int] = {}
+            site_meta_list: list[tuple[str, int, str, str]] = []
+            pos_to_site_ids: dict[tuple[str, int], list[int]] = {}
+
+            call_site_chunks: list[np.ndarray] = []
+            call_samp_chunks: list[np.ndarray] = []
+            call_dos_chunks: list[np.ndarray] = []
+            nc_site_chunks: list[np.ndarray] = []
+            nc_samp_chunks: list[np.ndarray] = []
+
+            for rgi in range(pf.num_row_groups):
+                rg_tbl = pf.read_row_group(rgi, columns=proj_cols)
+                if rg_tbl.num_rows == 0:
+                    continue
+                if "chrom" in rg_tbl.column_names:
+                    for c_val in pc.unique(rg_tbl.column("chrom").cast(pa.string())).to_pylist():
+                        if c_val:
+                            observed_contigs.add(str(c_val))
+
+                mask = pc.is_in(rg_tbl.column("sample_id").cast(pa.string()), value_set=samps_pa)
+                if ch_h is not None:
+                    mask = pc.and_(mask, pc.equal(rg_tbl.column("chrom").cast(pa.string()), ch_h))
+                    if s_h is not None and e_h is not None:
+                        mask = pc.and_(
+                            mask,
+                            pc.and_(
+                                pc.greater_equal(rg_tbl.column("pos"), s_h),
+                                pc.less_equal(rg_tbl.column("pos"), e_h),
+                            ),
+                        )
+                sub = rg_tbl.filter(mask)
+                if sub.num_rows == 0:
+                    continue
+
+                sid_list = sub.column("sample_id").cast(pa.string()).to_pylist()
+                ch_list = sub.column("chrom").cast(pa.string()).to_pylist()
+                pos_np = sub.column("pos").to_numpy(zero_copy_only=False).astype(np.int64)
+                ref_list = sub.column("ref").cast(pa.string()).to_pylist()
+                alt_list = sub.column("alt").cast(pa.string()).to_pylist()
+                gt_list = sub.column("gt").cast(pa.string()).to_pylist() if "gt" in sub.column_names else ["1/1"] * sub.num_rows
+                dp_np = (
+                    sub.column("dp").to_numpy(zero_copy_only=False).astype(np.float64)
+                    if "dp" in sub.column_names
+                    else None
+                )
+                ws_np = (
+                    sub.column("wsaf").to_numpy(zero_copy_only=False).astype(np.float64)
+                    if "wsaf" in sub.column_names
+                    else None
+                )
+
+                dos_np, nocall_np = _vectorized_variant_dosage_and_nocall(
+                    gt_list, dp_np, ws_np, is_haploid=is_haploid
+                )
+                n_sub = len(sid_list)
+                s_idx_arr = np.fromiter((samp_to_col[str(s)] for s in sid_list), dtype=np.int32, count=n_sub)
+                site_id_arr = np.empty(n_sub, dtype=np.int32)
+                for i in range(n_sub):
+                    skey = (str(ch_list[i]), int(pos_np[i]), str(ref_list[i]), str(alt_list[i]))
+                    s_id = site_key_to_id.get(skey)
+                    if s_id is None:
+                        s_id = len(site_meta_list)
+                        site_key_to_id[skey] = s_id
+                        site_meta_list.append(skey)
+                        pos_to_site_ids.setdefault((skey[0], skey[1]), []).append(s_id)
+                    site_id_arr[i] = s_id
+
+                if np.any(nocall_np):
+                    nc_site_chunks.append(site_id_arr[nocall_np])
+                    nc_samp_chunks.append(s_idx_arr[nocall_np])
+                called_nz = (~nocall_np) & (dos_np > 0.0)
+                if np.any(called_nz):
+                    call_site_chunks.append(site_id_arr[called_nz])
+                    call_samp_chunks.append(s_idx_arr[called_nz])
+                    call_dos_chunks.append(dos_np[called_nz])
+
+            n_cand_sites = len(site_meta_list)
+            if n_cand_sites == 0:
+                contig_hint = sorted(observed_contigs) if observed_contigs else ["none"]
+                raise ValueError(
+                    f"Zero variant sites matched contrast {contrast!r}"
+                    + (f" under --hypothesis {hypothesis!r}" if hypothesis else "")
+                    + f" (available contigs in state: {contig_hint})."
+                )
+
+            # 3. Stream optional site_nocalls.parquet for per-site uncalled (chrom, pos, sample_id) pairs (#62)
+            nocalls_pq = state_dir / "site_nocalls.parquet"
+            if nocalls_pq.is_file() and pos_to_site_ids:
+                pf_nc = pq.ParquetFile(nocalls_pq)
+                nc_names = set(pf_nc.schema_arrow.names)
+                s_col_nc = "sample_id" if "sample_id" in nc_names else ("sample" if "sample" in nc_names else None)
+                c_col_nc = "chrom" if "chrom" in nc_names else ("contig" if "contig" in nc_names else None)
+                if s_col_nc and c_col_nc and "pos" in nc_names:
+                    cand_chroms_pa = pa.array(sorted({k[0] for k in pos_to_site_ids}), type=pa.string())
+                    for rgi in range(pf_nc.num_row_groups):
+                        nc_tbl = pf_nc.read_row_group(rgi, columns=[s_col_nc, c_col_nc, "pos"])
+                        if nc_tbl.num_rows == 0:
+                            continue
+                        nc_mask = pc.and_(
+                            pc.is_in(nc_tbl.column(s_col_nc).cast(pa.string()), value_set=samps_pa),
+                            pc.is_in(nc_tbl.column(c_col_nc).cast(pa.string()), value_set=cand_chroms_pa),
+                        )
+                        if s_h is not None and e_h is not None:
+                            nc_mask = pc.and_(
+                                nc_mask,
+                                pc.and_(
+                                    pc.greater_equal(nc_tbl.column("pos"), s_h),
+                                    pc.less_equal(nc_tbl.column("pos"), e_h),
+                                ),
+                            )
+                        nc_sub = nc_tbl.filter(nc_mask)
+                        if nc_sub.num_rows == 0:
+                            continue
+                        nc_sids = nc_sub.column(s_col_nc).cast(pa.string()).to_pylist()
+                        nc_chs = nc_sub.column(c_col_nc).cast(pa.string()).to_pylist()
+                        nc_pos = nc_sub.column("pos").to_numpy(zero_copy_only=False).astype(np.int64)
+                        hit_sites: list[int] = []
+                        hit_samps: list[int] = []
+                        for sid_s, ch_s, p_i in zip(nc_sids, nc_chs, nc_pos):
+                            matched_sids = pos_to_site_ids.get((str(ch_s), int(p_i)))
+                            if matched_sids:
+                                scol = samp_to_col[str(sid_s)]
+                                for m_sid in matched_sids:
+                                    hit_sites.append(m_sid)
+                                    hit_samps.append(scol)
+                        if hit_sites:
+                            nc_site_chunks.append(np.asarray(hit_sites, dtype=np.int32))
+                            nc_samp_chunks.append(np.asarray(hit_samps, dtype=np.int32))
+                elif s_col_nc and c_col_nc and "start" in nc_names and "end" in nc_names:
+                    # Optional interval-encoded site_nocalls.parquet support (0-based half-open or 1-based inclusive)
+                    by_chrom_pos: dict[str, tuple[np.ndarray, list[list[int]]]] = {}
+                    tmp_cp: dict[str, list[tuple[int, list[int]]]] = {}
+                    for (ch_k, p_k), sids_k in pos_to_site_ids.items():
+                        tmp_cp.setdefault(ch_k, []).append((p_k, sids_k))
+                    for ch_k, items_k in tmp_cp.items():
+                        items_k.sort(key=lambda x: x[0])
+                        by_chrom_pos[ch_k] = (
+                            np.asarray([x[0] for x in items_k], dtype=np.int64),
+                            [x[1] for x in items_k],
+                        )
+                    for rgi in range(pf_nc.num_row_groups):
+                        nc_tbl = pf_nc.read_row_group(rgi, columns=[s_col_nc, c_col_nc, "start", "end"])
+                        if nc_tbl.num_rows == 0:
+                            continue
+                        nc_sub = nc_tbl.filter(pc.is_in(nc_tbl.column(s_col_nc).cast(pa.string()), value_set=samps_pa))
+                        if nc_sub.num_rows == 0:
+                            continue
+                        hit_sites = []
+                        hit_samps = []
+                        for sid_s, ch_s, st_i, en_i in zip(
+                            nc_sub.column(s_col_nc).cast(pa.string()).to_pylist(),
+                            nc_sub.column(c_col_nc).cast(pa.string()).to_pylist(),
+                            nc_sub.column("start").to_numpy(zero_copy_only=False).astype(np.int64),
+                            nc_sub.column("end").to_numpy(zero_copy_only=False).astype(np.int64),
+                        ):
+                            entry = by_chrom_pos.get(str(ch_s))
+                            if entry is None:
+                                continue
+                            pos_arr_c, sids_list_c = entry
+                            lo_i = int(np.searchsorted(pos_arr_c, int(st_i), side="left"))
+                            hi_i = int(np.searchsorted(pos_arr_c, int(en_i), side="right"))
+                            if hi_i > lo_i:
+                                scol = samp_to_col[str(sid_s)]
+                                for idx_p in range(lo_i, hi_i):
+                                    for m_sid in sids_list_c[idx_p]:
+                                        hit_sites.append(m_sid)
+                                        hit_samps.append(scol)
+                        if hit_sites:
+                            nc_site_chunks.append(np.asarray(hit_sites, dtype=np.int32))
+                            nc_samp_chunks.append(np.asarray(hit_samps, dtype=np.int32))
+
+            # Order candidate sites deterministically by (chrom, pos, ref, alt)
+            sort_order = sorted(range(n_cand_sites), key=lambda i: site_meta_list[i])
+            old_to_sorted = np.empty(n_cand_sites, dtype=np.int32)
+            for new_i, old_i in enumerate(sort_order):
+                old_to_sorted[old_i] = new_i
+            sorted_site_meta = [site_meta_list[i] for i in sort_order]
+
+            if call_site_chunks:
+                c_sites = old_to_sorted[np.concatenate(call_site_chunks)]
+                c_samps = np.concatenate(call_samp_chunks)
+                c_dos = np.concatenate(call_dos_chunks)
+                c_ord = np.argsort(c_sites, kind="mergesort")
+                c_sites, c_samps, c_dos = c_sites[c_ord], c_samps[c_ord], c_dos[c_ord]
+                c_bounds = np.searchsorted(c_sites, np.arange(n_cand_sites + 1))
+            else:
+                c_sites = np.empty(0, dtype=np.int32)
+                c_samps = np.empty(0, dtype=np.int32)
+                c_dos = np.empty(0, dtype=np.float32)
+                c_bounds = np.zeros(n_cand_sites + 1, dtype=np.int64)
+
+            if nc_site_chunks:
+                n_sites_nc = old_to_sorted[np.concatenate(nc_site_chunks)]
+                n_samps_nc = np.concatenate(nc_samp_chunks)
+                n_ord = np.argsort(n_sites_nc, kind="mergesort")
+                n_sites_nc, n_samps_nc = n_sites_nc[n_ord], n_samps_nc[n_ord]
+                nc_bounds = np.searchsorted(n_sites_nc, np.arange(n_cand_sites + 1))
+            else:
+                n_sites_nc = np.empty(0, dtype=np.int32)
+                n_samps_nc = np.empty(0, dtype=np.int32)
+                nc_bounds = np.zeros(n_cand_sites + 1, dtype=np.int64)
+
+            # 4. Site-chunked vectorized Hudson Fst + permutation test (#63, #62, #65, #69)
+            n_perm_eff = max(1, int(n_perm))
+            rng = np.random.default_rng(42)
+            perm_a_mat = np.zeros((n_total_samps, n_perm_eff), dtype=np.float32)
+            for pi in range(n_perm_eff):
+                perm = rng.permutation(n_total_samps)
+                perm_a_mat[perm[:n_a], pi] = 1.0
+            perm_b_mat = 1.0 - perm_a_mat
+
             rows_out: list[dict[str, Any]] = []
             num_sum = 0.0
             den_sum = 0.0
-            if not vdf.empty:
-                vsub = vdf[vdf["sample_id"].astype(str).isin(set_a | set_b)].copy()
-                if hypothesis:
-                    key = hypothesis.split("=", 1)[-1].strip()
-                    if ":" in key and "-" in key.split(":", 1)[1]:
-                        ch_h, span_h = key.split(":", 1)
-                        s_h, e_h = [int(x) for x in span_h.split("-", 1)]
-                        vsub = vsub[(vsub["chrom"].astype(str) == ch_h) & (vsub["pos"] >= s_h) & (vsub["pos"] <= e_h)]
-                    else:
-                        vsub = vsub[vsub["chrom"].astype(str) == key]
-                ws_col = vsub["wsaf"] if "wsaf" in vsub.columns else pd.Series([np.nan] * len(vsub), index=vsub.index)
-                vsub["dosage"] = [_row_allele_freq(g, w) for g, w in zip(vsub["gt"], ws_col)]
-                for (ch, pos, ref, alt), grp_df in vsub.groupby(["chrom", "pos", "ref", "alt"], sort=True):
-                    da = grp_df.loc[grp_df["sample_id"].astype(str).isin(set_a), "dosage"].sum()
-                    db = grp_df.loc[grp_df["sample_id"].astype(str).isin(set_b), "dosage"].sum()
-                    pa = float(da) / float(n_a)
-                    pb = float(db) / float(n_b)
-                    c_a = (pa * (1.0 - pa) / (n_a - 1)) if n_a > 1 else 0.0
-                    c_b = (pb * (1.0 - pb) / (n_b - 1)) if n_b > 1 else 0.0
-                    num = (pa - pb) ** 2 - c_a - c_b
-                    den = pa * (1.0 - pb) + pb * (1.0 - pa)
-                    fst_val = float(num / den) if den > 1e-12 else 0.0
-                    num_sum += num
-                    den_sum += den
+            perm_num_sum = np.zeros(n_perm_eff, dtype=np.float64)
+            perm_den_sum = np.zeros(n_perm_eff, dtype=np.float64)
+
+            site_chunk = 16_384
+            for s0 in range(0, n_cand_sites, site_chunk):
+                s1 = min(n_cand_sites, s0 + site_chunk)
+                b_len = s1 - s0
+                dos_blk = np.zeros((b_len, n_total_samps), dtype=np.float32)
+                called_blk = np.ones((b_len, n_total_samps), dtype=np.float32)
+
+                cb0, cb1 = int(c_bounds[s0]), int(c_bounds[s1])
+                if cb1 > cb0:
+                    dos_blk[c_sites[cb0:cb1] - s0, c_samps[cb0:cb1]] = c_dos[cb0:cb1]
+
+                nb0, nb1 = int(nc_bounds[s0]), int(nc_bounds[s1])
+                if nb1 > nb0:
+                    rel_nc = n_sites_nc[nb0:nb1] - s0
+                    col_nc = n_samps_nc[nb0:nb1]
+                    called_blk[rel_nc, col_nc] = 0.0
+                    dos_blk[rel_nc, col_nc] = 0.0
+
+                na_obs = called_blk[:, :n_a].sum(axis=1, dtype=np.float64)
+                nb_obs = called_blk[:, n_a:].sum(axis=1, dtype=np.float64)
+                da_obs = dos_blk[:, :n_a].sum(axis=1, dtype=np.float64)
+                db_obs = dos_blk[:, n_a:].sum(axis=1, dtype=np.float64)
+
+                valid_obs = (na_obs >= 1.0) & (nb_obs >= 1.0)
+                pa_obs = np.divide(da_obs, na_obs, out=np.zeros_like(da_obs), where=na_obs >= 1.0)
+                pb_obs = np.divide(db_obs, nb_obs, out=np.zeros_like(db_obs), where=nb_obs >= 1.0)
+                n_chr_a = k_ploidy * na_obs
+                n_chr_b = k_ploidy * nb_obs
+                ca_obs = np.divide(
+                    pa_obs * (1.0 - pa_obs),
+                    n_chr_a - 1.0,
+                    out=np.zeros_like(pa_obs),
+                    where=n_chr_a > 1.0,
+                )
+                cb_obs = np.divide(
+                    pb_obs * (1.0 - pb_obs),
+                    n_chr_b - 1.0,
+                    out=np.zeros_like(pb_obs),
+                    where=n_chr_b > 1.0,
+                )
+                den_obs = np.where(valid_obs, pa_obs * (1.0 - pb_obs) + pb_obs * (1.0 - pa_obs), 0.0)
+                inf_mask = valid_obs & (den_obs > 1e-12)
+                if not np.any(inf_mask):
+                    continue
+
+                num_obs = (pa_obs - pb_obs) ** 2 - ca_obs - cb_obs
+                inf_indices = np.nonzero(inf_mask)[0]
+                num_sum += float(num_obs[inf_mask].sum())
+                den_sum += float(den_obs[inf_mask].sum())
+
+                for loc_i in inf_indices:
+                    ch_s, pos_i, ref_s, alt_s = sorted_site_meta[s0 + int(loc_i)]
+                    pa_v = float(pa_obs[loc_i])
+                    pb_v = float(pb_obs[loc_i])
+                    fst_v = float(num_obs[loc_i] / den_obs[loc_i])
                     rows_out.append(
                         {
-                            "chrom": str(ch),
-                            "pos": int(pos),
-                            "ref": str(ref),
-                            "alt": str(alt),
-                            "af_group_a": round(pa, 4),
-                            "af_group_b": round(pb, 4),
-                            "delta_af": round(pa - pb, 4),
-                            "hudson_fst": round(fst_val, 4),
-                            "n_group_a": n_a,
-                            "n_group_b": n_b,
+                            "chrom": ch_s,
+                            "pos": pos_i,
+                            "ref": ref_s,
+                            "alt": alt_s,
+                            "af_group_a": round(pa_v, 4),
+                            "af_group_b": round(pb_v, 4),
+                            "delta_af": round(pa_v - pb_v, 4),
+                            "hudson_fst": round(fst_v, 4),
+                            "n_group_a": int(round(na_obs[loc_i])),
+                            "n_group_b": int(round(nb_obs[loc_i])),
                         }
                     )
 
-            table_df = pd.DataFrame(rows_out)
-            if not table_df.empty:
-                table_df = table_df.sort_values(by=["hudson_fst", "delta_af"], ascending=[False, False]).reset_index(drop=True)
-            genome_fst = float(num_sum / den_sum) if den_sum > 1e-12 else 0.0
+                dos_inf = dos_blk[inf_mask]
+                cal_inf = called_blk[inf_mask]
+                na_p = (cal_inf @ perm_a_mat).astype(np.float64)
+                nb_p = (cal_inf @ perm_b_mat).astype(np.float64)
+                da_p = (dos_inf @ perm_a_mat).astype(np.float64)
+                db_p = (dos_inf @ perm_b_mat).astype(np.float64)
 
-            # Permutation p-value over group labels
-            rng = np.random.default_rng(42)
-            all_samps = sorted(set_a | set_b)
-            n_ge = 0
-            n_perm_eff = max(1, int(n_perm))
-            if rows_out and len(all_samps) >= 2 and not vdf.empty:
-                sites_list = list(vsub.groupby(["chrom", "pos", "ref", "alt"], sort=False))
-                samp_to_idx = {s: i for i, s in enumerate(all_samps)}
-                mat = np.zeros((len(sites_list), len(all_samps)), dtype=np.float64)
-                for si, (_, gdf) in enumerate(sites_list):
-                    for sid_v, dos_v in zip(gdf["sample_id"].astype(str), gdf["dosage"].values):
-                        j = samp_to_idx.get(sid_v)
-                        if j is not None:
-                            mat[si, j] = float(dos_v)
-                for _ in range(n_perm_eff):
-                    perm = rng.permutation(len(all_samps))
-                    pa_v = mat[:, perm[:n_a]].mean(axis=1)
-                    pb_v = mat[:, perm[n_a:]].mean(axis=1)
-                    ca_v = (pa_v * (1.0 - pa_v) / (n_a - 1)) if n_a > 1 else 0.0
-                    cb_v = (pb_v * (1.0 - pb_v) / (n_b - 1)) if n_b > 1 else 0.0
-                    p_den = float(np.sum(pa_v * (1.0 - pb_v) + pb_v * (1.0 - pa_v)))
-                    p_fst = float(np.sum((pa_v - pb_v) ** 2 - ca_v - cb_v) / p_den) if p_den > 1e-12 else 0.0
-                    if p_fst >= genome_fst - 1e-12:
-                        n_ge += 1
+                valid_p = (na_p >= 1.0) & (nb_p >= 1.0)
+                pa_p = np.divide(da_p, na_p, out=np.zeros_like(da_p), where=na_p >= 1.0)
+                pb_p = np.divide(db_p, nb_p, out=np.zeros_like(db_p), where=nb_p >= 1.0)
+                n_chr_ap = k_ploidy * na_p
+                n_chr_bp = k_ploidy * nb_p
+                ca_p = np.divide(
+                    pa_p * (1.0 - pa_p),
+                    n_chr_ap - 1.0,
+                    out=np.zeros_like(pa_p),
+                    where=n_chr_ap > 1.0,
+                )
+                cb_p = np.divide(
+                    pb_p * (1.0 - pb_p),
+                    n_chr_bp - 1.0,
+                    out=np.zeros_like(pb_p),
+                    where=n_chr_bp > 1.0,
+                )
+                p_den_site = np.where(valid_p, pa_p * (1.0 - pb_p) + pb_p * (1.0 - pa_p), 0.0)
+                inf_p = valid_p & (p_den_site > 1e-12)
+                p_num_site = np.where(inf_p, (pa_p - pb_p) ** 2 - ca_p - cb_p, 0.0)
+                p_den_site = np.where(inf_p, p_den_site, 0.0)
+                perm_num_sum += p_num_site.sum(axis=0)
+                perm_den_sum += p_den_site.sum(axis=0)
+
+            # #64: Refuse zero informative sites before touching HypothesisLedger
+            if not rows_out or not math.isfinite(den_sum) or den_sum <= 1e-12:
+                contig_hint = sorted(observed_contigs) if observed_contigs else ["none"]
+                raise ValueError(
+                    f"Zero informative (polymorphic) variant sites remain for contrast {contrast!r}"
+                    + (f" under --hypothesis {hypothesis!r}" if hypothesis else "")
+                    + f" (available contigs in state: {contig_hint})."
+                )
+            if not np.all(np.isfinite(perm_den_sum)):
+                raise ValueError(f"Non-finite permutation Fst denominator encountered for contrast {contrast!r}")
+
+            table_df = pd.DataFrame(rows_out)
+            table_df = table_df.sort_values(by=["hudson_fst", "delta_af"], ascending=[False, False]).reset_index(drop=True)
+            genome_fst = float(num_sum / den_sum)
+
+            p_fst_vec = np.divide(
+                perm_num_sum,
+                perm_den_sum,
+                out=np.full_like(perm_num_sum, np.nan),
+                where=perm_den_sum > 1e-12,
+            )
+            # Treat permutations with zero informative denominator conservatively rather than as 0.0 < genome_fst
+            n_ge = int(np.sum(np.isnan(p_fst_vec) | (p_fst_vec >= genome_fst - 1e-12)))
             perm_p = float((n_ge + 1) / (n_perm_eff + 1))
 
+            # #61: VariationLoop has no independent holdout slice -> holdout_available=False, confirmed=False, 0.0 reward
+            holdout_available = False
             qid = f"q{(ledger._query_index + 1):04d}"
-            spec = f"F_ST({chosen_col}: {','.join(vals_a)} vs {','.join(vals_b)})"
-            qv = ledger.evaluate_query(qid, actor, spec, genome_fst, perm_p, genome_fst, perm_p, store=store)
+            spec_parts_vl = [f"F_ST({chosen_col}: {','.join(vals_a)} vs {','.join(vals_b)})"]
+            if subset_clauses:
+                spec_parts_vl.append("subset=" + "&".join(f"{c}={','.join(vs)}" for c, vs in subset_clauses))
+            if hypothesis and str(hypothesis).strip():
+                spec_parts_vl.append(f"hypothesis={str(hypothesis).strip()}")
+            spec = "|".join(spec_parts_vl)
+            qv = ledger.evaluate_query(
+                qid,
+                actor,
+                spec,
+                genome_fst,
+                perm_p,
+                None,
+                None,
+                store=store,
+                holdout_available=holdout_available,
+            )
             Path(out_table).parent.mkdir(parents=True, exist_ok=True)
             table_df.to_csv(out_table, sep="\t", index=False, float_format="%.6g")
             wall_s = round(time.time() - t0, 3)
@@ -1800,18 +2687,27 @@ def run_warm_engine_query(
                 "command": "query",
                 "engine": "variationloop",
                 "mode": "fst",
+                "ploidy": state_ploidy,
                 "contrast": {"field": chosen_col, "a": vals_a, "b": vals_b},
+                "subset": subset or None,
+                "hypothesis": hypothesis or None,
+                "n_perm": n_perm_eff,
                 "new_bytes": 0,
                 "network_sockets_blocked": True,
                 "wall_seconds": wall_s,
                 "genome_fst": round(genome_fst, 4),
                 "informative_sites": len(rows_out),
                 "pvalue": round(perm_p, 6),
+                "holdout_available": holdout_available,
+                "missing_genotype_policy": (
+                    "Excludes ./. and dp==0 calls plus site_nocalls.parquet entries from N_called, "
+                    "and treats remaining unrecorded sites in reads_counted>0 samples as homozygous reference."
+                ),
                 "verdict": qv.__dict__,
                 "wealth_after": qv.alpha_wealth_after,
                 "alpha_spent": qv.alpha_allocated,
                 "headline_metric": f"F_ST = {genome_fst:.3f}",
-                "headline_detail": f"{len(rows_out):,} variant sites compared (p = {perm_p:.3g})",
+                "headline_detail": f"{len(rows_out):,} informative sites compared (p = {perm_p:.3g})",
             }
             write_json(out_verdict, out_doc)
             if out_report:
@@ -1833,7 +2729,9 @@ def run_warm_engine_query(
 
 
 def prebuild_all_native_libs() -> dict[str, str]:
-    """Compile and load all C99/OpenMP binaries and shared libraries across all Focaloop engines."""
+    """Compile and verify all C99/OpenMP binaries and shared libraries across all Focaloop engines."""
+    from ._native_cache import verify_safe_artifact
+    from .malariavar.logan_var import ensure_var_logan_bins
     from .malariavar.native._loader import ensure_shared_lib
     from .runners_expression import prebuild_expressionloop_native_libs
     from .runners_geneloop import prebuild_geneloop_native_libs
@@ -1848,10 +2746,12 @@ def prebuild_all_native_libs() -> dict[str, str]:
         ("varloop_core", ["varloop_core.c"], None, False),
     ):
         p = ensure_shared_lib(stem, srcs, headers=hdrs, use_openmp=omp)
+        verify_safe_artifact(p)
         built[f"malariavar_{stem}"] = str(p)
-    from .malariavar.logan_var import ensure_var_logan_bins
 
     v_prep, v_pile = ensure_var_logan_bins()
+    verify_safe_artifact(v_prep, require_exec=True)
+    verify_safe_artifact(v_pile, require_exec=True)
     built["malariavar_prep_unitigs_filt_adapt"] = str(v_prep)
     built["malariavar_logan_var_pileup"] = str(v_pile)
     built.update(prebuild_geneloop_native_libs())

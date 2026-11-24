@@ -69,7 +69,7 @@ RUN python -m pip install --no-cache-dir --no-deps "bricks2marble==0.1.1" "hidte
     && (cd /opt/Tiberius && python -m pip install --no-deps --no-cache-dir .) \
     && chmod +x /opt/Tiberius/tiberius.py /opt/Tiberius/tiberius/*.py
 
-# Bundle all 7 official Tiberius v2 clade weight packs (~195 MB total) so GeneLoop works offline
+# Bundle all 8 official Tiberius v2 clade weight packs (~225 MB total) so GeneLoop works offline
 RUN set -eu; \
     unpack_weights() { \
         url="$1"; dest="$2"; \
@@ -82,6 +82,7 @@ RUN set -eu; \
         mv "$src_dir" "/opt/focaloop/tiberius_weights/$dest"; \
         rm -rf /tmp/tw.tar.gz /tmp/tw_stage; \
     }; \
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/tiberius_weights_v2.tar.gz" "tiberius_weights_v2"; \
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/tiberius_nosm_weights_v2.tar.gz" "tiberius_nosm_weights_v2"; \
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/vertebrates_weights.tar.gz" "vertebrates_weights"; \
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/insecta_unmasked_v2.tar.gz" "insecta_unmasked_v2"; \
@@ -91,8 +92,9 @@ RUN set -eu; \
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/diatoms_unmasked.tar.gz" "diatoms_weights"
 
 # Install Focaloop 0.4.0 and precompile all portable (-msse4.2 -mpopcnt) C99/OpenMP binaries & libs
-COPY --chown=$MAMBA_USER:$MAMBA_USER pyproject.toml README.md Makefile /opt/focaloop/src/
+COPY --chown=$MAMBA_USER:$MAMBA_USER pyproject.toml MANIFEST.in README.md Makefile /opt/focaloop/src/
 COPY --chown=$MAMBA_USER:$MAMBA_USER scripts /opt/focaloop/src/scripts
+COPY --chown=$MAMBA_USER:$MAMBA_USER blueprints /opt/focaloop/src/blueprints
 COPY --chown=$MAMBA_USER:$MAMBA_USER focaloop /opt/focaloop/src/focaloop
 RUN (cd /opt/focaloop/src && FOCALOOP_PORTABLE_ISA=1 make install-native PREFIX=/opt/conda PYTHON=python) \
     && python -m pip install --no-deps --no-cache-dir /opt/focaloop/src \
@@ -121,7 +123,7 @@ ENV FOCALOOP_BLUEPRINT_PATH=/opt/focaloop/blueprints \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/focaloop/native_cache:/opt/Tiberius:/opt/Tiberius/tiberius:/opt/conda/bin:$PATH
 
-# Build-time smoke verification: CLI, blueprints, native C tiling, Tiberius + all 7 weights, aligners & tools
+# Build-time smoke verification: CLI, blueprints, native C tiling, Tiberius + all 8 weights, aligners & tools
 RUN focaloop --version \
     && focaloop validate panexpr malariavar geneloop focaloop_query focaloop_bait \
     && xsra --version \
@@ -130,7 +132,7 @@ RUN focaloop --version \
 from focaloop.geneloop.seed import detect_tiberius_runtime, discover_tiberius_weights; \
 from focaloop.malariavar.logan_var import ensure_var_logan_bins; \
 rt = detect_tiberius_runtime(); assert rt['backend'] == 'native', rt; \
-models = ('mammalia_nosofttmasking_v2','vertebrates','insecta','angiosperms','fungi','chlorophyta','diatoms'); \
+models = ('mammalia_softmasking_v2','mammalia_nosofttmasking_v2','vertebrates','insecta','angiosperms','fungi','chlorophyta','diatoms'); \
 found = {m: discover_tiberius_weights(m) for m in models}; \
 assert all(found.values()), found; \
 prep, pile = ensure_var_logan_bins(); \

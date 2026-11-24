@@ -35,9 +35,11 @@ Stage: runtime
 %files
     container/environment.yml /opt/focaloop/environment.yml
     pyproject.toml /opt/focaloop/src/pyproject.toml
+    MANIFEST.in /opt/focaloop/src/MANIFEST.in
     README.md /opt/focaloop/src/README.md
     Makefile /opt/focaloop/src/Makefile
     scripts /opt/focaloop/src/scripts
+    blueprints /opt/focaloop/src/blueprints
     focaloop /opt/focaloop/src/focaloop
     blueprints/panexpr/blueprint.focaloop.yml /opt/focaloop/blueprints/panexpr/blueprint.focaloop.yml
     blueprints/malariavar/blueprint.focaloop.yml /opt/focaloop/blueprints/malariavar/blueprint.focaloop.yml
@@ -91,7 +93,7 @@ Stage: runtime
     (cd /opt/Tiberius && python -m pip install --no-deps --no-cache-dir .)
     chmod +x /opt/Tiberius/tiberius.py /opt/Tiberius/tiberius/*.py
 
-    # Bundle all 7 official Tiberius v2 clade weight packs (~195 MB total) so GeneLoop works offline
+    # Bundle all 8 official Tiberius v2 clade weight packs (~225 MB total) so GeneLoop works offline
     mkdir -p /opt/focaloop/tiberius_weights
     unpack_weights() {
         url="$1"; dest="$2"
@@ -104,6 +106,7 @@ Stage: runtime
         mv "$src_dir" "/opt/focaloop/tiberius_weights/$dest"
         rm -rf /tmp/tw.tar.gz /tmp/tw_stage
     }
+    unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/tiberius_weights_v2.tar.gz" "tiberius_weights_v2"
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/tiberius_nosm_weights_v2.tar.gz" "tiberius_nosm_weights_v2"
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/vertebrates_weights.tar.gz" "vertebrates_weights"
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/insecta_unmasked_v2.tar.gz" "insecta_unmasked_v2"
@@ -135,7 +138,7 @@ print('Native libs count:', len(libs), sorted(libs))
     rm -rf /tmp/build_numba_cache
     chmod -R a+rX /opt/focaloop /opt/conda /opt/Tiberius /opt/themisto
 
-    # Build-time smoke verification: CLI, blueprints, native C tiling, Tiberius + all 7 weights, aligners & tools
+    # Build-time smoke verification: CLI, blueprints, native C tiling, Tiberius + all 8 weights, aligners & tools
     focaloop --version
     focaloop validate panexpr malariavar geneloop focaloop_query focaloop_bait
     xsra --version
@@ -146,7 +149,7 @@ from focaloop.geneloop.seed import detect_tiberius_runtime, discover_tiberius_we
 from focaloop.malariavar.logan_var import ensure_var_logan_bins
 rt = detect_tiberius_runtime()
 assert rt['backend'] == 'native', rt
-models = ('mammalia_nosofttmasking_v2','vertebrates','insecta','angiosperms','fungi','chlorophyta','diatoms')
+models = ('mammalia_softmasking_v2','mammalia_nosofttmasking_v2','vertebrates','insecta','angiosperms','fungi','chlorophyta','diatoms')
 found = {m: discover_tiberius_weights(m) for m in models}
 assert all(found.values()), found
 prep, pile = ensure_var_logan_bins()
