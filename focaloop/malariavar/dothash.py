@@ -306,17 +306,20 @@ class DotHashCohortIndex:
         query_card: float | None = None,
         n_threads: int = 1,
     ) -> tuple[np.ndarray, np.ndarray]:
+        eff_k = min(max(0, int(k_top)), int(self.n_samples))
+        if eff_k == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32)
         q = np.ascontiguousarray(query_hv, dtype=np.int16)
         qc = estimate_cardinality(q) if query_card is None else float(query_card)
-        top_idx = np.empty(k_top, dtype=np.int32)
-        top_sim = np.empty(k_top, dtype=np.float32)
+        top_idx = np.full(eff_k, -1, dtype=np.int32)
+        top_sim = np.full(eff_k, -1e30, dtype=np.float32)
         _LIB.dothash_knn_1_vs_n_jaccard(
             q.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
             ctypes.c_float(qc),
             self.matrix.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
             self.cardinalities.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             self.n_samples,
-            k_top,
+            eff_k,
             top_idx.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             top_sim.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             n_threads,
@@ -331,7 +334,10 @@ class DotHashCohortIndex:
         n_threads: int = 1,
     ) -> tuple[np.ndarray, np.ndarray]:
         q_mat = np.ascontiguousarray(queries_hv, dtype=np.int16)
-        n_q = q_mat.shape[0]
+        n_q = int(q_mat.shape[0])
+        eff_k = min(max(0, int(k_top)), int(self.n_samples))
+        if n_q == 0 or eff_k == 0:
+            return np.empty((n_q, eff_k), dtype=np.int32), np.empty((n_q, eff_k), dtype=np.float32)
         if query_cards is None:
             norms_sq = np.empty(n_q, dtype=np.int64)
             _LIB.dothash_norms_sq_batch(
@@ -344,8 +350,8 @@ class DotHashCohortIndex:
         else:
             q_cards = np.ascontiguousarray(query_cards, dtype=np.float32)
 
-        top_idx = np.empty((n_q, k_top), dtype=np.int32)
-        top_sim = np.empty((n_q, k_top), dtype=np.float32)
+        top_idx = np.full((n_q, eff_k), -1, dtype=np.int32)
+        top_sim = np.full((n_q, eff_k), -1e30, dtype=np.float32)
         _LIB.dothash_knn_q_vs_n_jaccard(
             q_mat.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
             q_cards.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -353,7 +359,7 @@ class DotHashCohortIndex:
             self.matrix.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
             self.cardinalities.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             self.n_samples,
-            k_top,
+            eff_k,
             top_idx.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             top_sim.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             n_threads,

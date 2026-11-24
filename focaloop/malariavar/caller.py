@@ -527,16 +527,18 @@ def exon_ratio(g, acc: Accumulator, key, genome_median):
 def cnv_calls(g, acc: Accumulator, p: CallParams, core_median_depth):
     depth = bin_depth(g, acc)
     ratio, bin_median = gc_normalize(g, depth)
+    bad_med = (not np.isfinite(bin_median)) or bin_median < 5
+    bad_core = (core_median_depth is None) or (not np.isfinite(core_median_depth)) or core_median_depth < 5
     out = []
     for name, keys in G.CNV_LOCI.items():
         r, se, nb = locus_ratio(g, ratio, keys)
-        call = -1 if (not np.isfinite(r) or se > p.cnv_max_se or bin_median < 5) else int(r >= p.amp_ratio)
+        call = -1 if (not np.isfinite(r) or se > p.cnv_max_se or bad_med) else int(r >= p.amp_ratio)
         out.append(dict(locus=name, kind="amp", ratio=r, se=se, n_bins=nb, call=call, method="coverage"))
     for name, key in G.DEL_LOCI.items():
         r_bin, se_bin, nb = locus_ratio(g, ratio, [key])
         r_ex, se_ex = exon_ratio(g, acc, key, core_median_depth)
         r = r_ex if np.isfinite(r_ex) else r_bin
-        call = -1 if (not np.isfinite(r) or core_median_depth < 5) else int(r < p.del_ratio)
+        call = -1 if (not np.isfinite(r) or bad_core) else int(r < p.del_ratio)
         out.append(dict(locus=name, kind="del", ratio=r, se=se_ex, n_bins=nb, call=call, method="coverage",
                         ratio_bins=r_bin))
     return out, depth, ratio, bin_median
@@ -674,18 +676,30 @@ def junction_support(sel, genes, p: CallParams, tol=None):
     return best
 
 
+def _normalize_sample_type(sample_type) -> str:
+    raw = "gDNA" if sample_type is None else str(sample_type).strip()
+    if not raw:
+        return "gdna"
+    low = raw.lower()
+    if low not in ("gdna", "swga", "mda"):
+        raise ValueError(f"Unsupported sample_type {sample_type!r} (expected gDNA, sWGA, or MDA)")
+    return low
+
+
 def cnv_calls_v2(g, acc, p: CallParams, bin_p=None, sample_type="gDNA"):
     """CNV amplifications and hrp2/hrp3 deletions with p-corrected, GC-normalised, locally normalised depth.
 
     Amplification: a junction cluster spanning a curated gene (with chimeric-background scaling on sWGA/MDA),
     or (gDNA libraries only) a local coverage ratio >= 1.5."""
+    stype_low = _normalize_sample_type(sample_type)
+    gdna = (stype_low == "gdna")
     depth = p_corrected_depth(g, acc, bin_p)
     ratio, bin_median = gc_normalize(g, depth)
+    bad_med = (not np.isfinite(bin_median)) or bin_median < 5
     out = []
     rf = getattr(acc, "rf", np.zeros((0, 3), np.int64))
     if hasattr(acc, "rf_n"):
         rf = acc.rf[:int(acc.rf_n[0])]
-    gdna = str(sample_type) == "gDNA"
     tol = p.junction_tol if gdna else p.junction_tol_swga
     # phi29 MDA / sWGA libraries produce genome-wide random face-away chimeras; scale the junction floor above background
     fa_floor = p.faceaway_min if gdna else max(p.faceaway_min, int(p.faceaway_min + 0.02 * max(0, len(rf) - 20)))
@@ -697,7 +711,7 @@ def cnv_calls_v2(g, acc, p: CallParams, bin_p=None, sample_type="gDNA"):
         sel = rf[rf[:, 0] == ci] if len(rf) else rf
         fa = junction_support(sel, genes, p, tol=tol)
         cov = bool(gdna and np.isfinite(r) and r >= p.amp_ratio)
-        call = -1 if (bin_median < 5 or (gdna and not np.isfinite(r) and fa == 0)) else int(cov or fa >= fa_floor)
+        call = -1 if (bad_med or (gdna and not np.isfinite(r) and fa == 0)) else int(cov or fa >= fa_floor)
         out.append(dict(locus=name, kind="amp", ratio=r, se=np.nan, n_bins=nb, call=call,
                         method=("coverage+junction" if gdna else "junction_only") + "_v4", faceaway_pairs=fa))
     for name, key in G.DEL_LOCI.items():
@@ -726,13 +740,13 @@ def cnv_calls_v2(g, acc, p: CallParams, bin_p=None, sample_type="gDNA"):
         # gDNA: a MAPQ >= 1 gene bin mostly empty AND a 300 bp exon window (MAPQ >= 20 bases) essentially empty.
         # sWGA / MDA coverage is too uneven for deletion calls (Pf8 leaves 77 of 79 such panel isolates undetermined):
         # no call. The telomere-side ratio is reported, not required (it cost 9 true gDNA hrp3 deletions).
-        if str(sample_type) != "gDNA":
+        if not gdna:
             call = -1
         else:
-            call = -1 if (not np.isfinite(rmin) or not np.isfinite(wmin) or bin_median < 5) else \
+            call = -1 if (not np.isfinite(rmin) or not np.isfinite(wmin) or bad_med) else \
                 int(rmin < p.del_ratio and wmin < p.del_window)
         out.append(dict(locus=name, kind="del", ratio=rmin, se=np.nan, n_bins=nb, call=call,
-                        method="bin_and_window_v5" if str(sample_type) == "gDNA" else "no_call_amplified_library",
+                        method="bin_and_window_v5" if gdna else "no_call_amplified_library",
                         ratio_bins=rgene, ratio_window=wmin, ratio_telomere=rtel))
     return out, depth, ratio, bin_median
 
@@ -876,6 +890,7 @@ def curated_calls(g, acc, drm_codons, bin_p=None, p: CallParams = None, sample_t
         for x in sorted(aa - {ref}):
             tag = f"{ref}{codon}{x}"
             out.append(tag if ref not in aa else tag.lower())
+    codons["k13_missing_codons"] = int(missing)
     k13 = "-" if missing > 378 * 0.2 else (",".join(out) if out else "None")
     cnv, depth, ratio, bmed = cnv_calls_v2(g, acc, p, bin_p, sample_type)
     return codons, k13, cnv, depth, ratio, bmed

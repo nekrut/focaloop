@@ -138,6 +138,11 @@ def _lib() -> ct.CDLL:
     ]
     lib.vl_score_reads_haplotypes.restype = None
 
+    lib.vl_acc_extract_callable_runs.argtypes = [
+        ct.c_void_p, ct.c_int32, ct.c_int32, i32p, i32p, ct.c_int64,
+    ]
+    lib.vl_acc_extract_callable_runs.restype = ct.c_int64
+
     _LIB = lib
     return lib
 
@@ -617,6 +622,30 @@ class PagedContigAccumulator:
         )
         return meta6, mapq, pool
 
+    def callable_runs(self, ctg_id: int, min_dp: int = 1) -> tuple[np.ndarray, np.ndarray]:
+        n = int(self._lib.vl_acc_extract_callable_runs(
+            self._handle, ct.c_int32(ctg_id), ct.c_int32(min_dp),
+            ct.POINTER(ct.c_int32)(), ct.POINTER(ct.c_int32)(), ct.c_int64(0),
+        ))
+        if n <= 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+        s0 = np.empty(n, dtype=np.int32)
+        e0 = np.empty(n, dtype=np.int32)
+        self._lib.vl_acc_extract_callable_runs(
+            self._handle, ct.c_int32(ctg_id), ct.c_int32(min_dp),
+            _ptr(s0, ct.c_int32), _ptr(e0, ct.c_int32), ct.c_int64(n),
+        )
+        return s0, e0
+
+    def save_callable_npz(self, out_npz: str | Path, min_dp: int = 1) -> None:
+        arrays: dict[str, np.ndarray] = {}
+        for cid, cname in enumerate(self.g.names):
+            s0, e0 = self.callable_runs(cid, min_dp=min_dp)
+            if len(s0) > 0:
+                arrays[f"s_{cname}"] = s0
+                arrays[f"e_{cname}"] = e0
+        np.savez_compressed(Path(out_npz), **arrays)
+
     def free_contig(self, ctg_id: int) -> None:
         self._lib.vl_acc_free_contig(self._handle, ct.c_int32(ctg_id))
 
@@ -694,30 +723,36 @@ def call_diploid_snvs_contig(g: G.Genome, ctg_id: int, cand: dict[str, np.ndarra
 
     if str(p.ploidy).strip().lower() == "haploid":
         eff_min_wsaf = max(0.05, min(0.99, float(p.haploid_min_wsaf)))
-        wsaf1 = ac1 / np.maximum(tot, 1).astype(np.float64)
-        qual1 = _wsaf_llr_qual(ac1, tot - ac1, max(float(p.snv_err), 0.005))
         out_h: list[dict] = []
         ctg_name = g.names[ctg_id]
         bases_str = "ACGT"
-        for i in range(m):
-            if hom_del[i] or ac1[i] < p.snv_min_alt or wsaf1[i] < eff_min_wsaf or qual1[i] < p.snv_min_qual:
-                continue
-            q_i = float(qual1[i])
-            out_h.append(dict(
-                ctg_id=ctg_id,
-                chrom=ctg_name,
-                pos0=int(pos0[i]),
-                pos=int(pos0[i]) + 1,
-                ref=bases_str[int(ref[i])],
-                alt=bases_str[int(a1[i])],
-                gt="1",
-                qual=round(q_i, 2),
-                gq=min(99, max(0, int(round(q_i)))),
-                dp=int(dp_full[i]),
-                ad=(int(rc[i]), int(ac1[i])),
-                wsaf=(round(float(wsaf1[i]), 4),),
-                source="pileup_snv_wsaf",
-            ))
+        err_snv_h = max(float(p.snv_err), 0.005)
+        for rank_k in range(3):
+            ak = order[:, rank_k]
+            ack = np.maximum(counts[idx_m, ak], 0)
+            wsafk = ack / np.maximum(tot, 1).astype(np.float64)
+            qualk = _wsaf_llr_qual(ack, tot - ack, err_snv_h)
+            for i in range(m):
+                if hom_del[i] or int(ak[i]) == int(ref[i]):
+                    continue
+                if ack[i] < p.snv_min_alt or wsafk[i] < eff_min_wsaf or qualk[i] < p.snv_min_qual:
+                    continue
+                q_i = float(qualk[i])
+                out_h.append(dict(
+                    ctg_id=ctg_id,
+                    chrom=ctg_name,
+                    pos0=int(pos0[i]),
+                    pos=int(pos0[i]) + 1,
+                    ref=bases_str[int(ref[i])],
+                    alt=bases_str[int(ak[i])],
+                    gt="1",
+                    qual=round(q_i, 2),
+                    gq=min(99, max(0, int(round(q_i)))),
+                    dp=int(dp_full[i]),
+                    ad=(int(rc[i]), int(ack[i])),
+                    wsaf=(round(float(wsafk[i]), 4),),
+                    source="pileup_snv_wsaf",
+                ))
         return out_h
 
     # Opposite a heterozygous 0/1 spanning deletion (delc in [22%, 78%] of dp_full and delc >= 3),
@@ -901,16 +936,24 @@ def call_diploid_indels_contig(
         err_0 = float(min(0.065, p.indel_base_err + p.indel_hp_err_quad * max(0, hp1 - 4) ** 2))
         if str(p.ploidy).strip().lower() == "haploid":
             eff_indel_wsaf = max(0.15, min(0.99, float(p.haploid_min_wsaf)))
-            wsaf_i = float(c1) / float(max(dp_tot, 1))
-            qual_i = float(_wsaf_llr_qual(c1, max(dp_tot - c1, 0), max(err_0, 0.015)))
-            if wsaf_i >= eff_indel_wsaf and qual_i >= p.indel_min_qual:
-                calls.append(dict(
-                    ctg_id=ctg_id, chrom=ctg_name, pos0=a0, pos=a0 + 1,
-                    ref=r1, alt=alt1, gt="1",
-                    qual=round(qual_i, 2), gq=min(99, max(0, int(round(qual_i)))),
-                    dp=dp_tot, ad=(rc, c1), wsaf=(round(wsaf_i, 4),),
-                    source="pileup_indel_wsaf",
-                ))
+            sum_alt_all = sum(int(x[0]) for x in items)
+            dp_all = max(max(int(x[5]) for x in items), sum_alt_all)
+            rc_all_ind = max(dp_all - sum_alt_all, 0)
+            for c_k, r_k, alt_k, _k_k, _L_k, _dp_k, hp_k in items:
+                req_k = max(p.indel_min_alt, 4 if hp_k >= 13 else (3 if hp_k >= 8 else p.indel_min_alt))
+                if c_k < req_k:
+                    continue
+                err_k = float(min(0.065, p.indel_base_err + p.indel_hp_err_quad * max(0, hp_k - 4) ** 2))
+                wsaf_k = float(c_k) / float(max(dp_all, 1))
+                qual_k = float(_wsaf_llr_qual(c_k, max(dp_all - c_k, 0), max(err_k, 0.015)))
+                if wsaf_k >= eff_indel_wsaf and qual_k >= p.indel_min_qual:
+                    calls.append(dict(
+                        ctg_id=ctg_id, chrom=ctg_name, pos0=a0, pos=a0 + 1,
+                        ref=r_k, alt=alt_k, gt="1",
+                        qual=round(qual_k, 2), gq=min(99, max(0, int(round(qual_k)))),
+                        dp=dp_all, ad=(rc_all_ind, c_k), wsaf=(round(wsaf_k, 4),),
+                        source="pileup_indel_wsaf",
+                    ))
             continue
 
         err_hom = float(min(0.24, 0.018 + 0.0040 * min(L1, 40) + 0.0085 * max(0, min(hp1, 20) - 3) + 0.5 * err_0))
@@ -1222,11 +1265,21 @@ def reassemble_active_regions_contig(
         return pileup_calls
     r_pos0 = meta6[:, 0]
 
-    # Query uncaptured full-span non-indel depth across (s0, mid, e0-1) in one batch
-    q_s = np.array([s0 for s0, _, _ in active_wins], dtype=np.int32)
+    # Query uncaptured full-span non-indel depth across (s0, mid, e0-1) in one batch,
+    # clamping away from the [0, 32) and [L_ctg - 32, L_ctg) contig-end bins where uncap_dp cannot increment (L39)
     q_m = np.array([(s0 + e0) // 2 for s0, e0, _ in active_wins], dtype=np.int32)
-    q_e = np.array([max(s0, e0 - 1) for s0, e0, _ in active_wins], dtype=np.int32)
-    dp_mids, _, uncap_m = acc.query_positions(ctg_id, q_m)
+    dp_mids, _, _ = acc.query_positions(ctg_id, q_m)
+    if L_ctg >= 68:
+        lo_clamp = 32
+        hi_clamp = L_ctg - 33
+        q_s = np.clip(np.array([s0 for s0, _, _ in active_wins], dtype=np.int32), lo_clamp, hi_clamp)
+        q_mc = np.clip(q_m, lo_clamp, hi_clamp)
+        q_e = np.clip(np.array([max(s0, e0 - 1) for s0, e0, _ in active_wins], dtype=np.int32), lo_clamp, hi_clamp)
+    else:
+        q_s = np.array([s0 for s0, _, _ in active_wins], dtype=np.int32)
+        q_mc = q_m
+        q_e = np.array([max(s0, e0 - 1) for s0, e0, _ in active_wins], dtype=np.int32)
+    _, _, uncap_m = acc.query_positions(ctg_id, q_mc)
     _, _, uncap_s = acc.query_positions(ctg_id, q_s)
     _, _, uncap_e = acc.query_positions(ctg_id, q_e)
     uncap_min = np.minimum(uncap_m, np.minimum(uncap_s, uncap_e))
@@ -1234,7 +1287,7 @@ def reassemble_active_regions_contig(
     drop_mask = np.zeros(len(pileup_calls), dtype=bool)
     call_pos = np.array([c["pos0"] for c in pileup_calls], dtype=np.int32) if pileup_calls else np.zeros(0, dtype=np.int32)
     call_end = np.array([c["pos0"] + len(c["ref"]) for c in pileup_calls], dtype=np.int32) if pileup_calls else np.zeros(0, dtype=np.int32)
-    call_is_ind = np.array([c["source"] == "pileup_indel" for c in pileup_calls], dtype=bool) if pileup_calls else np.zeros(0, dtype=bool)
+    call_is_ind = np.array(["indel" in str(c.get("source", "")) for c in pileup_calls], dtype=bool) if pileup_calls else np.zeros(0, dtype=bool)
     new_calls: list[dict] = []
 
     flank = p.active_flank_bp
@@ -1281,7 +1334,10 @@ def reassemble_active_regions_contig(
         # Geometric span factor for multi-bp active windows: fraction of 151-bp reads spanning the entire [s0, e0) core
         w_span_bp = max(1, e0 - s0)
         span_frac = max(0.15, min(1.0, (151.0 - float(w_span_bp - 1)) / 151.0))
-        n_uncap = 0 if in_zoom_win else int(round(float(uncap_min[w_idx]) * span_frac))
+        raw_uncap = int(uncap_min[w_idx])
+        if raw_uncap == 0 and (s0 < 48 or e0 > L_ctg - 48):
+            raw_uncap = max(0, int(dp_mids[w_idx]) - len(sel))
+        n_uncap = 0 if in_zoom_win else int(round(float(raw_uncap) * span_frac))
         cand_haps = OZ.discover_candidate_haplotypes(
             ref_win, reads_seq, quals=reads_qual, uncap_ref_depth=n_uncap,
             k_list=(31, 55), min_weight=1.8, max_candidates=7,
@@ -1328,44 +1384,46 @@ def reassemble_active_regions_contig(
             eff_asm_wsaf = max(0.15, min(0.99, float(p.haploid_min_wsaf)))
             best_per_r = np.argmax(ll_mat, axis=1)
             sup_0 = n_uncap + int((best_per_r == 0).sum())
-            dp_est = max(int(dp_mids[w_idx]), len(sel) + n_uncap)
+            total_span_h = max(int(dp_mids[w_idx]), len(sel) + n_uncap, 1)
             ll_ref_only = float(ll_mat[:, 0].sum() + n_uncap * pure_ll[0])
-            best_h = 0
-            best_qual = 0.0
-            best_sup_h = 0
-            best_w = 0.0
+            # Evaluate ALL candidate haplotypes against total spanning depth (#32) so multi-clone mixtures keep every clone
+            agg_diffs: dict[tuple[int, str, str], list[float]] = {}
             for h_i in range(1, n_h):
                 sup_h = int((best_per_r == h_i).sum())
                 if sup_h < 2:
                     continue
-                w_hat = float(np.clip(sup_h / max(float(sup_0 + sup_h), 1.0), 0.01, 0.999))
-                if w_hat < eff_asm_wsaf:
-                    continue
-                lw_alt = math.log(w_hat)
-                lw_ref = math.log(max(1.0 - w_hat, 1e-9))
+                w_hat_single = float(np.clip(sup_h / float(total_span_h), 0.01, 0.999))
+                lw_alt = math.log(w_hat_single)
+                lw_ref = math.log(max(1.0 - w_hat_single, 1e-9))
                 ll_mix = float(
                     np.logaddexp(ll_mat[:, 0] + lw_ref, ll_mat[:, h_i] + lw_alt).sum()
                     + n_uncap * float(np.logaddexp(pure_ll[0] + lw_ref, pure_ll[h_i] + lw_alt))
                 )
                 q_h = min(999.0, max(0.0, 10.0 * max(0.0, ll_mix - ll_ref_only) / LN10))
-                if q_h > best_qual:
-                    best_qual = q_h
-                    best_h = h_i
-                    best_sup_h = sup_h
-                    best_w = w_hat
-            if best_h == 0 or best_qual < p.active_min_qual:
+                if q_h < p.active_min_qual:
+                    continue
+                for p0_d, r_s, a_s in OZ.decompose_haplotype_diffs(ref_win, cand_haps[h_i], lo, ctg_seq_u8):
+                    cur_agg = agg_diffs.get((p0_d, r_s, a_s))
+                    if cur_agg is None:
+                        agg_diffs[(p0_d, r_s, a_s)] = [float(sup_h), q_h]
+                    else:
+                        cur_agg[0] += float(sup_h)
+                        cur_agg[1] = max(cur_agg[1], q_h)
+            asm_records = []
+            for (p0_d, r_s, a_s), (sup_tot, q_best) in agg_diffs.items():
+                w_tot = float(np.clip(sup_tot / float(total_span_h), 0.01, 0.999))
+                if w_tot < eff_asm_wsaf:
+                    continue
+                gq_h = min(99, max(0, int(round(q_best))))
+                sup_int = int(round(sup_tot))
+                asm_records.append(dict(
+                    ctg_id=ctg_id, chrom=ctg_name, pos0=p0_d, pos=p0_d + 1,
+                    ref=r_s, alt=a_s, gt="1", qual=round(q_best, 2), gq=gq_h,
+                    dp=max(total_span_h, sup_0 + sup_int), ad=(sup_0, sup_int),
+                    wsaf=(round(w_tot, 4),), hap_side=0, source="omnitig_asm_wsaf",
+                ))
+            if not asm_records:
                 continue
-            diffs = OZ.decompose_haplotype_diffs(ref_win, cand_haps[best_h], lo, ctg_seq_u8)
-            gq_h = min(99, max(0, int(round(best_qual))))
-            asm_records = [
-                dict(
-                    ctg_id=ctg_id, chrom=ctg_name, pos0=p0, pos=p0 + 1,
-                    ref=r_s, alt=a_s, gt="1", qual=round(best_qual, 2), gq=gq_h,
-                    dp=max(dp_est, sup_0 + best_sup_h), ad=(sup_0, best_sup_h),
-                    wsaf=(round(best_w, 4),), hap_side=0, source="omnitig_asm_wsaf",
-                )
-                for p0, r_s, a_s in diffs
-            ]
         else:
             pairs: list[tuple[int, int]] = []
             pair_posts: list[float] = []
@@ -1405,7 +1463,6 @@ def reassemble_active_regions_contig(
             dp_est = max(int(dp_mids[w_idx]), len(sel) + n_uncap)
 
             if h1_b == 0 and h2_b == 0:
-                # Inside explicit zoom regions (where all reads are captured), suppress low-QUAL paralog noise when 0/0 wins
                 if in_zoom_win and gq >= 25 and len(call_pos):
                     ov = (call_pos < e0) & (call_end > s0)
                     for ci_drop in np.where(ov)[0]:
@@ -1421,6 +1478,26 @@ def reassemble_active_regions_contig(
                 ctg_id, ctg_name, ctg_seq_u8, ref_win, lo,
                 cand_haps[h1_b], cand_haps[h2_b], qual, gq, dp_est, ad_est,
             )
+
+        if not in_zoom_win and asm_records:
+            # Outside explicit zoom regions, single-SNV reads (NM==1, indel==0) are uncaptured (#30, #31).
+            # Keep indels, MNPs, and close SNV clusters (<=45 bp) from reassembly; leave isolated SNVs to full pileup!
+            snv_positions = sorted(
+                r["pos0"] for r in asm_records
+                if len(r["ref"]) == 1 and all(len(a) == 1 for a in str(r["alt"]).split(","))
+            )
+            clustered_snv_pos: set[int] = set()
+            for idx_sp in range(len(snv_positions)):
+                if (idx_sp > 0 and snv_positions[idx_sp] - snv_positions[idx_sp - 1] <= 45) or (
+                    idx_sp + 1 < len(snv_positions) and snv_positions[idx_sp + 1] - snv_positions[idx_sp] <= 45
+                ):
+                    clustered_snv_pos.add(snv_positions[idx_sp])
+            asm_records = [
+                r for r in asm_records
+                if not (len(r["ref"]) == 1 and all(len(a) == 1 for a in str(r["alt"]).split(",")))
+                or (r["pos0"] in clustered_snv_pos)
+            ]
+
         if not asm_records:
             continue
 
@@ -1430,13 +1507,23 @@ def reassemble_active_regions_contig(
             if len(call_pos):
                 drop_mask |= (call_pos < rep_hi) & (call_end > rep_lo)
         elif len(call_pos):
-            # Outside zoom regions, replace pileup calls ONLY locally around emitted assembled alleles
-            # so clean neighboring SNVs or separate indels in [s0, e0) are never wiped out!
+            # Outside zoom regions, indels replace nearby pileup indels only; MNP/clustered SNVs replace SNVs at their span (#30, #31)
+            is_hap = str(p.ploidy).strip().lower() == "haploid"
             for r in asm_records:
                 r_lo = r["pos0"]
                 r_hi = r["pos0"] + len(r["ref"])
-                drop_mask |= (~call_is_ind) & (call_pos < r_hi + 2) & (call_end > r_lo - 2)
-                drop_mask |= call_is_ind & (call_pos < r_hi + 14) & (call_end > r_lo - 14)
+                r_is_pure_indel = any(len(a) != len(r["ref"]) for a in str(r["alt"]).split(","))
+                if r_is_pure_indel:
+                    if not is_hap:
+                        drop_mask |= call_is_ind & (call_pos < r_hi + 14) & (call_end > r_lo - 14)
+                    else:
+                        # In haploid mode, only drop identical/shifted duplicate of the same indel length so co-infecting STRs survive (#32)
+                        for ci_p, pc in enumerate(pileup_calls):
+                            if call_is_ind[ci_p] and pc["pos0"] < r_hi + 14 and (pc["pos0"] + len(pc["ref"])) > r_lo - 14:
+                                if (len(pc["alt"]) - len(pc["ref"])) == (len(r["alt"]) - len(r["ref"])):
+                                    drop_mask[ci_p] = True
+                else:
+                    drop_mask |= (~call_is_ind) & (call_pos < r_hi + 1) & (call_end > r_lo - 1)
         new_calls.extend(asm_records)
 
     kept = [c for i, c in enumerate(pileup_calls) if not drop_mask[i]]
@@ -1462,55 +1549,89 @@ def resolve_diploid_overlaps(calls: list[dict], ploidy: str = "diploid") -> list
         out_h.sort(key=lambda x: (x["pos0"], x["ref"], x["alt"]))
         return out_h
 
-    # Group records at identical pos0 + ref
-    by_pos_ref: dict[tuple[int, str], list[dict]] = {}
+    # Group records at identical pos0 (unifying REF if needed) to synthesize trans 1/2 compound heterozygotes (#31)
+    by_pos: dict[int, list[dict]] = {}
     for c in best_by_key.values():
-        by_pos_ref.setdefault((c["pos0"], c["ref"]), []).append(c)
+        by_pos.setdefault(c["pos0"], []).append(c)
 
     merged_pos: list[dict] = []
-    for (p0, r_s), grp in by_pos_ref.items():
+    for p0, grp in by_pos.items():
         if len(grp) == 1:
             merged_pos.append(grp[0])
+            continue
+        grp.sort(key=lambda x: -x["qual"])
+        g0, g1 = grp[0], grp[1]
+        hs0 = int(g0.get("hap_side", 0))
+        hs1 = int(g1.get("hap_side", 0))
+        opp_phase = (hs0, hs1) in ((1, 2), (2, 1))
+        ac0 = int(g0["ad"][1])
+        ac1 = int(g1["ad"][1])
+        ac_sum = ac0 + ac1
+        dp_comb = max(int(g0["dp"]), int(g1["dp"]), ac_sum)
+        # Each single-allele call's ref AD includes reads supporting the OTHER alt allele at p0 (#31):
+        # true reference-only support is dp_comb - ac0 - ac1 when the two alt read sets are disjoint!
+        true_rc = max(0, dp_comb - ac_sum)
+        disjoint_trans = (
+            ac0 >= 2
+            and ac1 >= 2
+            and ac_sum <= int(1.20 * max(dp_comb, 1))
+            and true_rc <= 0.18 * max(1, dp_comb)
+        )
+        u_ref = g0["ref"] if len(g0["ref"]) >= len(g1["ref"]) else g1["ref"]
+        can_unify = u_ref.startswith(g0["ref"]) and u_ref.startswith(g1["ref"])
+        u_alt0 = g0["alt"] + u_ref[len(g0["ref"]):] if can_unify else g0["alt"]
+        u_alt1 = g1["alt"] + u_ref[len(g1["ref"]):] if can_unify else g1["alt"]
+        if (
+            can_unify
+            and "," not in g0["alt"]
+            and "," not in g1["alt"]
+            and u_alt0 != u_alt1
+            and g0["gt"] == "0/1"
+            and g1["gt"] == "0/1"
+            and (opp_phase or disjoint_trans)
+        ):
+            merged_pos.append(dict(
+                g0,
+                ref=u_ref,
+                alt=f"{u_alt0},{u_alt1}",
+                gt="1/2",
+                qual=max(g0["qual"], g1["qual"]),
+                gq=min(g0["gq"], g1["gq"]),
+                dp=max(dp_comb, true_rc + ac_sum),
+                ad=(true_rc, ac0, ac1),
+                hap_side=0,
+            ))
         else:
-            grp.sort(key=lambda x: -x["qual"])
-            g0, g1 = grp[0], grp[1]
-            hs0 = int(g0.get("hap_side", 0))
-            hs1 = int(g1.get("hap_side", 0))
-            opp_phase = (hs0, hs1) in ((1, 2), (2, 1))
-            rc = min(int(g0["ad"][0]), int(g1["ad"][0]))
-            ac_sum = int(g0["ad"][1]) + int(g1["ad"][1])
-            unphased_trans = (hs0 == 0 and hs1 == 0 and rc <= 0.18 * max(1, rc + ac_sum))
-            if (
-                "," not in g0["alt"]
-                and "," not in g1["alt"]
-                and g0["gt"] == "0/1"
-                and g1["gt"] == "0/1"
-                and (opp_phase or unphased_trans)
-            ):
-                merged_pos.append(dict(
-                    g0,
-                    alt=f"{g0['alt']},{g1['alt']}",
-                    gt="1/2",
-                    qual=max(g0["qual"], g1["qual"]),
-                    gq=min(g0["gq"], g1["gq"]),
-                    dp=max(int(g0["dp"]), rc + ac_sum),
-                    ad=(rc, int(g0["ad"][1]), int(g1["ad"][1])),
-                    hap_side=0,
-                ))
-            else:
-                merged_pos.append(g0)
+            # Keep non-conflicting records (e.g. SNV at indel anchor base) for the span-conflict sweep below
+            for g_item in grp:
+                merged_pos.append(g_item)
 
     merged_pos.sort(key=lambda x: (x["pos0"], -len(x["ref"]), -x["qual"]))
 
-    # Sweep reference intervals to prevent diploid copy-count > 2 across overlapping spans.
+    def _effective_span(rec: dict) -> tuple[int, int]:
+        """Modified reference bases: pure 1-bp left-anchored indels do NOT consume their anchor base (#31)."""
+        s_r = int(rec["pos0"])
+        r_ref = str(rec["ref"])
+        alts = str(rec["alt"]).split(",")
+        if all(len(a) != len(r_ref) and len(a) >= 1 and len(r_ref) >= 1 and a[0] == r_ref[0] for a in alts):
+            # Pure insertion or deletion anchored at s_r: modified span starts at s_r + 1
+            if len(r_ref) > 1:
+                return s_r + 1, s_r + len(r_ref)
+            # Pure insertion between s_r and s_r + 1: zero reference bases deleted (conflicts only with same-pos ins)
+            return s_r + 1, s_r + 1
+        return s_r, s_r + len(r_ref)
+
+    # Sweep reference intervals to prevent diploid copy-count > 2 across genuinely overlapping modified spans.
     # Never rewrite 1/1 -> 0/1: drop the lower-QUAL conflicting record(s) intact!
     out: list[dict] = []
-    active_spans: list[tuple[int, int, int, dict]] = []  # (start0, end0, copies_used, record)
+    active_spans: list[tuple[int, int, int, dict]] = []  # (eff_s0, eff_e0, copies_used, record)
     for rec in merged_pos:
-        s0 = rec["pos0"]
-        e0 = s0 + len(rec["ref"])
-        active_spans = [sp for sp in active_spans if sp[1] > s0]
-        ov_recs = [sp for sp in active_spans if max(sp[0], s0) < min(sp[1], e0)]
+        s0, e0 = _effective_span(rec)
+        active_spans = [sp for sp in active_spans if sp[1] > s0 or (sp[0] == sp[1] == s0)]
+        ov_recs = [
+            sp for sp in active_spans
+            if (max(sp[0], s0) < min(sp[1], e0)) or (sp[0] == sp[1] == s0 == e0)
+        ]
         used = sum(sp[2] for sp in ov_recs)
         gt = rec["gt"]
         copies = 2 if gt in ("1/1", "1/2") else 1
@@ -1586,9 +1707,12 @@ def call_contig_diploid_batch(
     global _FORK_CALL_CTX
     _FORK_CALL_CTX = (g, acc, p, return_pileup_also)
     try:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
         ctx = mp.get_context("fork")
-        with ctx.Pool(processes=eff_w) as pool:
-            for cid, res in pool.imap_unordered(_fork_call_contig_one, ordered, chunksize=1):
+        with ProcessPoolExecutor(max_workers=eff_w, mp_context=ctx) as ex:
+            futs = {ex.submit(_fork_call_contig_one, cid): cid for cid in ordered}
+            for fut in as_completed(futs):
+                cid, res = fut.result()
                 if return_pileup_also:
                     recs, pil_recs = res
                     calls_by_ctg[cid] = recs
@@ -1597,6 +1721,8 @@ def call_contig_diploid_batch(
                     calls_by_ctg[cid] = res
     finally:
         _FORK_CALL_CTX = None
+    if len(calls_by_ctg) != len(cids):
+        raise RuntimeError(f"Incomplete contig batch result: got {len(calls_by_ctg)} of {len(cids)} contigs")
     return calls_by_ctg, pileup_by_ctg
 
 
@@ -1796,10 +1922,15 @@ def run_varloop_fastq(
     also_out_pileup_vcf_gz: str | Path | None = None,
     call_workers: int = 1,
     mapper_name: str = "strobealign",
+    clip_regions: Sequence[tuple[str, int, int]] | None = None,
+    callable_npz_out: str | Path | None = None,
 ) -> dict:
     """Stream paired FASTQ -> aligner -> lock-free C PagedContigAccumulator -> Diploid Omnitig VCF."""
+    import tempfile
     import threading
     p = params or DiploidParams()
+    _validate_fastq_input(Path(r1_gz))
+    _validate_fastq_input(Path(r2_gz))
     rss_mon = ProcTreeRssMonitor().start()
     t0 = time.time()
     cpu0 = _cpu_times()
@@ -1815,13 +1946,13 @@ def run_varloop_fastq(
         else:
             cmd += [ref_str, str(r1_gz), str(r2_gz)]
     elif mapper_name == "minimap2":
-        cmd = ["minimap2", "-t", str(map_threads), "-K", "20M", "-ax", "sr", ref_str]
+        cmd = ["minimap2", "-t", str(map_threads), "-K", "1M", "-ax", "sr", ref_str]
         if use_subsample_pipe:
             cmd += ["-"]
         else:
             cmd += [str(r1_gz), str(r2_gz)]
     elif mapper_name in ("bwa-mem2", "bwa"):
-        cmd = [mapper_name, "mem", "-t", str(map_threads)]
+        cmd = [mapper_name, "mem", "-K", "1000000", "-t", str(map_threads)]
         if use_subsample_pipe:
             cmd += ["-p", ref_str, "-"]
         else:
@@ -1832,18 +1963,24 @@ def run_varloop_fastq(
     sieve_stats = np.zeros(8, dtype=np.int64)
     sieve_err: list[str] = []
     t_stream0 = time.time()
+    Path(out_vcf_gz).parent.mkdir(parents=True, exist_ok=True)
 
-    with PagedContigAccumulator(g, p, target_regions=target_regions, zoom_regions=zoom_regions) as acc:
+    with (
+        tempfile.TemporaryFile(dir=str(Path(out_vcf_gz).parent)) as mapper_err_f,
+        PagedContigAccumulator(g, p, target_regions=target_regions, zoom_regions=zoom_regions) as acc,
+    ):
         if use_subsample_pipe:
             r_fd, w_fd = os.pipe()
-            mapper = subprocess.Popen(cmd, stdin=r_fd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+            mapper = subprocess.Popen(cmd, stdin=r_fd, stdout=subprocess.PIPE, stderr=mapper_err_f, bufsize=0)
             os.close(r_fd)
             dec1 = _fastq_decomp_cmd(r1_gz, 6)
             dec2 = _fastq_decomp_cmd(r2_gz, 6)
-            p_in1 = subprocess.Popen(dec1, stdout=subprocess.PIPE)
-            p_in2 = subprocess.Popen(dec2, stdout=subprocess.PIPE)
+            p_in1 = subprocess.Popen(dec1, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            p_in2 = subprocess.Popen(dec2, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
             def _pump_sieve():
+                rc_i1 = 0
+                rc_i2 = 0
                 try:
                     lib = _lib()
                     keep_thr = min(int(p_sample * (1 << 32)), 1 << 32)
@@ -1866,13 +2003,15 @@ def run_varloop_fastq(
                         p_in1.stdout.close()
                     if p_in2.stdout:
                         p_in2.stdout.close()
-                    p_in1.wait()
-                    p_in2.wait()
+                    rc_i1 = p_in1.wait()
+                    rc_i2 = p_in2.wait()
+                    if rc_i1 != 0 or rc_i2 != 0:
+                        sieve_err.append(f"FASTQ decompressor failed: rc=({rc_i1},{rc_i2})")
 
             pump_thr = threading.Thread(target=_pump_sieve, daemon=True)
             pump_thr.start()
         else:
-            mapper = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+            mapper = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=mapper_err_f, bufsize=0)
             pump_thr = None
 
         try:
@@ -1882,8 +2021,9 @@ def run_varloop_fastq(
                 mapper.stdout.close()
         if pump_thr is not None:
             pump_thr.join(timeout=120)
-        stderr_txt = mapper.stderr.read().decode("utf-8", errors="replace") if mapper.stderr else ""
         rc = mapper.wait()
+        mapper_err_f.seek(0)
+        stderr_txt = mapper_err_f.read().decode("utf-8", errors="replace")
         if sieve_err:
             raise RuntimeError("; ".join(sieve_err))
         if rc != 0:
@@ -1892,6 +2032,21 @@ def run_varloop_fastq(
         t_stream = time.time() - t_stream0
         rss_mon.sample_once()
         summ = acc.summary()
+        sam_recs = int(summ["stats"][0])
+        reads_cnt = int(summ["stats"][2])
+        malf_cnt = int(summ["stats"][11])
+        if sam_recs <= 0 or reads_cnt <= 0:
+            raise RuntimeError(
+                f"Sample {sample!r}: zero usable reads aligned/counted "
+                f"(sam_records={sam_recs}, reads_counted={reads_cnt}, malformed_sam={malf_cnt})"
+            )
+        if malf_cnt > 0.5 * max(sam_recs, 1):
+            raise RuntimeError(
+                f"Sample {sample!r}: majority of SAM records rejected as malformed ({malf_cnt}/{sam_recs})"
+            )
+        if callable_npz_out is not None:
+            acc.save_callable_npz(callable_npz_out, min_dp=1)
+        med_dp = _estimate_median_depth(g, summ, acc._target_bin_mask)
         # Pre-sort all captured contig read arrays once before calling
         acc.sort_all_reads()
 
@@ -1910,7 +2065,12 @@ def run_varloop_fastq(
             return_pileup_also=want_both,
             weights=summ["ccount"],
         )
-        n_asm = sum(1 for recs in calls_by_ctg.values() for r in recs if r["source"] == "omnitig_asm")
+        eff_clip = clip_regions if clip_regions is not None else target_regions
+        if eff_clip is not None:
+            calls_by_ctg = _clip_calls_to_regions(calls_by_ctg, eff_clip, cidx)
+            if want_both:
+                pileup_by_ctg = _clip_calls_to_regions(pileup_by_ctg, eff_clip, cidx)
+        n_asm = sum(1 for recs in calls_by_ctg.values() for r in recs if str(r.get("source", "")).startswith("omnitig_asm"))
         t_call = time.time() - t_call0
 
     n_vcf = write_diploid_vcf(g, calls_by_ctg, out_vcf_gz, sample=sample, contig_ids=want_cids)
@@ -1936,6 +2096,7 @@ def run_varloop_fastq(
         "primary_mapped": int(summ["stats"][1]),
         "reads_counted": int(summ["stats"][2]),
         "bases_counted": int(summ["stats"][3]),
+        "median_depth": med_dp,
         "pcr_dups_skipped": int(summ["stats"][10]),
         "pcr_dup_fraction": round(float(summ["stats"][10]) / max(int(summ["stats"][1]), 1), 6),
         "malformed_sam_rejected": int(summ["stats"][11]),
@@ -1968,6 +2129,279 @@ def run_varloop_fastq(
         out_tel["pileup_vcf_path"] = str(also_out_pileup_vcf_gz)
         out_tel["n_pileup_variants"] = n_pileup_vcf
     return out_tel
+
+
+BGZF_EOF = b"\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00\x42\x43\x02\x00\x1b\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+
+def _estimate_median_depth(g: G.Genome, summ: dict, target_bin_mask: np.ndarray | None = None) -> float:
+    bb = summ["binbases"]
+    if target_bin_mask is not None and target_bin_mask.any():
+        vals = bb[target_bin_mask].astype(np.float64) / 1000.0
+    else:
+        vals = bb[bb > 0].astype(np.float64) / 1000.0
+    if len(vals) == 0:
+        tot_len = max(1, int(summ.get("eff_bp") or int(g.lengths.sum())))
+        return round(float(summ["stats"][3]) / float(tot_len), 2)
+    return round(float(np.median(vals)), 2)
+
+
+def _clip_calls_to_regions(
+    calls_by_ctg: dict[int, list[dict]],
+    clip_regions: Sequence[tuple[str, int, int]],
+    cidx: dict[str, int],
+) -> dict[int, list[dict]]:
+    """Restrict emitted variant records to those overlapping unpadded target BED intervals (L38)."""
+    by_cid: dict[int, list[tuple[int, int]]] = {}
+    for cn, s0, e0 in clip_regions:
+        if cn in cidx and int(e0) > int(s0):
+            by_cid.setdefault(cidx[cn], []).append((int(s0), int(e0)))
+    for cid in list(by_cid.keys()):
+        ivs = sorted(by_cid[cid])
+        merged: list[tuple[int, int]] = []
+        for a, b in ivs:
+            if merged and a <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        by_cid[cid] = merged
+
+    clipped: dict[int, list[dict]] = {}
+    for cid, recs in calls_by_ctg.items():
+        ivs = by_cid.get(cid)
+        if not ivs:
+            clipped[cid] = []
+            continue
+        ends = [b for _, b in ivs]
+        import bisect
+        kept_r: list[dict] = []
+        for r in recs:
+            p0 = int(r["pos0"])
+            p1 = p0 + max(1, len(str(r["ref"])))
+            idx = bisect.bisect_right(ends, p0)
+            if idx < len(ivs) and ivs[idx][0] < p1:
+                kept_r.append(r)
+        clipped[cid] = kept_r
+    return clipped
+
+
+def _validate_fastq_input(fq_path: Path) -> None:
+    """Validate FASTQ(.gz) input magic bytes, non-emptiness, and gzip stream trailer integrity (#23)."""
+    if not fq_path.is_file():
+        raise FileNotFoundError(f"FASTQ file does not exist: {fq_path.name}")
+    sz = fq_path.stat().st_size
+    if sz == 0:
+        raise ValueError(f"FASTQ input {fq_path.name!r} is empty (0 bytes)")
+    with open(fq_path, "rb") as fh:
+        head = fh.read(256)
+    if head.startswith(b"BZh"):
+        raise ValueError(f"Unsupported bzip2 FASTQ {fq_path.name!r} (expected uncompressed FASTQ or .fastq.gz)")
+    if head.startswith(b"\xfd7zXZ\x00"):
+        raise ValueError(f"Unsupported xz FASTQ {fq_path.name!r} (expected uncompressed FASTQ or .fastq.gz)")
+    if head.startswith(b"\x28\xb5\x2f\xfd"):
+        raise ValueError(f"Unsupported zstd FASTQ {fq_path.name!r} (expected uncompressed FASTQ or .fastq.gz)")
+    if head.startswith((b"BAM\x01", b"CRAM")):
+        raise ValueError(f"Alignment file {fq_path.name!r} supplied where FASTQ reads were expected")
+    if head[:2] == b"\x1f\x8b":
+        try:
+            with gzip.open(fq_path, "rb") as gzf:
+                first_chunk = gzf.read(256)
+        except Exception as exc:
+            raise ValueError(f"Corrupt or truncated gzip FASTQ {fq_path.name!r}: {exc}") from exc
+        if not first_chunk:
+            raise ValueError(f"Gzipped FASTQ {fq_path.name!r} decompresses to 0 bytes")
+        if not first_chunk.startswith(b"@"):
+            raise ValueError(f"Gzipped input {fq_path.name!r} is not FASTQ (first record does not start with '@')")
+        # Verify full gzip stream integrity (catches truncated .gz even when external mappers ignore EOF errors)
+        gz_tool = shutil.which("gzip")
+        if gz_tool:
+            chk = subprocess.run([gz_tool, "-t", str(fq_path)], capture_output=True, text=True)
+            if chk.returncode != 0:
+                raise ValueError(f"Truncated or corrupt gzip FASTQ {fq_path.name!r}: {chk.stderr.strip()}")
+    else:
+        low = head[:64].lstrip().lower()
+        if low.startswith((b"<!doctype", b"<html", b"<?xml", b"<error")):
+            raise ValueError(f"Input {fq_path.name!r} is an HTML/XML error document rather than FASTQ")
+        if not head.startswith(b"@"):
+            raise ValueError(f"Input {fq_path.name!r} is not valid FASTQ (first byte is not '@')")
+
+
+def _parse_sam_header_sq(header_text: str) -> list[tuple[str, int]]:
+    out: list[tuple[str, int]] = []
+    for ln in header_text.splitlines():
+        if ln.startswith("@SQ\t") or ln.startswith("@SQ "):
+            fields: dict[str, str] = {}
+            for tok in ln.split("\t")[1:]:
+                if ":" in tok:
+                    k, v = tok.split(":", 1)
+                    fields[k] = v.strip()
+            if "SN" in fields and "LN" in fields:
+                out.append((fields["SN"], int(fields["LN"])))
+    return out
+
+
+def _extract_header_sq_from_cram_bytes(header_bytes: bytes, ref_fasta: Path, tmp_dir: Path) -> list[tuple[str, int]]:
+    hdr_cram = tmp_dir / "header_probe.cram"
+    hdr_cram.write_bytes(header_bytes + C_CRAM_EOF)
+    try:
+        if shutil.which("samtools"):
+            pr = subprocess.run(
+                ["samtools", "view", "-H", "--reference", str(ref_fasta), str(hdr_cram)],
+                capture_output=True,
+                text=True,
+            )
+            if pr.returncode != 0:
+                raise RuntimeError(f"Failed reading CRAM header: {pr.stderr.strip()[-300:]}")
+            return _parse_sam_header_sq(pr.stdout)
+        import pysam
+        with pysam.AlignmentFile(str(hdr_cram), "rc", reference_filename=str(ref_fasta)) as af:
+            return _parse_sam_header_sq(str(af.header))
+    finally:
+        hdr_cram.unlink(missing_ok=True)
+
+
+def _validate_sq_against_genome(
+    g: G.Genome,
+    sq_list: list[tuple[str, int]],
+    required_contigs: Sequence[str] | None = None,
+    label: str = "alignment",
+) -> dict[str, int]:
+    """Validate BAM/CRAM @SQ contigs & lengths against reference Genome (#22, #24); return `@SQ` index map."""
+    if not sq_list:
+        raise ValueError(f"{label}: header contains zero @SQ reference sequence lines")
+    cidx = {n: i for i, n in enumerate(g.names)}
+    sq_idx: dict[str, int] = {}
+    sq_len: dict[str, int] = {}
+    matched = 0
+    for idx, (sn, ln) in enumerate(sq_list):
+        sq_idx[sn] = idx
+        sq_len[sn] = ln
+        if sn in cidx:
+            matched += 1
+            ref_ln = int(g.lengths[cidx[sn]])
+            if ln != ref_ln:
+                raise ValueError(
+                    f"{label}: @SQ contig {sn!r} length {ln} does not match reference FASTA length {ref_ln}"
+                )
+    if matched == 0:
+        raise ValueError(
+            f"{label}: zero @SQ contigs match reference FASTA "
+            f"(header contigs: {[s for s, _ in sq_list[:5]]}, reference contigs: {list(g.names[:5])})"
+        )
+    if required_contigs:
+        missing = [cn for cn in dict.fromkeys(required_contigs) if cn not in sq_idx]
+        if missing:
+            raise ValueError(
+                f"{label}: target contigs {missing[:5]} are absent from alignment @SQ header "
+                f"(header contigs: {[s for s, _ in sq_list[:5]]})"
+            )
+    return sq_idx
+
+
+def _validate_local_aln_integrity(g: G.Genome, aln_path: Path, ref_fasta: Path, req_contigs: Sequence[str] | None = None) -> None:
+    """Validate BAM/CRAM non-emptiness, BGZF/CRAM EOF markers, samtools quickcheck, and @SQ header (#24, #25)."""
+    if not aln_path.is_file():
+        raise FileNotFoundError(f"Alignment file does not exist: {aln_path.name}")
+    sz = aln_path.stat().st_size
+    if sz == 0:
+        raise ValueError(f"Alignment file {aln_path.name!r} is empty (0 bytes)")
+    with open(aln_path, "rb") as fh:
+        magic = fh.read(4)
+        tail_38 = b""
+        if sz >= 28:
+            fh.seek(max(0, sz - 38))
+            tail_38 = fh.read(38)
+    if magic == b"CRAM":
+        if sz < len(C_CRAM_EOF) or tail_38[-len(C_CRAM_EOF):] != C_CRAM_EOF:
+            raise RuntimeError(f"Truncated CRAM file {aln_path.name!r}: CRAM EOF container is absent")
+    elif magic[:2] == b"\x1f\x8b":
+        if sz < len(BGZF_EOF) or tail_38[-len(BGZF_EOF):] != BGZF_EOF:
+            raise RuntimeError(f"Truncated BAM file {aln_path.name!r}: BGZF EOF marker is absent")
+    elif magic != b"BAM\x01":
+        raise ValueError(f"Input {aln_path.name!r} is neither a valid BAM nor CRAM file")
+
+    if shutil.which("samtools"):
+        qc = subprocess.run(["samtools", "quickcheck", str(aln_path)], capture_output=True, text=True)
+        if qc.returncode != 0:
+            raise RuntimeError(f"samtools quickcheck failed on {aln_path.name!r}: {qc.stderr.strip()}")
+        pr = subprocess.run(
+            ["samtools", "view", "-H", "--reference", str(ref_fasta), str(aln_path)],
+            capture_output=True,
+            text=True,
+        )
+        if pr.returncode != 0:
+            raise RuntimeError(f"Failed reading alignment header of {aln_path.name!r}: {pr.stderr.strip()[-300:]}")
+        sq_list = _parse_sam_header_sq(pr.stdout)
+    else:
+        import pysam
+        mode = "rc" if magic == b"CRAM" else "rb"
+        with pysam.AlignmentFile(str(aln_path), mode, reference_filename=str(ref_fasta)) as af:
+            if getattr(af, "check_truncation", False) and not getattr(af, "eof", True):
+                raise RuntimeError(f"Truncated alignment file {aln_path.name!r}: EOF marker is absent")
+            sq_list = _parse_sam_header_sq(str(af.header))
+    _validate_sq_against_genome(g, sq_list, required_contigs=req_contigs, label=aln_path.name)
+
+
+def _fetch_remote_range_chunked(url: str, start: int, end: int, write_fn, max_chunk: int = 32 << 20, tries: int = 4) -> int:
+    """Fetch remote byte interval `[start, end)` in `<= 32 MiB` HTTP 206 streaming chunks with retries (#26, #42)."""
+    from . import streamer as ST
+    ss = ST._session()
+    total_written = 0
+    pos = int(start)
+    end_i = int(end)
+    while pos < end_i:
+        sub_end = min(end_i, pos + max_chunk)
+        want = sub_end - pos
+        for attempt in range(tries):
+            got_sub = 0
+            try:
+                with ss.get(
+                    url,
+                    headers={"Range": f"bytes={pos + got_sub}-{sub_end - 1}"},
+                    timeout=(30, 180),
+                    stream=True,
+                ) as r:
+                    r.raise_for_status()
+                    if r.status_code != 206:
+                        raise RuntimeError(
+                            f"Remote server ignored HTTP Range request on {url} (status {r.status_code}, expected 206)"
+                        )
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            write_fn(chunk)
+                            got_sub += len(chunk)
+                if got_sub != want:
+                    raise RuntimeError(f"Truncated HTTP 206 range response: got {got_sub} bytes, expected {want}")
+                total_written += got_sub
+                pos = sub_end
+                break
+            except Exception:
+                if attempt + 1 >= tries:
+                    raise
+                time.sleep(min(15.0, 1.5 * (2 ** attempt)))
+    return total_written
+
+
+def _probe_remote_cram_size(url: str) -> int | None:
+    from . import streamer as ST
+    ss = ST._session()
+    try:
+        rh = ss.head(url, allow_redirects=True, timeout=30)
+        if 200 <= rh.status_code < 300 and rh.headers.get("Content-Length"):
+            return int(rh.headers["Content-Length"])
+    except Exception:
+        pass
+    try:
+        with ss.get(url, headers={"Range": "bytes=0-0"}, allow_redirects=True, timeout=30, stream=True) as rg:
+            if rg.status_code == 206:
+                cr = rg.headers.get("Content-Range", "")
+                if "/" in cr:
+                    tot_s = cr.rsplit("/", 1)[-1].strip()
+                    if tot_s.isdigit():
+                        return int(tot_s)
+    except Exception:
+        pass
+    return None
 
 
 def _stream_aln_via_pysam(
@@ -2018,172 +2452,224 @@ def run_varloop_crai_focused(
     sample: str = "HG002",
     pad_bp: int = 1000,
     zoom_assisted: bool = True,
+    clip_regions: Sequence[tuple[str, int, int]] | None = None,
+    callable_npz_out: str | Path | None = None,
 ) -> dict:
     """Slice exact CRAM containers via `.crai` (`plan_ranges`), feed directly into `PagedContigAccumulator`, and call.
 
     NOTE: Requires a pre-aligned indexed CRAM + `.crai`; upstream read alignment and CRAM encoding are excluded.
     """
+    import shlex
+    import tempfile
+    import threading
+
     p = params or DiploidParams()
     rss_mon = ProcTreeRssMonitor().start()
     t0 = time.time()
     cpu0 = _cpu_times()
     cidx = {n: i for i, n in enumerate(g.names)}
-    regs_fc = [
-        (cidx[cn], max(1, int(s0) + 1 - pad_bp), min(int(g.lengths[cidx[cn]]), int(e0) + pad_bp), cn)
-        for cn, s0, e0 in regions_bed if cn in cidx
-    ]
+    if not regions_bed:
+        raise ValueError("run_varloop_crai_focused requires at least one target region")
+    unknown_bed = [cn for cn, _, _ in regions_bed if cn not in cidx]
+    if len(unknown_bed) == len(regions_bed):
+        raise ValueError(
+            f"Target BED contigs {list(dict.fromkeys(unknown_bed))[:5]} do not match reference FASTA {list(g.names[:5])}"
+        )
+
     crai_arr = FC.parse_crai(crai_path)
-    # Include the final CRAM container offset -> file end for both local and remote files
-    if Path(str(cram_path_or_url)).exists():
-        cram_size = Path(cram_path_or_url).stat().st_size
+    if len(crai_arr) == 0:
+        raise ValueError(f"Empty CRAI index: {Path(crai_path).name}")
+    hdr_end = int(np.unique(crai_arr[:, 3])[0])
+    if hdr_end <= 0:
+        raise ValueError(f"Invalid CRAM header offset {hdr_end} in CRAI index")
+
+    is_local_cram = not str(cram_path_or_url).startswith(("http://", "https://", "ftp://")) and Path(str(cram_path_or_url)).exists()
+    if is_local_cram:
+        local_cp = Path(cram_path_or_url)
+        cram_size = local_cp.stat().st_size
+        if cram_size < hdr_end:
+            raise RuntimeError(f"Truncated CRAM file {local_cp.name!r}: size {cram_size} < header end {hdr_end}")
+        with open(local_cp, "rb") as fc_hdr:
+            header_bytes = fc_hdr.read(hdr_end)
+        if len(header_bytes) != hdr_end:
+            raise RuntimeError(f"Short read on CRAM header of {local_cp.name!r}: got {len(header_bytes)} != {hdr_end}")
     else:
-        cram_size = None
-        try:
-            from . import streamer as ST
-            _rh = ST._session().head(str(cram_path_or_url), allow_redirects=True, timeout=30)
-            if _rh.status_code < 400 and _rh.headers.get("Content-Length"):
-                cram_size = int(_rh.headers["Content-Length"])
-        except Exception:
-            cram_size = None
-    hdr_end, byte_ranges, n_cont, _ = FC.plan_ranges(crai_arr, regs_fc, read_pad=200)
-    # Handle last container in CRAM if selected (plan_ranges leaves out last offset when nxt is None)
-    offs = np.unique(crai_arr[:, 3])
-    if len(offs) and cram_size is not None:
-        last_off = int(offs[-1])
-        seq_c, st_c, sp_c = crai_arr[:, 0], crai_arr[:, 1], crai_arr[:, 2]
-        need_last = np.zeros(len(crai_arr), bool)
-        for ci, s1, e1, _ in regs_fc:
-            need_last |= (seq_c == ci) & (st_c <= e1) & (st_c + sp_c - 1 >= s1 - 200)
-        if last_off in set(crai_arr[need_last, 3].tolist()):
-            eof_len = len(C_CRAM_EOF)
-            end_b = cram_size - eof_len if cram_size > last_off + eof_len else cram_size
-            if byte_ranges and byte_ranges[-1][1] == last_off:
-                byte_ranges[-1] = (byte_ranges[-1][0], end_b)
-            else:
-                byte_ranges.append((last_off, end_b))
+        cram_size = _probe_remote_cram_size(str(cram_path_or_url))
+        hdr_chunks: list[bytes] = []
+        _fetch_remote_range_chunked(str(cram_path_or_url), 0, hdr_end, hdr_chunks.append)
+        header_bytes = b"".join(hdr_chunks)
 
-    sliced_bytes = hdr_end + sum(b - a for a, b in byte_ranges) + len(C_CRAM_EOF)
-
-    padded_targets = [(cn, max(0, s0 - pad_bp), min(int(g.lengths[cidx[cn]]), e0 + pad_bp)) for cn, s0, e0 in regions_bed if cn in cidx]
-    zoom_arg = padded_targets if zoom_assisted else None
-    import shlex
-    import tempfile
     Path(out_vcf_gz).parent.mkdir(parents=True, exist_ok=True)
     tmp_coll_dir = Path(tempfile.mkdtemp(prefix="vl_crai_", dir=str(Path(out_vcf_gz).parent)))
-    ref_q = shlex.quote(str(ref_fasta))
-    coll_q = shlex.quote(str(tmp_coll_dir / "coll"))
-    crai_cmd = f"samtools collate -u -O -r 50000 --reference {ref_q} - {coll_q} | samtools view -h -"
     try:
+        # Map .crai seq_id via CRAM @SQ order rather than FASTA contig order (#22, #24)
+        req_ctgs = [cn for cn, _, _ in regions_bed if cn in cidx]
+        sq_list = _extract_header_sq_from_cram_bytes(header_bytes, Path(ref_fasta), tmp_coll_dir)
+        sq_idx = _validate_sq_against_genome(g, sq_list, required_contigs=req_ctgs, label="CRAM")
+
+        regs_fc = [
+            (sq_idx[cn], max(1, int(s0) + 1 - pad_bp), min(int(g.lengths[cidx[cn]]), int(e0) + pad_bp), cn)
+            for cn, s0, e0 in regions_bed if cn in cidx and cn in sq_idx
+        ]
+        hdr_end_plan, byte_ranges, n_cont, _ = FC.plan_ranges(crai_arr, regs_fc, read_pad=200, cram_size=cram_size)
+        assert hdr_end_plan == hdr_end
+        expected_sliced = hdr_end + sum(b - a for a, b in byte_ranges) + len(C_CRAM_EOF)
+
+        padded_targets = [
+            (cn, max(0, int(s0) - pad_bp), min(int(g.lengths[cidx[cn]]), int(e0) + pad_bp))
+            for cn, s0, e0 in regions_bed if cn in cidx
+        ]
+        zoom_arg = padded_targets if zoom_assisted else None
+        ref_q = shlex.quote(str(ref_fasta))
+        coll_q = shlex.quote(str(tmp_coll_dir / "coll"))
+        crai_cmd = f"samtools collate -u -O -r 50000 --reference {ref_q} - {coll_q} | samtools view -h -"
+
         with PagedContigAccumulator(g, p, target_regions=padded_targets, zoom_regions=zoom_arg) as acc:
             if shutil.which("samtools"):
-                view_proc = subprocess.Popen(
-                    ["bash", "-o", "pipefail", "-c", crai_cmd],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-                )
-                import threading
+                with tempfile.TemporaryFile(dir=str(tmp_coll_dir)) as crai_err_f:
+                    view_proc = subprocess.Popen(
+                        ["bash", "-o", "pipefail", "-c", crai_cmd],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=crai_err_f, bufsize=0,
+                    )
+                    feeder_exc: list[BaseException] = []
+                    bytes_fed = [0]
 
-                def _feed_cram():
-                    try:
-                        if Path(str(cram_path_or_url)).exists():
-                            with open(cram_path_or_url, "rb") as fc:
-                                view_proc.stdin.write(fc.read(hdr_end))
+                    def _write_stdin(chunk: bytes) -> None:
+                        assert view_proc.stdin is not None
+                        view_proc.stdin.write(chunk)
+                        bytes_fed[0] += len(chunk)
+
+                    def _feed_cram():
+                        try:
+                            _write_stdin(header_bytes)
+                            if is_local_cram:
+                                with open(cram_path_or_url, "rb") as fc:
+                                    for a, b in byte_ranges:
+                                        fc.seek(a)
+                                        rem = b - a
+                                        while rem > 0:
+                                            blk = fc.read(min(4 << 20, rem))
+                                            if not blk:
+                                                raise RuntimeError(
+                                                    f"Truncated local CRAM {Path(cram_path_or_url).name!r} at offset {b - rem} (expected {b})"
+                                                )
+                                            _write_stdin(blk)
+                                            rem -= len(blk)
+                            else:
                                 for a, b in byte_ranges:
-                                    fc.seek(a)
-                                    rem = b - a
-                                    while rem > 0:
-                                        blk = fc.read(min(4 << 20, rem))
-                                        if not blk:
-                                            break
-                                        view_proc.stdin.write(blk)
-                                        rem -= len(blk)
-                                view_proc.stdin.write(C_CRAM_EOF)
-                        else:
-                            from . import streamer as ST
-                            ss = ST._session()
-                            r = ss.get(str(cram_path_or_url), headers={"Range": f"bytes=0-{hdr_end - 1}"}, timeout=120)
-                            r.raise_for_status()
-                            view_proc.stdin.write(r.content)
-                            for a, b in byte_ranges:
-                                r = ss.get(str(cram_path_or_url), headers={"Range": f"bytes={a}-{b - 1}"}, timeout=180)
-                                r.raise_for_status()
-                                view_proc.stdin.write(r.content)
-                            view_proc.stdin.write(C_CRAM_EOF)
-                    finally:
-                        if view_proc.stdin:
-                            view_proc.stdin.close()
+                                    _fetch_remote_range_chunked(str(cram_path_or_url), a, b, _write_stdin)
+                            _write_stdin(C_CRAM_EOF)
+                        except BaseException as exc:
+                            feeder_exc.append(exc)
+                        finally:
+                            if view_proc.stdin:
+                                try:
+                                    view_proc.stdin.close()
+                                except Exception:
+                                    pass
 
-                th = threading.Thread(target=_feed_cram, daemon=True)
-                th.start()
-                try:
-                    acc.consume_sam_fd(view_proc.stdout.fileno())
-                finally:
-                    if view_proc.stdout:
-                        view_proc.stdout.close()
-                th.join(timeout=60)
-                err_s = view_proc.stderr.read().decode("utf-8", errors="replace") if view_proc.stderr else ""
-                rc = view_proc.wait()
-                if rc != 0:
-                    raise RuntimeError(f"samtools view on sliced CRAM exited {rc}: {err_s[-400:]}")
+                    th = threading.Thread(target=_feed_cram, daemon=True)
+                    th.start()
+                    try:
+                        acc.consume_sam_fd(view_proc.stdout.fileno())
+                    finally:
+                        if view_proc.stdout:
+                            view_proc.stdout.close()
+                    th.join(timeout=120)
+                    rc = view_proc.wait()
+                    crai_err_f.seek(0)
+                    err_s = crai_err_f.read().decode("utf-8", errors="replace")
+                    if feeder_exc:
+                        raise RuntimeError(
+                            f"CRAM slice feeder failed for {sample!r}: {type(feeder_exc[0]).__name__}: {feeder_exc[0]}"
+                        ) from feeder_exc[0]
+                    if bytes_fed[0] != expected_sliced:
+                        raise RuntimeError(
+                            f"CRAM slice byte count mismatch: fed {bytes_fed[0]} != expected {expected_sliced}"
+                        )
+                    if rc != 0 or "EOF marker is absent" in err_s or "truncated file" in err_s.lower():
+                        raise RuntimeError(f"samtools view on sliced CRAM failed (rc={rc}): {err_s[-400:]}")
             else:
                 staged_cram = tmp_coll_dir / "sliced.cram"
+                written = 0
                 with open(staged_cram, "wb") as fo:
-                    if Path(str(cram_path_or_url)).exists():
+                    fo.write(header_bytes)
+                    written += len(header_bytes)
+                    if is_local_cram:
                         with open(cram_path_or_url, "rb") as fc:
-                            fo.write(fc.read(hdr_end))
                             for a, b in byte_ranges:
                                 fc.seek(a)
                                 rem = b - a
                                 while rem > 0:
                                     blk = fc.read(min(4 << 20, rem))
                                     if not blk:
-                                        break
+                                        raise RuntimeError(
+                                            f"Truncated local CRAM {Path(cram_path_or_url).name!r} at offset {b - rem}"
+                                        )
                                     fo.write(blk)
+                                    written += len(blk)
                                     rem -= len(blk)
                     else:
-                        from . import streamer as ST
-                        ss = ST._session()
-                        r = ss.get(str(cram_path_or_url), headers={"Range": f"bytes=0-{hdr_end - 1}"}, timeout=120)
-                        r.raise_for_status()
-                        fo.write(r.content)
                         for a, b in byte_ranges:
-                            r = ss.get(str(cram_path_or_url), headers={"Range": f"bytes={a}-{b - 1}"}, timeout=180)
-                            r.raise_for_status()
-                            fo.write(r.content)
+                            written += _fetch_remote_range_chunked(str(cram_path_or_url), a, b, fo.write)
                     fo.write(C_CRAM_EOF)
+                    written += len(C_CRAM_EOF)
+                if written != expected_sliced:
+                    raise RuntimeError(f"Staged CRAM slice size mismatch: {written} != {expected_sliced}")
                 _stream_aln_via_pysam(acc, staged_cram, Path(ref_fasta), tmp_coll_dir, target_regions=padded_targets)
 
             summ = acc.summary()
+            sam_recs = int(summ["stats"][0])
+            reads_cnt = int(summ["stats"][2])
+            if n_cont > 0 and sam_recs == 0:
+                raise RuntimeError(
+                    f"Sample {sample!r}: focused CRAM decode yielded 0 SAM records across {n_cont} planned containers"
+                )
+            if callable_npz_out is not None:
+                acc.save_callable_npz(callable_npz_out, min_dp=1)
+            med_dp = _estimate_median_depth(g, summ, acc._target_bin_mask)
             acc.sort_all_reads()
             want_cids = sorted({cidx[cn] for cn, _, _ in padded_targets})
             calls_by_ctg = {cid: call_contig_diploid(g, acc, cid, p, free_after=True) for cid in want_cids}
+            eff_clip = clip_regions if clip_regions is not None else regions_bed
+            calls_by_ctg = _clip_calls_to_regions(calls_by_ctg, eff_clip, cidx)
     finally:
         shutil.rmtree(tmp_coll_dir, ignore_errors=True)
 
     n_vcf = write_diploid_vcf(g, calls_by_ctg, out_vcf_gz, sample=sample, contig_ids=want_cids)
     n_snv = sum(
-        1 for calls in calls_by_ctg.values() for c in calls if len(str(c["ref"])) == 1 and len(str(c["alt"])) == 1
+        1
+        for calls in calls_by_ctg.values()
+        for c in calls
+        if len(str(c["ref"])) == 1 and all(len(a) == 1 for a in str(c["alt"]).split(","))
     )
-    n_indel = sum(
-        1 for calls in calls_by_ctg.values() for c in calls if len(str(c["ref"])) != 1 or len(str(c["alt"])) != 1
-    )
+    n_indel = n_vcf - n_snv
     n_omnitig = sum(
-        1 for calls in calls_by_ctg.values() for c in calls if str(c.get("source", "")) == "omnitig"
+        1 for calls in calls_by_ctg.values() for c in calls if str(c.get("source", "")).startswith("omnitig_asm")
     )
     cpu1 = _cpu_times()
     peak_tree_rss, _ = rss_mon.stop()
+    prim_mapped = int(summ["stats"][1])
+    pcr_dups = int(summ["stats"][10])
     return {
+        "sample": sample,
         "mode": "crai_focused (requires pre-aligned CRAM)",
         "requires_prealigned_cram": True,
         "zoom_assisted": zoom_assisted,
         "note": "Requires pre-aligned indexed CRAM + .crai; upstream read alignment and CRAM encoding times are excluded.",
         "cram_total_bytes": cram_size,
-        "crai_sliced_bytes": int(sliced_bytes),
-        "crai_wire_fraction": round(sliced_bytes / cram_size, 6) if cram_size else None,
+        "crai_sliced_bytes": int(expected_sliced),
+        "crai_wire_fraction": round(expected_sliced / cram_size, 6) if cram_size else None,
         "n_containers": int(n_cont),
         "n_coalesced_ranges": len(byte_ranges),
-        "sam_records": int(summ.get("sam_records", 0)),
-        "reads_counted": int(summ.get("reads_counted", 0)),
-        "pcr_dups_skipped": int(summ.get("pcr_dups_skipped", 0)),
+        "sam_records": sam_recs,
+        "primary_mapped": prim_mapped,
+        "reads_counted": reads_cnt,
+        "bases_counted": int(summ["stats"][3]),
+        "median_depth": med_dp,
+        "pcr_dups_skipped": pcr_dups,
+        "pcr_dup_fraction": round(float(pcr_dups) / max(prim_mapped, 1), 6),
+        "malformed_sam_rejected": int(summ["stats"][11]),
         "acc_total_bytes": summ["total_acc_bytes"],
         "peak_proctree_rss_bytes": peak_tree_rss,
         "n_variants": n_vcf,
@@ -2191,6 +2677,7 @@ def run_varloop_crai_focused(
         "n_indel": n_indel,
         "n_omnitig_assembled": n_omnitig,
         "wall_s": round(time.time() - t0, 3),
+        "total_wall_s": round(time.time() - t0, 3),
         "total_cpu_s": round((cpu1[0] - cpu0[0]) + (cpu1[1] - cpu0[1]), 3),
         "vcf_path": str(out_vcf_gz),
     }
@@ -2211,6 +2698,8 @@ def run_varloop_bam_cram(
     threads: int = 4,
     call_workers: int = 1,
     targets_bed: str | Path | None = None,
+    clip_regions: Sequence[tuple[str, int, int]] | None = None,
+    callable_npz_out: str | Path | None = None,
 ) -> dict:
     """Stream a BAM/CRAM alignment file through `samtools collate` into `PagedContigAccumulator` and call."""
     import shlex
@@ -2223,19 +2712,27 @@ def run_varloop_bam_cram(
 
     out_vcf_p = Path(out_vcf_gz)
     out_vcf_p.parent.mkdir(parents=True, exist_ok=True)
-    tmp_coll_dir = Path(tempfile.mkdtemp(prefix="vl_bam_", dir=str(out_vcf_p.parent)))
     cidx = {n: i for i, n in enumerate(g.names)}
     if targets_bed and target_regions is None:
         parsed_regs: list[tuple[str, int, int]] = []
-        with open(targets_bed) as bf:
+        raw_bed_rows = 0
+        with open(targets_bed, encoding="utf-8-sig") as bf:
             for ln in bf:
                 if not ln.strip() or ln.startswith(("#", "track", "browser")):
                     continue
                 parts = ln.split()
-                if len(parts) >= 3 and parts[0] in cidx:
-                    parsed_regs.append((parts[0], max(0, int(parts[1])), min(int(g.lengths[cidx[parts[0]]]), int(parts[2]))))
+                if len(parts) >= 3:
+                    raw_bed_rows += 1
+                    if parts[0] in cidx:
+                        parsed_regs.append((parts[0], max(0, int(parts[1])), min(int(g.lengths[cidx[parts[0]]]), int(parts[2]))))
+        if raw_bed_rows > 0 and not parsed_regs:
+            raise ValueError(f"Target BED {Path(targets_bed).name!r} matched 0 contigs in reference FASTA")
         target_regions = parsed_regs or None
 
+    req_ctgs = [cn for cn, _, _ in target_regions] if target_regions else None
+    _validate_local_aln_integrity(g, Path(bam_or_cram), Path(ref_fasta), req_contigs=req_ctgs)
+
+    tmp_coll_dir = Path(tempfile.mkdtemp(prefix="vl_bam_", dir=str(out_vcf_p.parent)))
     t_q = max(1, int(threads))
     ref_q = shlex.quote(str(ref_fasta))
     in_q = shlex.quote(str(bam_or_cram))
@@ -2257,24 +2754,41 @@ def run_varloop_bam_cram(
     try:
         with PagedContigAccumulator(g, p, target_regions=target_regions, zoom_regions=zoom_regions) as acc:
             if shutil.which("samtools"):
-                view_proc = subprocess.Popen(
-                    ["bash", "-o", "pipefail", "-c", bam_cmd],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-                )
-                try:
-                    acc.consume_sam_fd(view_proc.stdout.fileno())
-                finally:
-                    if view_proc.stdout:
-                        view_proc.stdout.close()
-                err_s = view_proc.stderr.read().decode("utf-8", errors="replace") if view_proc.stderr else ""
-                rc = view_proc.wait()
-                if rc != 0:
-                    raise RuntimeError(f"samtools collate/view failed ({rc}): {err_s[-500:]}")
+                with tempfile.TemporaryFile(dir=str(tmp_coll_dir)) as bam_err_f:
+                    view_proc = subprocess.Popen(
+                        ["bash", "-o", "pipefail", "-c", bam_cmd],
+                        stdout=subprocess.PIPE, stderr=bam_err_f, bufsize=0,
+                    )
+                    try:
+                        acc.consume_sam_fd(view_proc.stdout.fileno())
+                    finally:
+                        if view_proc.stdout:
+                            view_proc.stdout.close()
+                    rc = view_proc.wait()
+                    bam_err_f.seek(0)
+                    err_s = bam_err_f.read().decode("utf-8", errors="replace")
+                    if rc != 0 or "EOF marker is absent" in err_s or "truncated file" in err_s.lower():
+                        raise RuntimeError(f"samtools collate/view failed (rc={rc}): {err_s[-500:]}")
             else:
                 _stream_aln_via_pysam(acc, Path(bam_or_cram), Path(ref_fasta), tmp_coll_dir, target_regions=target_regions)
 
             t_stream = time.time() - t_stream0
             summ = acc.summary()
+            sam_recs = int(summ["stats"][0])
+            reads_cnt = int(summ["stats"][2])
+            malf_cnt = int(summ["stats"][11])
+            if sam_recs <= 0 or reads_cnt <= 0:
+                raise RuntimeError(
+                    f"Sample {sample!r}: zero usable alignments counted from {Path(bam_or_cram).name!r} "
+                    f"(sam_records={sam_recs}, reads_counted={reads_cnt}, malformed_sam={malf_cnt})"
+                )
+            if malf_cnt > 0.5 * max(sam_recs, 1):
+                raise RuntimeError(
+                    f"Sample {sample!r}: majority of SAM records rejected as malformed ({malf_cnt}/{sam_recs})"
+                )
+            if callable_npz_out is not None:
+                acc.save_callable_npz(callable_npz_out, min_dp=1)
+            med_dp = _estimate_median_depth(g, summ, acc._target_bin_mask)
             acc.sort_all_reads()
             t_call0 = time.time()
             if target_regions is not None:
@@ -2288,7 +2802,10 @@ def run_varloop_bam_cram(
                 return_pileup_also=False,
                 weights=summ["ccount"],
             )
-            n_asm = sum(1 for recs in calls_by_ctg.values() for r in recs if r["source"] == "omnitig_asm")
+            eff_clip = clip_regions if clip_regions is not None else target_regions
+            if eff_clip is not None:
+                calls_by_ctg = _clip_calls_to_regions(calls_by_ctg, eff_clip, cidx)
+            n_asm = sum(1 for recs in calls_by_ctg.values() for r in recs if str(r.get("source", "")).startswith("omnitig_asm"))
             t_call = time.time() - t_call0
     finally:
         shutil.rmtree(tmp_coll_dir, ignore_errors=True)
@@ -2301,16 +2818,20 @@ def run_varloop_bam_cram(
         if len(r["ref"]) == 1 and all(len(a) == 1 for a in r["alt"].split(","))
     )
     in_size = Path(bam_or_cram).stat().st_size if Path(str(bam_or_cram)).exists() else 0
+    prim_mapped = int(summ["stats"][1])
+    pcr_dups = int(summ["stats"][10])
     return {
         "sample": sample,
         "mapper": "prealigned_bam_cram",
         "order_mode": summ["order_mode"],
         "input_bytes": in_size,
         "sam_records": int(summ["stats"][0]),
-        "primary_mapped": int(summ["stats"][1]),
+        "primary_mapped": prim_mapped,
         "reads_counted": int(summ["stats"][2]),
         "bases_counted": int(summ["stats"][3]),
-        "pcr_dups_skipped": int(summ["stats"][10]),
+        "median_depth": med_dp,
+        "pcr_dups_skipped": pcr_dups,
+        "pcr_dup_fraction": round(float(pcr_dups) / max(prim_mapped, 1), 6),
         "malformed_sam_rejected": int(summ["stats"][11]),
         "informative_reads_captured": int(summ["stats"][8]),
         "acc_total_bytes": summ["total_acc_bytes"],

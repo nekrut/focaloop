@@ -46,30 +46,55 @@ def _as_str_list(val: str | Path | Sequence[str | Path] | None, *, keep_empty: b
     return out
 
 
-def _clean_sample_name(raw: str | Path | None, fallback: str = "sample_1") -> str:
+def _clean_sample_name(raw: str | Path | None, fallback: str = "sample_1", *, strip_mate_suffix: bool = True) -> str:
     txt = str(raw or "").strip()
     if not txt:
         return fallback
-    base = Path(txt).name if ("/" in txt or "\\" in txt) else txt
+    looks_like_path = (
+        isinstance(raw, Path)
+        or txt.startswith(("/", "./", "../", "~"))
+        or bool(re.match(r"^[A-Za-z]:[\\/]", txt))
+        or bool(_READ_EXT_RE.search(txt))
+        or (txt.lower().endswith(".dat") and "dataset_" in txt.lower())
+    )
+    base = Path(txt).name if (looks_like_path and ("/" in txt or "\\" in txt)) else txt
     if base.lower().endswith(".dat") and base.lower().startswith("dataset_"):
         return fallback
     had_fastq_ext = bool(re.search(r"\.(?:fastqsanger|fastq|fq)(?:\.gz|\.bz2|\.zst)?$", base, re.I))
     stem = _READ_EXT_RE.sub("", base)
-    if had_fastq_ext or re.search(r"(?:_R[12]|_R[12]_001)$", stem, re.I):
+    if strip_mate_suffix and (had_fastq_ext or re.search(r"(?:_R[12]|_R[12]_001)$", stem, re.I)):
         stem = _MATE_SUFFIX_RE.sub("", stem)
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("_.")
-    return cleaned or fallback
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("_.").lstrip("-").strip("_.")
+    if not cleaned:
+        fb = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(fallback)).strip("_.").lstrip("-").strip("_.")
+        return fb or "sample_1"
+    return cleaned
 
 
 def _dedup_sample_names(names: Sequence[str]) -> list[str]:
     seen: dict[str, int] = {}
     out: list[str] = []
+    renamed: list[str] = []
     for raw in names:
-        n = raw or "sample"
+        n = (raw or "sample").lstrip("-") or "sample"
         cnt = seen.get(n, 0) + 1
         seen[n] = cnt
-        out.append(n if cnt == 1 else f"{n}_{cnt}")
+        final_n = n if cnt == 1 else f"{n}_{cnt}"
+        if cnt > 1:
+            renamed.append(f"{n}->{final_n}")
+        out.append(final_n)
+    if renamed:
+        _log(f"Deduplicated colliding sample identifiers: {', '.join(renamed[:10])}")
     return out
+
+
+def _vcf_has_variants(vcf_path: Path) -> bool:
+    opener = gzip.open if str(vcf_path).endswith(".gz") else open
+    with opener(vcf_path, "rt", encoding="utf-8", errors="replace") as fh:
+        for ln in fh:
+            if ln and not ln.startswith("#"):
+                return True
+    return False
 
 
 def _bcftools_merge_batched(
@@ -81,6 +106,11 @@ def _bcftools_merge_batched(
 ) -> None:
     """Hierarchically merge bgzipped+tabix VCFs in batches <= batch_size to avoid ulimit -n exhaustion."""
     cur = [Path(p) for p in vcf_paths]
+    if not any(_vcf_has_variants(p) for p in cur):
+        _merge_vcfs_pure_python(cur, merged_gz)
+        if shutil.which("tabix") and str(merged_gz).endswith(".gz"):
+            subprocess.run(["tabix", "-f", "-p", "vcf", str(merged_gz)], check=False)
+        return
     merge_threads = str(max(1, min(int(threads), 8)))
     round_idx = 0
     while len(cur) > batch_size:
@@ -93,11 +123,18 @@ def _bcftools_merge_batched(
             if len(chunk) == 1:
                 next_round.append(chunk[0])
                 continue
+            out_b = bdir / f"batch_{bi // batch_size:04d}.vcf.gz"
+            if not any(_vcf_has_variants(p) for p in chunk):
+                plain_b = out_b.with_suffix("")
+                _merge_vcfs_pure_python(chunk, plain_b)
+                subprocess.run(["bgzip", "-f", str(plain_b)], check=True)
+                subprocess.run(["tabix", "-f", "-p", "vcf", str(out_b)], check=True)
+                next_round.append(out_b)
+                continue
             fofn = bdir / f"batch_{bi // batch_size:04d}.fofn"
             fofn.write_text("\n".join(str(p) for p in chunk) + "\n", encoding="utf-8")
-            out_b = bdir / f"batch_{bi // batch_size:04d}.vcf.gz"
             subprocess.run(
-                ["bcftools", "merge", "--threads", merge_threads, "-l", str(fofn), "-Oz", "-o", str(out_b)],
+                ["bcftools", "merge", "--no-version", "--threads", merge_threads, "-l", str(fofn), "-Oz", "-o", str(out_b)],
                 check=True,
             )
             subprocess.run(["tabix", "-f", "-p", "vcf", str(out_b)], check=True)
@@ -106,7 +143,7 @@ def _bcftools_merge_batched(
     fofn_final = work_dir / "merge_final.fofn"
     fofn_final.write_text("\n".join(str(p) for p in cur) + "\n", encoding="utf-8")
     subprocess.run(
-        ["bcftools", "merge", "--threads", merge_threads, "-l", str(fofn_final), "-Oz", "-o", str(merged_gz)],
+        ["bcftools", "merge", "--no-version", "--threads", merge_threads, "-l", str(fofn_final), "-Oz", "-o", str(merged_gz)],
         check=True,
     )
 
@@ -206,6 +243,7 @@ _BASE_CSS = """
   .kpi .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
   .section { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
              padding: 18px 20px; margin-bottom: 16px; }
+  .warn-box { border-color: #f59e0b; background: #fffbeb; }
   .section h2 { margin: 0 0 10px 0; font-size: 16px; font-weight: 650;
                 border-bottom: 1px solid var(--border); padding-bottom: 8px; }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
@@ -335,15 +373,31 @@ def _ensure_faidx(fa_path: Path) -> None:
 
 
 def _read_manifest_table(manifest_path: str | Path) -> list[dict[str, str]]:
-    text = Path(manifest_path).read_text(encoding="utf-8")
-    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    text = Path(manifest_path).read_text(encoding="utf-8-sig")
+    non_blank = [ln for ln in text.splitlines() if ln.strip()]
+    if not non_blank:
+        raise ValueError(f"{Path(manifest_path).name}: manifest is empty")
+    lines: list[str] = []
+    for idx_ln, ln in enumerate(non_blank):
+        s_ln = ln.lstrip()
+        if s_ln.startswith("#"):
+            # Allow a leading '#' on the header row (e.g. `#sample_id\tgroup`) while skipping comment lines (L36)
+            cand_hdr = s_ln.lstrip("#").strip()
+            if not lines and ("\t" in cand_hdr or "," in cand_hdr) and re.search(
+                r"\b(?:sample|sample_id|id|group|population|country|country_or_group|source|accession|url)\b",
+                cand_hdr,
+                re.I,
+            ):
+                lines.append(cand_hdr)
+            continue
+        lines.append(ln)
     if not lines:
-        raise ValueError(f"{manifest_path}: manifest is empty")
+        raise ValueError(f"{Path(manifest_path).name}: manifest contains no header or sample rows")
     delim = "\t" if "\t" in lines[0] else ","
     reader = csv.DictReader(io.StringIO("\n".join(lines)), delimiter=delim)
-    rows = [{(k or "").strip(): (v or "").strip() for k, v in row.items()} for row in reader]
+    rows = [{(k or "").strip().lstrip("\ufeff"): (v or "").strip() for k, v in row.items()} for row in reader]
     if not rows:
-        raise ValueError(f"{manifest_path}: manifest has header but zero sample rows")
+        raise ValueError(f"{Path(manifest_path).name}: manifest has header but zero sample rows")
     return rows
 
 
@@ -367,33 +421,71 @@ def _ipv4_session():
     return s
 
 
-def _head_content_length(url: str, timeout: float = 45.0) -> int:
+def _head_content_length(url: str, timeout: float = 45.0, retries: int = 3) -> int:
     s = _ipv4_session()
-    try:
-        r = s.head(url, allow_redirects=True, timeout=timeout)
-        if r.status_code < 400 and r.headers.get("Content-Length"):
-            return int(r.headers["Content-Length"])
-    except Exception:
-        pass
-    r = s.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=timeout)
-    try:
-        cr = r.headers.get("Content-Range", "")
-        if "/" in cr:
-            tot = cr.rsplit("/", 1)[-1]
-            if tot.isdigit():
-                return int(tot)
-        if r.headers.get("Content-Length"):
-            return int(r.headers["Content-Length"])
-    finally:
-        r.close()
-    raise RuntimeError(f"Could not determine remote byte length for {url}")
+    last_err: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            r = s.head(url, allow_redirects=True, timeout=timeout)
+            if 200 <= r.status_code < 300 and r.headers.get("Content-Length"):
+                return int(r.headers["Content-Length"])
+            if r.status_code in (401, 403, 404, 410):
+                r.raise_for_status()
+        except Exception as exc:
+            last_err = exc
+            if getattr(getattr(exc, "response", None), "status_code", None) in (401, 403, 404, 410):
+                raise
+        try:
+            with s.get(url, headers={"Range": "bytes=0-0"}, stream=True, allow_redirects=True, timeout=timeout) as rg:
+                rg.raise_for_status()
+                if rg.status_code == 206:
+                    cr = rg.headers.get("Content-Range", "")
+                    if "/" in cr:
+                        tot = cr.rsplit("/", 1)[-1].strip()
+                        if tot.isdigit():
+                            return int(tot)
+                elif rg.status_code == 200 and rg.headers.get("Content-Length"):
+                    return int(rg.headers["Content-Length"])
+        except Exception as exc:
+            last_err = exc
+            if getattr(getattr(exc, "response", None), "status_code", None) in (401, 403, 404, 410):
+                raise
+        if attempt + 1 < retries:
+            time.sleep(1.0 * (2 ** attempt))
+    raise RuntimeError(f"Could not determine remote byte length for {url}: {last_err}")
 
 
-def _fetch_crai_file(crai_uri: str, dst: Path) -> Path:
+def _assert_manifest_uri_allowed(
+    uri: str,
+    sample_id: str,
+    field_name: str,
+    *,
+    allow_local: bool,
+    local_map: dict[str, list[Path]] | None = None,
+) -> None:
+    if not uri or allow_local:
+        return
+    if local_map and (uri in local_map or sample_id in local_map):
+        return
+    if uri.startswith(("http://", "https://", "ftp://")):
+        return
+    accs = [a.strip() for a in re.split(r"[;,]", uri) if a.strip()]
+    if accs and all(_INSDC_RUN_RE.match(a) for a in accs):
+        return
+    raise ValueError(
+        f"Sample {sample_id!r}: local filesystem path in manifest {field_name} is disallowed "
+        "(pass --allow-local-manifest-paths on CLI or supply Galaxy History datasets)"
+    )
+
+
+def _fetch_crai_file(crai_uri: str, dst: Path, *, allow_local: bool = True) -> Path:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if Path(crai_uri).exists():
-        shutil.copy2(crai_uri, dst)
-        return dst
+    if not crai_uri.startswith(("http://", "https://", "ftp://")):
+        if not allow_local:
+            raise ValueError("Local CRAI path in manifest requires --allow-local-manifest-paths")
+        if Path(crai_uri).is_file():
+            shutil.copy2(crai_uri, dst)
+            return dst
     s = _ipv4_session()
     last_err: Exception | None = None
     for attempt in range(5):
@@ -417,13 +509,27 @@ def _fetch_crai_file(crai_uri: str, dst: Path) -> Path:
     raise RuntimeError(f"Failed to fetch CRAI {crai_uri}: {last_err}")
 
 
-def _resolve_ena_or_odp(acc: str) -> dict[str, Any]:
+def _match_ena_paired_urls(urls: Sequence[str]) -> tuple[str | None, str | None]:
+    """Select _1/_2 paired FASTQ URLs explicitly even when ENA lists 3 files (ACC.fastq.gz + _1 + _2) (#21)."""
+    clean = [u.strip() for u in urls if u and u.strip()]
+    if not clean:
+        return None, None
+    r1_m = [u for u in clean if re.search(r"_(?:R?1)(?:_001)?\.f(?:ast)?q(?:\.gz)?$", u.split("?", 1)[0], re.I)]
+    r2_m = [u for u in clean if re.search(r"_(?:R?2)(?:_001)?\.f(?:ast)?q(?:\.gz)?$", u.split("?", 1)[0], re.I)]
+    if r1_m and r2_m:
+        return r1_m[0], r2_m[0]
+    if len(clean) == 2:
+        return clean[0], clean[1]
+    return clean[0], None
+
+
+def _resolve_ena_or_odp(acc: str, retries: int = 4) -> dict[str, Any]:
     acc = acc.strip().upper()
     odp_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}"
     all_odp = False
     odp_bytes = np.nan
     try:
-        odp_bytes = float(_head_content_length(odp_url, timeout=20.0))
+        odp_bytes = float(_head_content_length(odp_url, timeout=20.0, retries=2))
         all_odp = True
     except Exception:
         pass
@@ -432,37 +538,54 @@ def _resolve_ena_or_odp(acc: str) -> dict[str, Any]:
     fastq_bytes = np.nan
     order_hint = "flowcell"
     s = _ipv4_session()
-    try:
-        r = s.get(
-            "https://www.ebi.ac.uk/ena/portal/api/filereport",
-            params={
-                "accession": acc,
-                "result": "read_run",
-                "fields": "run_accession,fastq_ftp,fastq_bytes,submitted_format",
-                "format": "tsv",
-            },
-            timeout=30.0,
-        )
-        if r.status_code == 200:
-            parsed = list(csv.DictReader(io.StringIO(r.text), delimiter="\t"))
-            if parsed:
-                row0 = parsed[0]
-                fq = row0.get("fastq_ftp") or ""
-                if fq:
-                    fastq_urls = [fq]
-                fb = [int(x) for x in (row0.get("fastq_bytes") or "").split(";") if x.isdigit()]
-                if fb:
-                    fastq_bytes = float(sum(fb))
-                sfmt = (row0.get("submitted_format") or "").upper()
-                if sfmt and "SRF" not in sfmt and ("BAM" in sfmt or "CRAM" in sfmt):
-                    order_hint = "sorted"
-    except Exception:
-        pass
+    ena_ok = False
+    ena_err: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            r = s.get(
+                "https://www.ebi.ac.uk/ena/portal/api/filereport",
+                params={
+                    "accession": acc,
+                    "result": "read_run",
+                    "fields": "run_accession,fastq_ftp,fastq_bytes,submitted_format",
+                    "format": "tsv",
+                },
+                timeout=30.0,
+            )
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise RuntimeError(f"ENA API returned HTTP {r.status_code}")
+            r.raise_for_status()
+            ena_ok = True
+            if r.text.strip():
+                parsed = list(csv.DictReader(io.StringIO(r.text), delimiter="\t"))
+                if parsed:
+                    row0 = parsed[0]
+                    fq = row0.get("fastq_ftp") or ""
+                    if fq:
+                        fastq_urls = [fq]
+                    fb = [int(x) for x in (row0.get("fastq_bytes") or "").split(";") if x.isdigit()]
+                    if fb:
+                        fastq_bytes = float(sum(fb))
+                    sfmt = (row0.get("submitted_format") or "").upper()
+                    if sfmt and "SRF" not in sfmt and ("BAM" in sfmt or "CRAM" in sfmt):
+                        order_hint = "sorted"
+            break
+        except Exception as exc:
+            ena_err = exc
+            if attempt + 1 < retries:
+                time.sleep(1.0 * (2 ** attempt))
+    if not ena_ok and not all_odp:
+        raise RuntimeError(f"Failed to resolve INSDC accession {acc!r} via ENA or SRA ODP: {ena_err}")
+
+    is_paired = False
+    if fastq_urls:
+        u1, u2 = _match_ena_paired_urls(fastq_urls[0].split(";"))
+        is_paired = bool(u1 and u2)
     return {
         "ena_runs": [acc],
         "all_odp": all_odp,
         "odp_bytes": odp_bytes,
-        "all_paired_fastq": bool(fastq_urls and "_1.fastq.gz" in fastq_urls[0] and "_2.fastq.gz" in fastq_urls[0]),
+        "all_paired_fastq": is_paired,
         "fastq_urls": fastq_urls,
         "fastq_bytes": fastq_bytes,
         "order_hint": order_hint,
@@ -519,11 +642,110 @@ def _build_local_reads_map(reads: Sequence[str] | None, read_ids: Sequence[str] 
     return local_map
 
 
+def _validate_and_parse_bed(
+    bed_path: str | Path,
+    contig_lengths: dict[str, int],
+    ref_label: str = "reference FASTA",
+) -> list[tuple[str, int, int]]:
+    """Parse, validate, and merge 0-based BED intervals against `contig_lengths` (#28, #29)."""
+    raw_rows = 0
+    bed_ctgs: list[str] = []
+    skipped_ctgs: list[str] = []
+    by_ctg: dict[str, list[tuple[int, int]]] = {}
+    with open(bed_path, encoding="utf-8-sig") as fh:
+        for ln in fh:
+            if not ln.strip() or ln.startswith(("#", "track", "browser")):
+                continue
+            parts = ln.rstrip("\n").split()
+            if len(parts) < 3:
+                continue
+            chrom = parts[0]
+            try:
+                s0 = max(0, int(parts[1]))
+                e0 = int(parts[2])
+            except ValueError as exc:
+                raise ValueError(f"Malformed BED coordinates in {Path(bed_path).name!r}: {ln.strip()!r}") from exc
+            if e0 <= s0:
+                continue
+            raw_rows += 1
+            if chrom not in bed_ctgs and len(bed_ctgs) < 8:
+                bed_ctgs.append(chrom)
+            if chrom not in contig_lengths:
+                if chrom not in skipped_ctgs:
+                    skipped_ctgs.append(chrom)
+                continue
+            e_clip = min(contig_lengths[chrom], e0)
+            if e_clip > s0:
+                by_ctg.setdefault(chrom, []).append((s0, e_clip))
+
+    if raw_rows == 0:
+        raise ValueError(f"Target BED {Path(bed_path).name!r} contains zero valid (start < end) intervals")
+    if not by_ctg:
+        raise ValueError(
+            f"Target BED {Path(bed_path).name!r} matched 0 contigs in {ref_label} "
+            f"(BED contigs: {bed_ctgs[:5]}, reference contigs: {list(contig_lengths.keys())[:5]})"
+        )
+    if skipped_ctgs:
+        _log(
+            f"Warning: {len(skipped_ctgs)} BED contig(s) absent from {ref_label} were skipped "
+            f"({', '.join(skipped_ctgs[:5])})"
+        )
+
+    merged_out: list[tuple[str, int, int]] = []
+    for chrom in contig_lengths:
+        ivs = by_ctg.get(chrom)
+        if not ivs:
+            continue
+        ivs.sort()
+        cur_s, cur_e = ivs[0]
+        for a, b in ivs[1:]:
+            if a <= cur_e:
+                cur_e = max(cur_e, b)
+            else:
+                merged_out.append((chrom, cur_s, cur_e))
+                cur_s, cur_e = a, b
+        merged_out.append((chrom, cur_s, cur_e))
+    return merged_out
+
+
+def _pad_and_merge_regions(
+    regions: Sequence[tuple[str, int, int]],
+    contig_lengths: dict[str, int],
+    pad_bp: int,
+) -> list[tuple[str, int, int]]:
+    by_ctg: dict[str, list[tuple[int, int]]] = {}
+    for chrom, s0, e0 in regions:
+        if chrom not in contig_lengths:
+            continue
+        clen = contig_lengths[chrom]
+        a = max(0, int(s0) - int(pad_bp))
+        b = min(clen, int(e0) + int(pad_bp))
+        if b > a:
+            by_ctg.setdefault(chrom, []).append((a, b))
+    out: list[tuple[str, int, int]] = []
+    for chrom in contig_lengths:
+        ivs = by_ctg.get(chrom)
+        if not ivs:
+            continue
+        ivs.sort()
+        cs, ce = ivs[0]
+        for a, b in ivs[1:]:
+            if a <= ce:
+                ce = max(ce, b)
+            else:
+                out.append((chrom, cs, ce))
+                cs, ce = a, b
+        out.append((chrom, cs, ce))
+    return out
+
+
 def _parse_bed_regions(bed_path: str | Path | None, contig_lengths: dict[str, int] | None = None) -> list[tuple[str, int, int]]:
     if not bed_path:
         return []
+    if contig_lengths is not None:
+        return _validate_and_parse_bed(bed_path, contig_lengths)
     regs: list[tuple[str, int, int]] = []
-    with open(bed_path, encoding="utf-8") as fh:
+    with open(bed_path, encoding="utf-8-sig") as fh:
         for ln in fh:
             if not ln.strip() or ln.startswith(("#", "track", "browser")):
                 continue
@@ -533,10 +755,6 @@ def _parse_bed_regions(bed_path: str | Path | None, contig_lengths: dict[str, in
             chrom = parts[0]
             s0 = max(0, int(parts[1]))
             e0 = int(parts[2])
-            if contig_lengths is not None:
-                if chrom not in contig_lengths:
-                    continue
-                e0 = min(contig_lengths[chrom], e0)
             if e0 > s0:
                 regs.append((chrom, s0, e0))
     return regs
@@ -738,7 +956,16 @@ def _format_malariavar_drm_table(
         hrp3_call = c_row.get("hrp3", np.nan) if hasattr(c_row, "get") else np.nan
 
         k13_raw = r.get("k13_ns")
-        k13_str = "WT" if (k13_raw is None or str(k13_raw).strip() in ("", "none", "None", "nan")) else str(k13_raw)
+        k13_miss_raw = r.get("aa_k13_missing_codons", r.get("k13_missing_codons", 0))
+        try:
+            k13_miss_cnt = int(float(k13_miss_raw or 0)) if pd.notna(k13_miss_raw) else 0
+        except (TypeError, ValueError):
+            k13_miss_cnt = 0
+        is_wt_k13 = k13_raw is None or str(k13_raw).strip() in ("", "none", "None", "nan")
+        if is_wt_k13 and k13_miss_cnt > 0:
+            k13_str = f"WT ({k13_miss_cnt} codons uncovered)"
+        else:
+            k13_str = "WT" if is_wt_k13 else str(k13_raw)
         who = WR.classify_sample(
             {
                 "crt_76": r.get("aa_crt_76"),
@@ -751,6 +978,8 @@ def _format_malariavar_drm_table(
                 "dhps_581": r.get("aa_dhps_581"),
                 "dhps_613": r.get("aa_dhps_613"),
                 "k13_ns": r.get("k13_ns"),
+                "k13_has_missing": k13_miss_cnt > 0,
+                "k13_missing_codons": k13_miss_cnt,
                 "mdr1_amp": mdr1_call,
                 "pm2_pm3_amp": pm23_call,
             }
@@ -947,12 +1176,24 @@ def render_variationloop_report(
             )
 
         ploidy_lbl = str(summary_stats.get("ploidy", "diploid"))
+        dup_warn_samples = summary_stats.get("high_dup_samples") or []
+        dup_banner = ""
+        if dup_warn_samples:
+            dup_banner = (
+                '<div class="section warn-box">'
+                '<h2>High PCR Duplicate Rate Notice</h2>'
+                f'<p>More than 95% of mapped reads were marked as coordinate+TLEN duplicates in: '
+                f'<code>{_esc(", ".join(str(x) for x in dup_warn_samples[:10]))}</code>. '
+                'If these libraries come from targeted PCR amplicon sequencing, re-run with PCR duplicate removal set to Off.</p>'
+                '</div>'
+            )
         body_sections = f"""
+  {dup_banner}
   <div class="kpis">
     <div class="kpi"><div class="label">Samples Analyzed</div><div class="val">{n_samp}</div><div class="sub">Mode: <code>{_esc(analysis_mode)}</code> · Model: <code>{_esc(ploidy_lbl)}</code></div></div>
     <div class="kpi"><div class="label">Total Variants</div><div class="val">{n_tot:,}</div><div class="sub">{n_snv:,} SNVs · {n_indel:,} Indels</div></div>
     <div class="kpi"><div class="label">Omnitig Rescued</div><div class="val">{n_asm:,}</div><div class="sub">Multi-k local haplotype reassembly</div></div>
-    <div class="kpi"><div class="label">PCR Duplicates Filtered</div><div class="val">{n_dup:,}</div><div class="sub">62-bit exact coordinate+TLEN dedup</div></div>
+    <div class="kpi"><div class="label">PCR Duplicates Filtered</div><div class="val">{n_dup:,}</div><div class="sub">64-bit collision-free coordinate+TLEN dedup</div></div>
     <div class="kpi"><div class="label">Paged Accumulator RAM</div><div class="val">{acc_mb:.2f} MB</div><div class="sub">64 kb lazy-paged C accumulator</div></div>
   </div>
   <div class="section">
@@ -994,6 +1235,8 @@ def _resolve_fastq_pair_for_row(
     local_map: dict[str, list[Path]],
     work_dir: Path,
     sample_id: str,
+    *,
+    allow_local: bool = True,
 ) -> tuple[str, str | None, str]:
     """Resolve a manifest row's source into (r1_path_or_url, r2_path_or_url, kind)."""
     src = _pick_col(row, ("source_uri_or_srr", "run_or_url", "fastq_1", "accession", "source", "url"))
@@ -1002,47 +1245,238 @@ def _resolve_fastq_pair_for_row(
     if cand_local:
         ordered = sorted(cand_local, key=lambda p: p.name)[:2]
         return str(ordered[0]), (str(ordered[1]) if len(ordered) > 1 else None), "local_fastq"
-    if src and Path(src).exists():
-        p1 = str(Path(src).resolve())
-        p2 = str(Path(mate2).resolve()) if (mate2 and Path(mate2).exists()) else None
-        return p1, p2, "local_fastq"
     if _INSDC_RUN_RE.match(src):
         info = _resolve_ena_or_odp(src)
         fq_raw = info.get("fastq_urls") or []
         if fq_raw:
             urls = [u.strip() for u in fq_raw[0].split(";") if u.strip()]
             urls = [("https://" + u[6:] if u.startswith("ftp://") else (u if u.startswith("http") else "https://" + u)) for u in urls]
-            if len(urls) >= 2:
-                return urls[0], urls[1], "remote_fastq"
-            return urls[0], None, "remote_fastq"
+            u1, u2 = _match_ena_paired_urls(urls)
+            if u1:
+                return u1, u2, "remote_fastq"
         return src.upper(), None, "insdc_odp"
     if src.startswith(("http://", "https://", "ftp://")):
         parts = [u.strip() for u in src.split(";") if u.strip()]
         if mate2:
+            _assert_manifest_uri_allowed(mate2, sample_id, "mate2", allow_local=allow_local, local_map=local_map)
             parts.append(mate2.strip())
         parts = [("https://" + u[6:] if u.startswith("ftp://") else u) for u in parts]
-        return parts[0], (parts[1] if len(parts) > 1 else None), "remote_fastq"
+        u1, u2 = _match_ena_paired_urls(parts)
+        return (u1 or parts[0]), u2, "remote_fastq"
+    if not allow_local:
+        raise ValueError(
+            f"Sample {sample_id!r}: local filesystem path in manifest is disallowed "
+            "(pass --allow-local-manifest-paths on CLI or supply Galaxy History datasets)"
+        )
+    if src and Path(src).exists():
+        p1 = str(Path(src).resolve())
+        p2 = str(Path(mate2).resolve()) if (mate2 and Path(mate2).exists()) else None
+        return p1, p2, "local_fastq"
     raise ValueError(f"Sample {sample_id!r}: could not resolve FASTQ source {src!r}")
 
 
-def _materialize_remote_input(uri_or_acc: str, dst: Path, kind: str, threads: int = 4) -> Path:
+def _materialize_odp_paired(acc: str, dst_r1: Path, dst_r2: Path, threads: int = 4) -> tuple[Path, Path]:
+    """Stream interleaved SRA ODP FASTQ via xsra and split lockstep mates into paired R1/R2 .fq.gz files (L31)."""
+    if not shutil.which("xsra"):
+        raise RuntimeError(f"INSDC accession {acc!r} requires 'xsra' in PATH when ENA FASTQ URLs are unavailable")
+    dst_r1.parent.mkdir(parents=True, exist_ok=True)
+    dst_r2.parent.mkdir(parents=True, exist_ok=True)
+    odp_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}"
+    proc = subprocess.Popen(
+        ["xsra", "dump", "-Q", "-P", odp_url, "-t", str(max(1, threads))],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    n_pairs = 0
+    try:
+        assert proc.stdout is not None
+        with gzip.open(dst_r1, "wb", compresslevel=1) as f1, gzip.open(dst_r2, "wb", compresslevel=1) as f2:
+            while True:
+                h1 = proc.stdout.readline()
+                if not h1:
+                    break
+                s1 = proc.stdout.readline()
+                p1 = proc.stdout.readline()
+                q1 = proc.stdout.readline()
+                h2 = proc.stdout.readline()
+                s2 = proc.stdout.readline()
+                p2 = proc.stdout.readline()
+                q2 = proc.stdout.readline()
+                if not (s1 and p1 and q1 and h2 and s2 and p2 and q2):
+                    raise RuntimeError(f"Truncated interleaved xsra FASTQ stream for {acc!r}")
+                f1.write(h1 + s1 + p1 + q1)
+                f2.write(h2 + s2 + p2 + q2)
+                n_pairs += 1
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        err_txt = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"xsra dump failed for {acc!r} (rc={rc}): {err_txt[-300:]}")
+    if n_pairs == 0:
+        raise RuntimeError(f"xsra dump produced 0 paired reads for {acc!r}")
+    return dst_r1, dst_r2
+
+
+def _materialize_remote_input(uri_or_acc: str, dst: Path, kind: str, threads: int = 4, retries: int = 5) -> Path:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if kind == "insdc_odp":
-        if not shutil.which("xsra"):
-            raise RuntimeError(f"INSDC accession {uri_or_acc!r} requires 'xsra' in PATH when ENA FASTQ URLs are unavailable")
-        odp_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{uri_or_acc}/{uri_or_acc}"
-        out_fq = dst.with_suffix(".interleaved.fq")
-        with open(out_fq, "wb") as fh:
-            subprocess.run(["xsra", "dump", "-Q", "-P", odp_url, "-t", str(max(1, threads))], stdout=fh, check=True)
-        return out_fq
+        r2_dst = dst.with_name(dst.name.replace("_R1", "_R2"))
+        if r2_dst == dst:
+            r2_dst = dst.with_suffix(".r2.fq.gz")
+        _materialize_odp_paired(uri_or_acc, dst, r2_dst, threads=threads)
+        return dst
+    part = dst.with_name(f".{dst.name}.{os.getpid()}.part")
+    part.unlink(missing_ok=True)
     s = _ipv4_session()
-    with s.get(uri_or_acc, stream=True, timeout=180) as r:
-        r.raise_for_status()
-        with open(dst, "wb") as fh:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    fh.write(chunk)
-    return dst
+    expected_total: int | None = None
+    last_err: Exception | None = None
+    for attempt in range(max(1, retries)):
+        offset = part.stat().st_size if part.is_file() else 0
+        headers = {"Range": f"bytes={offset}-"} if offset > 0 else {}
+        try:
+            with s.get(uri_or_acc, headers=headers, stream=True, timeout=(30, 180)) as r:
+                if r.status_code in (429, 500, 502, 503, 504):
+                    raise RuntimeError(f"HTTP {r.status_code} downloading {uri_or_acc}")
+                r.raise_for_status()
+                if offset > 0 and r.status_code == 200:
+                    # Server ignored Range resume: restart from byte 0
+                    offset = 0
+                if expected_total is None:
+                    if r.status_code == 200 and r.headers.get("Content-Length"):
+                        expected_total = int(r.headers["Content-Length"])
+                    elif r.status_code == 206 and "/" in r.headers.get("Content-Range", ""):
+                        tot_s = r.headers["Content-Range"].rsplit("/", 1)[-1].strip()
+                        if tot_s.isdigit():
+                            expected_total = int(tot_s)
+                mode = "ab" if offset > 0 else "wb"
+                with open(part, mode) as fh:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            fh.write(chunk)
+            got_sz = part.stat().st_size if part.is_file() else 0
+            if expected_total is not None and got_sz != expected_total:
+                raise RuntimeError(f"Incomplete download for {uri_or_acc}: got {got_sz} bytes, expected {expected_total}")
+            if got_sz == 0:
+                raise RuntimeError(f"Downloaded empty (0-byte) file from {uri_or_acc}")
+            os.replace(part, dst)
+            return dst
+        except Exception as exc:
+            last_err = exc
+            if getattr(getattr(exc, "response", None), "status_code", None) in (401, 403, 404, 410):
+                part.unlink(missing_ok=True)
+                raise
+            if attempt + 1 < retries:
+                time.sleep(min(20.0, 1.5 * (2 ** attempt)))
+    part.unlink(missing_ok=True)
+    raise RuntimeError(f"Failed downloading {uri_or_acc} after {retries} attempts: {last_err}")
+
+
+def _sanitize_state_sample_record(
+    sample_id: str,
+    group: str,
+    extra_row: dict[str, Any] | None,
+    reads_counted: int,
+    median_depth: float,
+) -> dict[str, Any]:
+    """Build portable sample metadata entry with reads_counted, median_depth, and zero local filesystem paths (#72, L41)."""
+    PATH_LIKE_KEYS = {
+        "source", "source_uri_or_srr", "cram_url", "bam_url", "run_or_url",
+        "fastq_1", "fastq_2", "r2", "mate2", "mate2_url",
+        "crai", "crai_uri", "crai_url", "crai_uri_optional", "url",
+        "vcf_path", "pileup_vcf_path",
+    }
+    rec: dict[str, Any] = {
+        "sample": sample_id,
+        "group": group,
+        "condition": group,
+        "reads_counted": int(reads_counted),
+        "median_depth": round(float(median_depth), 2) if np.isfinite(median_depth) else 0.0,
+    }
+    for k, v in (extra_row or {}).items():
+        if not k or k in rec or v is None or v == "":
+            continue
+        sv = str(v).strip()
+        if not sv:
+            continue
+        if k.lower() in PATH_LIKE_KEYS:
+            if _INSDC_RUN_RE.match(sv):
+                rec["accession"] = sv.upper()
+            continue
+        if ("/" in sv or "\\" in sv) and not sv.startswith(("http://", "https://", "ftp://")):
+            continue
+        rec[k] = v
+    return rec
+
+
+def _write_site_nocalls_parquet(
+    out_pq: Path,
+    nocall_rows: list[tuple[str, int, str]],
+) -> None:
+    """Write `site_nocalls.parquet` (`chrom`, `pos`, `sample_id`) for uncovered/no-call samples at cohort sites (#62)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema(
+        [
+            ("chrom", pa.string()),
+            ("pos", pa.int64()),
+            ("sample_id", pa.string()),
+        ]
+    )
+    if nocall_rows:
+        nocall_rows.sort(key=lambda r: (r[0], r[1], r[2]))
+        tbl = pa.Table.from_pydict(
+            {
+                "chrom": [r[0] for r in nocall_rows],
+                "pos": [int(r[1]) for r in nocall_rows],
+                "sample_id": [r[2] for r in nocall_rows],
+            },
+            schema=schema,
+        )
+    else:
+        tbl = pa.Table.from_pydict({"chrom": [], "pos": [], "sample_id": []}, schema=schema)
+    pq.write_table(tbl, str(out_pq), compression="zstd")
+
+
+def _load_sample_covered_intervals(
+    cov_npz: Path | None,
+    cov_tsv: Path | None,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if cov_npz is not None and cov_npz.is_file():
+        with np.load(cov_npz) as z:
+            for k in z.files:
+                if k.startswith("s_"):
+                    cn = k[2:]
+                    ek = f"e_{cn}"
+                    if ek in z.files:
+                        out[cn] = (np.asarray(z[k], dtype=np.int32), np.asarray(z[ek], dtype=np.int32))
+        return out
+    if cov_tsv is not None and cov_tsv.is_file():
+        by_c: dict[str, tuple[list[int], list[int]]] = {}
+        with open(cov_tsv, "r", encoding="utf-8") as fh:
+            for ln in fh:
+                parts = ln.rstrip("\n").split("\t")
+                if len(parts) >= 3:
+                    s_l, e_l = by_c.setdefault(parts[0], ([], []))
+                    s_l.append(int(parts[1]))
+                    e_l.append(int(parts[2]))
+        for cn, (s_l, e_l) in by_c.items():
+            out[cn] = (np.asarray(s_l, dtype=np.int32), np.asarray(e_l, dtype=np.int32))
+    return out
+
+
+def _is_pos0_covered(cov_map: dict[str, tuple[np.ndarray, np.ndarray]], chrom: str, pos0: int) -> bool:
+    ivs = cov_map.get(chrom)
+    if ivs is None:
+        return False
+    s_arr, e_arr = ivs
+    if len(e_arr) == 0:
+        return False
+    idx = int(np.searchsorted(e_arr, pos0, side="right"))
+    return idx < len(s_arr) and int(s_arr[idx]) <= pos0
 
 
 def _run_pf3d7_surveillance(
@@ -1064,6 +1498,8 @@ def _run_pf3d7_surveillance(
     streams: int,
     sample_timeout_s: float,
     use_host_depletion: bool,
+    dedup_mode: str,
+    allow_local_manifest: bool,
     state_archive: str | Path | None,
     t_start: float,
 ) -> dict[str, Any]:
@@ -1096,9 +1532,13 @@ def _run_pf3d7_surveillance(
     meta_rows: list[dict[str, Any]] = []
     focused_jobs: list[dict[str, Any]] = []
     stream_jobs: list[dict[str, Any]] = []
+    seen_sids: set[str] = set()
 
     for idx_r, row in enumerate(rows_raw):
-        sid = _pick_col(row, ("sample_id", "Sample", "sample"), f"isolate_{idx_r + 1}")
+        sid = _clean_sample_name(_pick_col(row, ("sample_id", "Sample", "sample"), f"isolate_{idx_r + 1}"), fallback=f"isolate_{idx_r + 1}")
+        if sid in seen_sids:
+            raise ValueError(f"Duplicate sample_id {sid!r} in surveillance manifest")
+        seen_sids.add(sid)
         grp = _pick_col(row, ("country_or_group", "Country", "group", "Population"), "cohort")
         pop = _pick_col(row, ("population", "Population"), grp)
         src = _pick_col(row, ("source_uri_or_srr", "cram_url", "accession", "ena_runs", "source", "url"))
@@ -1107,10 +1547,16 @@ def _run_pf3d7_surveillance(
         year_s = _pick_col(row, ("year", "Year"), "2020")
         year = int(year_s) if year_s.isdigit() else 2020
 
+        from_direct = bool(row.get("_from_direct_args"))
+        eff_allow_row = allow_local_manifest or from_direct
+
         if not src and sid in local_map:
             src = sid
         if not src:
             raise ValueError(f"Isolate {sid!r}: missing source_uri_or_srr")
+        _assert_manifest_uri_allowed(src, sid, "source", allow_local=eff_allow_row, local_map=local_map)
+        if crai_u:
+            _assert_manifest_uri_allowed(crai_u, sid, "crai", allow_local=eff_allow_row, local_map=local_map)
 
         row_mode = mode_req
         if row_mode == "auto":
@@ -1127,6 +1573,7 @@ def _run_pf3d7_surveillance(
                     "crai_uri": crai_u or (src + ".crai"),
                     "cram_bytes": cram_bytes,
                     "Sample_type": stype,
+                    "_allow_local": eff_allow_row,
                 }
             )
         else:
@@ -1159,14 +1606,17 @@ def _run_pf3d7_surveillance(
                     stream_jobs.append({"Sample": sid, "Sample_type": stype, **info})
                 else:
                     mate2 = _pick_col(row, ("mate2_url", "fastq_2", "r2", "mate2"))
+                    if mate2:
+                        _assert_manifest_uri_allowed(mate2, sid, "mate2", allow_local=eff_allow_row, local_map=local_map)
                     fq_src = f"{src};{mate2}" if mate2 else src
+                    u1, u2 = _match_ena_paired_urls(fq_src.split(";"))
                     stream_jobs.append(
                         {
                             "Sample": sid,
                             "Sample_type": stype,
                             "ena_runs": [],
                             "all_odp": False,
-                            "all_paired_fastq": ";" in fq_src,
+                            "all_paired_fastq": bool(u1 and u2),
                             "fastq_urls": [fq_src],
                             "fastq_bytes": np.nan,
                             "order_hint": "flowcell",
@@ -1181,28 +1631,36 @@ def _run_pf3d7_surveillance(
         regs = FC.regions(g)
         if targets_bed:
             cidx = {n: i for i, n in enumerate(g.names)}
-            for cn, s0, e0 in _parse_bed_regions(targets_bed, dict(zip(g.names, [int(x) for x in g.lengths]))):
+            for cn, s0, e0 in _validate_and_parse_bed(targets_bed, dict(zip(g.names, [int(x) for x in g.lengths]))):
                 regs.append((cidx[cn], s0 + 1, e0, f"bed:{cn}:{s0}"))
         FC._init_worker(use_omnitig_zoom=False)
+        FC._WS["cp"].dedup = (dedup_mode != "off")
         crai_cache = work_dir / "crai"
         dl_pool = ThreadPoolExecutor(max_workers=streams, thread_name_prefix="crai-range")
         try:
             for idx_j, fj in enumerate(focused_jobs, 1):
                 sid = fj["Sample"]
                 url = fj["cram_url"]
-                crai_local = _fetch_crai_file(fj["crai_uri"], crai_cache / f"{sid}.cram.crai")
+                crai_local = _fetch_crai_file(fj["crai_uri"], crai_cache / f"{sid}.cram.crai", allow_local=bool(fj.get("_allow_local", True)))
                 cram_bytes = fj["cram_bytes"]
+                is_local_u = (not url.startswith(("http://", "https://", "ftp://"))) and bool(fj.get("_allow_local")) and Path(url).is_file()
                 if not cram_bytes:
-                    cram_bytes = Path(url).stat().st_size if Path(url).exists() else _head_content_length(url)
+                    cram_bytes = Path(url).stat().st_size if is_local_u else _head_content_length(url)
                     fj["cram_bytes"] = cram_bytes
-                hdr_end, rr, nc, spans = FC.plan_ranges(crai_local, regs)
+                hdr_end, rr, nc, spans = FC.plan_ranges(crai_local, regs, cram_size=cram_bytes)
                 staged_cram = FC.STAGE / f"{sid}.cram"
-                if Path(url).exists():
+                if is_local_u:
                     with open(url, "rb") as fi, open(staged_cram, "wb") as fo:
-                        fo.write(fi.read(hdr_end))
+                        hdr_b = fi.read(hdr_end)
+                        if len(hdr_b) != hdr_end:
+                            raise RuntimeError(f"Short read on local CRAM header for {sid}")
+                        fo.write(hdr_b)
                         for a, b in rr:
                             fi.seek(a)
-                            fo.write(fi.read(b - a))
+                            blk = fi.read(b - a)
+                            if len(blk) != (b - a):
+                                raise RuntimeError(f"Truncated local CRAM range [{a}, {b}) for {sid}")
+                            fo.write(blk)
                         fo.write(ST.CRAM_EOF)
                     fetch_bytes = staged_cram.stat().st_size
                     fetch_s = 0.01
@@ -1221,6 +1679,8 @@ def _run_pf3d7_surveillance(
                 tel = FC.process_one((sid, str(staged_cram), fj, str(cohort_dir), spans.tolist(), info))
                 if tel.get("stop_reason") == "crash" or tel.get("error"):
                     raise RuntimeError(f"Focused CRAM processing failed for {sid}: {tel.get('error')}")
+                if int(tel.get("reads_counted") or 0) <= 0:
+                    raise RuntimeError(f"Focused CRAM isolate {sid!r}: zero usable reads counted")
                 _log(f"  [{idx_j}/{len(focused_jobs)}] {sid}: {fetch_bytes / 1e6:.2f} MB ({100.0 * fetch_bytes / max(cram_bytes, 1):.2f}%)")
         finally:
             dl_pool.shutdown(wait=False, cancel_futures=True)
@@ -1246,25 +1706,35 @@ def _run_pf3d7_surveillance(
                 G.REF_FASTA = idx_fa
 
         _log(f"Running Mode B (wgs_stream) on {len(stream_jobs)} isolates with mapper={chosen_mapper}, depletion={use_host_depletion}...")
-        cfg = {
-            "map_threads": max(2, min(threads, 6)),
-            "xsra_threads": max(2, min(threads // 2, 4)),
-            "prefer": "odp_stream",
-            "store_candidates": False,
-            "mapper": chosen_mapper,
-            "min_depth": float(target_depth),
-            "min_depth_poly": float(max(target_depth + 8.0, target_depth * 1.25)),
-            "use_pla_sieve": use_pla,
-            "pla_sieve_path": pla_path,
-            "depletion_need": 2 if use_host_depletion else 0,
-            "use_omnitig_zoom": True,
-            "sample_timeout_s": float(sample_timeout_s),
-        }
         for idx_s, srow in enumerate(stream_jobs, 1):
             sid = srow["Sample"]
+            cfg = {
+                "map_threads": max(2, min(threads, 6)),
+                "xsra_threads": max(2, min(threads // 2, 4)),
+                "prefer": "odp_stream" if bool(srow.get("all_odp")) else "ena",
+                "store_candidates": False,
+                "mapper": chosen_mapper,
+                "min_depth": float(target_depth),
+                "min_depth_poly": float(max(target_depth + 8.0, target_depth * 1.25)),
+                "use_pla_sieve": use_pla,
+                "pla_sieve_path": pla_path,
+                "depletion_need": 2 if use_host_depletion else 0,
+                "dedup": (dedup_mode != "off"),
+                "use_omnitig_zoom": True,
+                "sample_timeout_s": float(sample_timeout_s),
+            }
             tel = E.run_sample(srow, str(cohort_dir), cfg)
             if tel.get("stop_reason") == "error":
                 raise RuntimeError(f"WGS streaming failed for {sid}: {tel.get('error')}")
+            if int(tel.get("reads_counted") or 0) <= 0:
+                raise RuntimeError(f"WGS streaming isolate {sid!r}: zero usable reads counted")
+            pcr_d = int(tel.get("pcr_dups_skipped") or 0)
+            sam_r = int(tel.get("sam_records") or 0)
+            if dedup_mode != "off" and sam_r >= 100 and pcr_d > 0.95 * sam_r:
+                _log(
+                    f"WARNING: Isolate {sid!r} had {100.0 * pcr_d / max(sam_r, 1):.1f}% PCR duplicates skipped. "
+                    "Use --dedup off (--dedup-bits 0) for targeted PCR amplicon libraries."
+                )
             _log(f"  [{idx_s}/{len(stream_jobs)}] {sid}: depth={float(tel.get('median_core_depth', 0)):.1f}x")
 
     all_samples = [r["Sample"] for r in meta_rows]
@@ -1279,9 +1749,9 @@ def _run_pf3d7_surveillance(
         drm_df.to_csv(out_drm, sep="\t", index=False, float_format="%.6g")
 
     calls_df = SS.read_table(cohort_dir, "variant_calls")
+    contig_names = list(g.names)
     if not calls_df.empty:
         calls_df = calls_df[calls_df["gt"] > 0].copy()
-        contig_names = list(g.names)
         calls_df["chrom"] = [contig_names[int(c)] if 0 <= int(c) < len(contig_names) else str(c) for c in calls_df["chrom"]]
         calls_df = calls_df.rename(columns={"sample": "sample_id"})
         cols_v = ["sample_id", "chrom", "pos", "ref", "alt", "kind", "gt", "ad_ref", "ad_alt", "dp", "wsaf", "qual", "core"]
@@ -1293,6 +1763,30 @@ def _run_pf3d7_surveillance(
     if out_vcf:
         _write_pathogen_vcf(g, calls_df, out_vcf)
 
+    # Build site_nocalls.parquet from callable_mask intervals vs cohort called variant sites (#62)
+    callable_all = SS.read_table(cohort_dir, "callable_mask")
+    nocalls_pf: list[tuple[str, int, str]] = []
+    if not calls_df.empty:
+        cohort_sites_pf = sorted({(str(c), int(p)) for c, p in zip(calls_df["chrom"], calls_df["pos"])})
+        called_set_pf = {(str(c), int(p), str(s)) for c, p, s in zip(calls_df["chrom"], calls_df["pos"], calls_df["sample_id"])}
+        cov_by_s_pf: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+        if not callable_all.empty:
+            for s_id, grp_c in callable_all.groupby("sample"):
+                m_c: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+                for c_idx, sub_c in grp_c.groupby("chrom"):
+                    cn = contig_names[int(c_idx)] if 0 <= int(c_idx) < len(contig_names) else str(c_idx)
+                    sub_sorted = sub_c.sort_values("start")
+                    s_arr = (sub_sorted["start"].to_numpy(dtype=np.int32) - 1)
+                    e_arr = sub_sorted["end"].to_numpy(dtype=np.int32)
+                    m_c[cn] = (s_arr, e_arr)
+                cov_by_s_pf[str(s_id)] = m_c
+        for s_id in all_samples:
+            cm_s = cov_by_s_pf.get(s_id, {})
+            for ch, p1 in cohort_sites_pf:
+                if (ch, p1, s_id) not in called_set_pf and not _is_pos0_covered(cm_s, ch, p1 - 1):
+                    nocalls_pf.append((ch, p1, s_id))
+    _write_site_nocalls_parquet(state_root / "site_nocalls.parquet", nocalls_pf)
+
     eff_mode = "focused_cram+wgs_stream" if (focused_jobs and stream_jobs) else ("focused_cram" if focused_jobs else "wgs_stream")
     summary_stats = {"mode": eff_mode, "reference_label": "Pf3D7 (PlasmoDB-54)", "n_isolates": len(drm_df), "wall_s": round(time.time() - t_start, 2), "warm": warm_info}
     render_variationloop_report(out_report, analysis_mode=eff_mode, summary_stats=summary_stats, variants_df=calls_df, drm_df=drm_df)
@@ -1300,6 +1794,7 @@ def _run_pf3d7_surveillance(
     store = FocaloopStateStore(state_root)
     HypothesisLedger.from_store(store, alpha_budget=0.05)
     drm_df.to_parquet(state_root / "drm_calls.parquet", index=False)
+    tel_by_sample = tel_df.drop_duplicates("sample", keep="last").set_index("sample").to_dict(orient="index") if not tel_df.empty else {}
     state_meta = {
         "engine": "malariavar",
         "version": "0.4.0",
@@ -1313,6 +1808,8 @@ def _run_pf3d7_surveillance(
                 "country_or_group": r["Country"],
                 "Country": r["Country"],
                 "Population": r["Population"],
+                "reads_counted": int((tel_by_sample.get(r["Sample"]) or {}).get("reads_counted") or 0),
+                "median_depth": round(float((tel_by_sample.get(r["Sample"]) or {}).get("median_core_depth") or 0.0), 2),
             }
             for r in meta_rows
         ],
@@ -1365,6 +1862,8 @@ def run_variationloop_galaxy(
     snv_min_qual: float = 20.0,
     indel_min_qual: float = 15.0,
     dedup_bits: int | None = None,
+    dedup: str | bool | None = None,
+    allow_local_manifest_paths: bool | None = None,
     reference_label: str | None = None,
     surveillance_panel: str = "none",
 ) -> dict[str, Any]:
@@ -1378,6 +1877,25 @@ def run_variationloop_galaxy(
     if eff_ploidy not in ("haploid", "diploid"):
         raise ValueError(f"Unsupported ploidy {ploidy!r}; expected 'haploid' or 'diploid'")
     eff_min_wsaf = max(0.05, min(0.99, float(min_wsaf if min_wsaf is not None else logan_min_wsaf)))
+
+    # Resolve PCR duplicate removal policy (#71, L43)
+    raw_dedup = os.environ.get("FOCALOOP_DEDUP_MODE", "auto") if dedup is None else dedup
+    if raw_dedup is False or (isinstance(raw_dedup, str) and raw_dedup.strip().lower() in ("off", "false", "0", "no")) or dedup_bits == 0:
+        eff_dedup_mode = "off"
+    elif raw_dedup is True or (isinstance(raw_dedup, str) and raw_dedup.strip().lower() in ("on", "true", "1", "yes")):
+        eff_dedup_mode = "on"
+    elif isinstance(raw_dedup, str) and raw_dedup.strip().lower() == "auto":
+        eff_dedup_mode = "auto"
+    else:
+        raise ValueError(f"Unsupported dedup setting {dedup!r} (expected 'auto', 'on', or 'off')")
+
+    # Resolve manifest local-path policy (#72): block arbitrary local filesystem paths unless explicitly opted in
+    if allow_local_manifest_paths is None:
+        eff_allow_local_manifest = os.environ.get("FOCALOOP_ALLOW_LOCAL_MANIFEST_PATHS", "").strip() == "1"
+        allow_logan_local_unitigs = (analysis_mode == "logan_unitigs")
+    else:
+        eff_allow_local_manifest = bool(allow_local_manifest_paths)
+        allow_logan_local_unitigs = bool(allow_local_manifest_paths)
 
     if host_depletion_mode is not None:
         eff_dep_mode = str(host_depletion_mode).strip().lower()
@@ -1406,6 +1924,10 @@ def run_variationloop_galaxy(
 
     if r1_list and r2_list and len(r1_list) != len(r2_list):
         raise ValueError(f"Mismatched paired FASTQ counts: {len(r1_list)} R1 files vs {len(r2_list)} R2 files")
+    if r1_list and read_id_list and len(read_id_list) != len(r1_list):
+        raise ValueError(f"Mismatched --read-ids count ({len(read_id_list)}) vs --reads-r1 count ({len(r1_list)})")
+    if bam_list and bam_id_list and len(bam_id_list) != len(bam_list):
+        raise ValueError(f"Mismatched --bam-ids count ({len(bam_id_list)}) vs --bam count ({len(bam_list)})")
 
     eff_single_sample = _clean_sample_name(
         sample_name
@@ -1414,22 +1936,27 @@ def run_variationloop_galaxy(
         or (r1_list[0] if r1_list else None)
         or (bam_list[0] if bam_list else None),
         fallback="sample_1",
+        strip_mate_suffix=not bool(r1_list and read_id_list),
     )
 
     local_map = _build_local_reads_map(reads, read_ids)
+    r1_dedup_sids: list[str] = []
     if r1_list:
-        for i, r1_s in enumerate(r1_list):
-            r1_p = Path(r1_s).resolve()
-            pair = [r1_p] + ([Path(r2_list[i]).resolve()] if i < len(r2_list) else [])
-            raw_id = (
+        raw_r1_sids = [
+            _clean_sample_name(
                 sample_name
                 if (len(r1_list) == 1 and sample_name)
-                else (read_id_list[i] if i < len(read_id_list) else r1_s)
+                else (read_id_list[i] if i < len(read_id_list) else r1_s),
+                fallback=f"sample_{i + 1}",
+                strip_mate_suffix=not (i < len(read_id_list)),
             )
-            sid_clean = _clean_sample_name(raw_id, fallback=f"sample_{i + 1}")
-            local_map[sid_clean] = pair
-            if i < len(read_id_list) and read_id_list[i]:
-                local_map[read_id_list[i]] = pair
+            for i, r1_s in enumerate(r1_list)
+        ]
+        r1_dedup_sids = _dedup_sample_names(raw_r1_sids)
+        for i, (sid_final, r1_s) in enumerate(zip(r1_dedup_sids, r1_list)):
+            r1_p = Path(r1_s).resolve()
+            pair = [r1_p] + ([Path(r2_list[i]).resolve()] if i < len(r2_list) else [])
+            local_map[sid_final] = pair
 
     try:
         if ncbi_accession and str(ncbi_accession).strip():
@@ -1452,31 +1979,34 @@ def run_variationloop_galaxy(
             if manifest_path and not (r1_list or bam_list):
                 rows_raw = _read_manifest_table(manifest_path)
             elif bam_list and analysis_mode == "focused_cram":
+                bam_sids_pf = _dedup_sample_names([
+                    _clean_sample_name(
+                        sample_name if (len(bam_list) == 1 and sample_name) else (bam_id_list[i] if i < len(bam_id_list) else bp),
+                        fallback=f"sample_{i + 1}",
+                        strip_mate_suffix=False,
+                    )
+                    for i, bp in enumerate(bam_list)
+                ])
                 rows_raw = [
                     {
-                        "sample_id": _clean_sample_name(
-                            sample_name if (len(bam_list) == 1 and sample_name) else (bam_id_list[i] if i < len(bam_id_list) else bp),
-                            fallback=f"sample_{i + 1}",
-                        ),
+                        "sample_id": bam_sids_pf[i],
                         "country_or_group": "cohort",
                         "source_uri_or_srr": str(Path(bp).resolve()),
                         "crai_uri": str(Path(crai_list[i]).resolve()) if (i < len(crai_list) and crai_list[i]) else "",
+                        "_from_direct_args": "1",
                     }
                     for i, bp in enumerate(bam_list)
                 ]
             elif r1_list or (reads and len(reads) >= 1):
                 if r1_list:
-                    rows_raw = []
-                    for i, r1_s in enumerate(r1_list):
-                        sid = _clean_sample_name(
-                            sample_name if (len(r1_list) == 1 and sample_name) else (read_id_list[i] if i < len(read_id_list) else r1_s),
-                            fallback=f"sample_{i + 1}",
-                        )
-                        rows_raw.append({"sample_id": sid, "country_or_group": "cohort", "source_uri_or_srr": sid})
+                    rows_raw = [
+                        {"sample_id": sid, "country_or_group": "cohort", "source_uri_or_srr": sid, "_from_direct_args": "1"}
+                        for sid in r1_dedup_sids
+                    ]
                 else:
                     pair_paths = [Path(p).resolve() for p in reads[:2]]
                     local_map[eff_single_sample] = pair_paths
-                    rows_raw = [{"sample_id": eff_single_sample, "country_or_group": "cohort", "source_uri_or_srr": eff_single_sample}]
+                    rows_raw = [{"sample_id": eff_single_sample, "country_or_group": "cohort", "source_uri_or_srr": eff_single_sample, "_from_direct_args": "1"}]
             else:
                 raise ValueError(f"Mode {analysis_mode!r} requires a sample manifest or History reads/CRAM input")
 
@@ -1498,6 +2028,8 @@ def run_variationloop_galaxy(
                 streams=streams,
                 sample_timeout_s=sample_timeout_s,
                 use_host_depletion=(eff_dep_mode != "off"),
+                dedup_mode=eff_dedup_mode,
+                allow_local_manifest=eff_allow_local_manifest,
                 state_archive=state_archive,
                 t_start=t_start,
             )
@@ -1514,54 +2046,91 @@ def run_variationloop_galaxy(
 
         eff_ref = _gunzip_if_needed(ref_fasta, work_dir / "ref", "reference.fa")
         _ensure_faidx(eff_ref)
-        g = G.from_fasta(eff_ref, bed=targets_bed, need_core=True)
+        g = G.from_fasta(eff_ref, bed=targets_bed, need_core=False)
         ctg_lens = dict(zip(g.names, [int(x) for x in g.lengths]))
-        bed_regions = _parse_bed_regions(targets_bed, ctg_lens) if targets_bed else []
+        bed_regions = _validate_and_parse_bed(targets_bed, ctg_lens, ref_label=Path(ref_fasta).name) if targets_bed else []
 
-        # Optional group/metadata table when paired collections or BAM/CRAM lists also pass --manifest
+        # Optional group/metadata table when paired collections or BAM/CRAM lists also pass --manifest (L36)
         group_lookup: dict[str, tuple[str, dict[str, str]]] = {}
         if manifest_path and (r1_list or bam_list):
-            for row in _read_manifest_table(manifest_path):
+            gs_rows = _read_manifest_table(manifest_path)
+            gs_cols_low = {k.lower() for k in gs_rows[0].keys()}
+            if not (gs_cols_low & {"sample_id", "sample"}):
+                raise ValueError(
+                    f"Group sheet {Path(manifest_path).name!r} is missing a required 'sample_id' (or 'sample') column"
+                )
+            if not (gs_cols_low & {"country_or_group", "population", "group", "condition"}):
+                raise ValueError(
+                    f"Group sheet {Path(manifest_path).name!r} is missing a required 'group' (or 'population'/'condition') column"
+                )
+            for row in gs_rows:
                 raw_sid = _pick_col(row, ("sample_id", "Sample", "sample"), "")
-                grp = _pick_col(row, ("country_or_group", "population", "group", "condition"), "cohort")
-                if raw_sid:
-                    group_lookup[raw_sid] = (grp, row)
-                    group_lookup[_clean_sample_name(raw_sid, fallback=raw_sid)] = (grp, row)
+                grp = _pick_col(row, ("country_or_group", "population", "group", "condition"), "")
+                if not raw_sid or not grp:
+                    raise ValueError(f"Group sheet {Path(manifest_path).name!r} contains an empty sample_id or group cell")
+                group_lookup[raw_sid] = (grp, row)
+                group_lookup[_clean_sample_name(raw_sid, fallback=raw_sid, strip_mate_suffix=False)] = (grp, row)
+                group_lookup[_clean_sample_name(raw_sid, fallback=raw_sid, strip_mate_suffix=True)] = (grp, row)
 
         # Build sample jobs uniformly from paired collections, BAM/CRAM lists, manifest, or SRA accessions
         jobs: list[dict[str, Any]] = []
         if r1_list:
-            raw_sids = [
-                _clean_sample_name(
-                    sample_name if (len(r1_list) == 1 and sample_name) else (read_id_list[i] if i < len(read_id_list) else r1_s),
-                    fallback=f"sample_{i + 1}",
-                )
-                for i, r1_s in enumerate(r1_list)
-            ]
-            sids = _dedup_sample_names(raw_sids)
-            for i, (sid, r1_s) in enumerate(zip(sids, r1_list)):
+            matched_gs = 0
+            for i, (sid, r1_s) in enumerate(zip(r1_dedup_sids, r1_list)):
                 raw_key = read_id_list[i] if i < len(read_id_list) else sid
-                grp, extra_row = group_lookup.get(raw_key) or group_lookup.get(sid) or ("cohort", {})
-                r2_s = str(Path(r2_list[i]).resolve()) if i < len(r2_list) else ""
-                row_meta = {**extra_row, "source": str(Path(r1_s).resolve()), "mate2_url": r2_s}
-                jobs.append({"sample": sid, "group": grp, "src": str(Path(r1_s).resolve()), "mate2": r2_s, "crai": "", "row": row_meta})
+                hit = group_lookup.get(raw_key) or group_lookup.get(sid)
+                if hit is not None:
+                    matched_gs += 1
+                    grp, extra_row = hit
+                else:
+                    grp, extra_row = ("cohort", {})
+                r1_res = str(Path(r1_s).resolve())
+                r2_res = str(Path(r2_list[i]).resolve()) if i < len(r2_list) else ""
+                jobs.append({
+                    "sample": sid, "group": grp, "src": r1_res, "mate2": r2_res, "crai": "",
+                    "row": extra_row, "from_direct_args": True, "direct_pair": (r1_res, r2_res),
+                })
+            if group_lookup and matched_gs == 0:
+                raise ValueError(
+                    f"Group sheet {Path(manifest_path).name!r} matched 0 collection samples "
+                    f"(collection IDs: {r1_dedup_sids[:5]})"
+                )
         elif bam_list:
             raw_sids = [
                 _clean_sample_name(
                     sample_name if (len(bam_list) == 1 and sample_name) else (bam_id_list[i] if i < len(bam_id_list) else bp),
                     fallback=f"sample_{i + 1}",
+                    strip_mate_suffix=False,
                 )
                 for i, bp in enumerate(bam_list)
             ]
             sids = _dedup_sample_names(raw_sids)
+            matched_gs = 0
             for i, (sid, bp) in enumerate(zip(sids, bam_list)):
                 raw_key = bam_id_list[i] if i < len(bam_id_list) else sid
-                grp, extra_row = group_lookup.get(raw_key) or group_lookup.get(sid) or ("cohort", {})
+                hit = group_lookup.get(raw_key) or group_lookup.get(sid)
+                if hit is not None:
+                    matched_gs += 1
+                    grp, extra_row = hit
+                else:
+                    grp, extra_row = ("cohort", {})
                 crai_s = str(Path(crai_list[i]).resolve()) if (i < len(crai_list) and crai_list[i]) else ""
-                jobs.append({"sample": sid, "group": grp, "src": str(Path(bp).resolve()), "mate2": "", "crai": crai_s, "row": extra_row})
+                jobs.append({
+                    "sample": sid, "group": grp, "src": str(Path(bp).resolve()), "mate2": "", "crai": crai_s,
+                    "row": extra_row, "from_direct_args": True,
+                })
+            if group_lookup and matched_gs == 0:
+                raise ValueError(
+                    f"Group sheet {Path(manifest_path).name!r} matched 0 BAM/CRAM samples "
+                    f"(sample IDs: {sids[:5]})"
+                )
         elif manifest_path:
+            seen_man_sids: set[str] = set()
             for idx_r, row in enumerate(_read_manifest_table(manifest_path)):
                 sid = _clean_sample_name(_pick_col(row, ("sample_id", "Sample", "sample"), f"sample_{idx_r + 1}"), fallback=f"sample_{idx_r + 1}")
+                if sid in seen_man_sids:
+                    raise ValueError(f"Duplicate sample_id {sid!r} in manifest {Path(manifest_path).name!r}")
+                seen_man_sids.add(sid)
                 grp = _pick_col(row, ("country_or_group", "population", "group", "condition"), "cohort")
                 src = _pick_col(row, ("source_uri_or_srr", "cram_url", "bam_url", "run_or_url", "fastq_1", "accession", "source", "url"))
                 crai_u = _pick_col(row, ("crai_uri", "crai_uri_optional", "crai_url", "crai"))
@@ -1570,7 +2139,13 @@ def run_variationloop_galaxy(
                     src = sid
                 if not src:
                     raise ValueError(f"Sample {sid!r}: missing input source column in manifest")
-                jobs.append({"sample": sid, "group": grp, "src": src, "mate2": mate2, "crai": crai_u, "row": row})
+                allow_row_local = eff_allow_local_manifest or allow_logan_local_unitigs
+                _assert_manifest_uri_allowed(src, sid, "source", allow_local=allow_row_local, local_map=local_map)
+                if mate2:
+                    _assert_manifest_uri_allowed(mate2, sid, "mate2", allow_local=eff_allow_local_manifest, local_map=local_map)
+                if crai_u:
+                    _assert_manifest_uri_allowed(crai_u, sid, "crai", allow_local=eff_allow_local_manifest, local_map=local_map)
+                jobs.append({"sample": sid, "group": grp, "src": src, "mate2": mate2, "crai": crai_u, "row": row, "from_direct_args": False})
         elif sra_accessions and str(sra_accessions).strip():
             raw_txt = str(sra_accessions).replace("__cn__", " ").replace("__cr__", " ").replace("__tt__", " ")
             tokens = [t.strip().upper() for t in re.split(r"[\s,;]+", raw_txt.strip()) if t.strip()]
@@ -1579,28 +2154,38 @@ def run_variationloop_galaxy(
                 if tok in seen_toks:
                     continue
                 seen_toks.add(tok)
-                jobs.append({"sample": tok, "group": "cohort", "src": tok, "mate2": "", "crai": "", "row": {"source": tok}})
+                jobs.append({"sample": tok, "group": "cohort", "src": tok, "mate2": "", "crai": "", "row": {}, "from_direct_args": False})
         elif reads:
             if len(reads) == 2 and Path(reads[0]).exists() and Path(reads[1]).exists():
+                r1_res = str(Path(reads[0]).resolve())
+                r2_res = str(Path(reads[1]).resolve())
                 jobs.append(
                     {
                         "sample": eff_single_sample,
                         "group": "cohort",
-                        "src": str(Path(reads[0]).resolve()),
-                        "mate2": str(Path(reads[1]).resolve()),
+                        "src": r1_res,
+                        "mate2": r2_res,
                         "crai": "",
                         "row": {},
+                        "from_direct_args": True,
+                        "direct_pair": (r1_res, r2_res),
                     }
                 )
             else:
-                for idx_r, rp in enumerate(reads):
-                    sid = _clean_sample_name(read_ids[idx_r] if read_ids and idx_r < len(read_ids) else Path(rp).stem, fallback=f"sample_{idx_r + 1}")
-                    jobs.append({"sample": sid, "group": "cohort", "src": str(Path(rp).resolve()), "mate2": "", "crai": "", "row": {}})
+                raw_read_sids = [
+                    _clean_sample_name(read_ids[idx_r] if read_ids and idx_r < len(read_ids) else Path(rp).stem, fallback=f"sample_{idx_r + 1}")
+                    for idx_r, rp in enumerate(reads)
+                ]
+                ded_read_sids = _dedup_sample_names(raw_read_sids)
+                for sid, rp in zip(ded_read_sids, reads):
+                    jobs.append({"sample": sid, "group": "cohort", "src": str(Path(rp).resolve()), "mate2": "", "crai": "", "row": {}, "from_direct_args": True})
         else:
             raise ValueError("Provide a paired FASTQ collection, paired R1/R2 FASTQ files, BAM/CRAM file(s), public SRA accessions, or a cohort manifest")
 
         total_genome_bp = sum(ctg_lens.values())
-        if dedup_bits is None:
+        if eff_dedup_mode == "off":
+            eff_dedup_bits = 0
+        elif dedup_bits is None:
             if total_genome_bp < 1_000_000:
                 eff_dedup_bits = 18
             elif total_genome_bp < 100_000_000:
@@ -1628,18 +2213,34 @@ def run_variationloop_galaxy(
         used_engines: set[str] = set()
         p_frac = float(np.clip(subsample_fraction, 1e-4, 1.0))
 
-        # 0.4.0 Logan unitig probe & optional k=15 host/off-target bitset
+        # 0.4.1 Logan unitig probe, 400 Mb span gate (#41), RAM-aware aligner (#44), & optional k=15 bitset
         logan_avail: set[str] = set()
         k15_bit_path: Path | None = None
+        logan_pileup_regs = _pad_and_merge_regions(bed_regions, ctg_lens, pad_bp=500) if bed_regions else [(cn, 0, ln) for cn, ln in ctg_lens.items()]
+        logan_pileup_span = sum(max(0, e - s) for _, s, e in logan_pileup_regs)
+        logan_aligner_selected = "bwa"
+
         if analysis_mode == "logan_unitigs" or eff_logan_mode in ("auto", "logan_only"):
             from .logan import is_insdc_run, probe_logan_runs
-            from .malariavar.logan_var import build_k15_reference_bitset, ensure_var_logan_bins
+            from .malariavar import logan_var as LV
 
             cand_accs = [
                 j["src"].strip().upper()
                 for j in jobs
                 if is_insdc_run(j["src"]) and j["src"] not in local_map and j["sample"] not in local_map
             ]
+            if cand_accs and logan_pileup_span > 400_000_000 and analysis_mode == "auto" and eff_logan_mode == "auto":
+                _log(
+                    f"Reference pileup span ({logan_pileup_span / 1e6:.1f} Mb) exceeds the 400 Mb Logan pileup limit "
+                    "without --targets-bed, falling back automatically to raw read streaming"
+                )
+                cand_accs = []
+            elif (cand_accs or analysis_mode == "logan_unitigs") and logan_pileup_span > 400_000_000:
+                raise ValueError(
+                    f"Logan unitig calling on reference span {logan_pileup_span / 1e6:.1f} Mb (> 400 Mb) requires "
+                    "--targets-bed restricting target intervals to <= 400 Mb (or switch Logan mode to Automatic)"
+                )
+
             if cand_accs:
                 lprobe = probe_logan_runs(cand_accs, kind="unitigs", max_workers=min(32, max(8, int(threads))))
                 logan_avail = set(lprobe["logan_runs"])
@@ -1654,16 +2255,27 @@ def run_variationloop_galaxy(
                         "Switch Logan mode to Automatic to fall back to raw read streaming."
                     )
             if logan_avail or analysis_mode == "logan_unitigs":
-                from .malariavar.logan_var import _select_var_aligner, ensure_var_aligner_index
-
-                prep_bin, _ = ensure_var_logan_bins()
-                # Pre-build shared aligner index once before concurrent Logan workers start
-                _aln_name, _aln_bin = _select_var_aligner(mapper)
-                ensure_var_aligner_index(_aln_name, _aln_bin, eff_ref, work_dir, _log)
+                prep_bin, _ = LV.ensure_var_logan_bins()
+                try:
+                    _aln_name, _aln_bin = LV._select_var_aligner(mapper, ref_bp=total_genome_bp)
+                except TypeError:
+                    _aln_name, _aln_bin = LV._select_var_aligner(mapper)
+                idx_logan_ref = LV.ensure_var_aligner_index(
+                    _aln_name, _aln_bin, eff_ref, work_dir, _log, allow_bwa_fallback=(mapper == "auto")
+                )
+                if (
+                    _aln_name == "bwa-mem2"
+                    and isinstance(idx_logan_ref, Path)
+                    and not Path(str(idx_logan_ref) + ".bwt.2bit.64").is_file()
+                    and Path(str(idx_logan_ref) + ".bwt").is_file()
+                ):
+                    logan_aligner_selected = "bwa"
+                else:
+                    logan_aligner_selected = _aln_name
                 logan_span = sum(max(0, e - s) for _, s, e in bed_regions) if bed_regions else total_genome_bp
                 want_k15 = (eff_dep_mode == "on") or (eff_dep_mode == "auto" and logan_span <= 50_000_000)
                 if want_k15:
-                    k15_bit_path = build_k15_reference_bitset(
+                    k15_bit_path = LV.build_k15_reference_bitset(
                         eff_ref,
                         work_dir / "logan_k15.bit",
                         prep_bin=prep_bin,
@@ -1671,18 +2283,22 @@ def run_variationloop_galaxy(
                         log=_log,
                     )
 
-        # Optional host/off-target 31-mer retention filter for raw FASTQ calling
+        def _job_allows_local(j_dict: dict[str, Any]) -> bool:
+            return bool(j_dict.get("from_direct_args")) or eff_allow_local_manifest
+
+        # Optional host/off-target 31-mer retention filter for raw FASTQ calling (padded +-150 bp around narrow BEDs, #28)
         kset_tab = None
         has_raw_fq_jobs = any(
             not (j["src"].strip().upper() in logan_avail and j["src"] not in local_map and j["sample"] not in local_map)
+            and not (analysis_mode == "logan_unitigs" and allow_logan_local_unitigs and Path(j["src"]).is_file())
             and not (
                 j["src"].split("?", 1)[0].lower().endswith((".bam", ".cram"))
-                or (not j["src"].startswith(("http://", "https://")) and Path(j["src"]).is_file() and _detect_aln_format(Path(j["src"])) in ("bam", "cram"))
+                or (_job_allows_local(j) and not j["src"].startswith(("http://", "https://")) and Path(j["src"]).is_file() and _detect_aln_format(Path(j["src"])) in ("bam", "cram"))
             )
             for j in jobs
         )
         if has_raw_fq_jobs and eff_dep_mode != "off":
-            regs_k = bed_regions or [(cn, 0, ln) for cn, ln in ctg_lens.items()]
+            regs_k = _pad_and_merge_regions(bed_regions, ctg_lens, pad_bp=150) if bed_regions else [(cn, 0, ln) for cn, ln in ctg_lens.items()]
             target_span = sum(max(0, e - s) for _, s, e in regs_k)
             want_fq_kset = (eff_dep_mode == "on") or (eff_dep_mode == "auto" and bool(bed_regions) and target_span <= 45_000_000)
             if want_fq_kset:
@@ -1698,7 +2314,18 @@ def run_variationloop_galaxy(
                 else:
                     bits_k = 26
                 kset_tab, kmeta = VG.build_target_kset(g, regs_k, bits=bits_k)
-                _log(f"Built target 31-mer pre-filter table ({kmeta['inserted_kmers']:,} k-mers across {target_span / 1e6:.2f} Mb)")
+                if int(kmeta["inserted_kmers"]) == 0:
+                    _log(
+                        "Warning: target intervals yielded 0 non-repetitive 31-mers — skipping read pre-filter "
+                        "so target alignments are not discarded"
+                    )
+                    kset_tab = None
+                else:
+                    _log(f"Built target 31-mer pre-filter table ({kmeta['inserted_kmers']:,} k-mers across {target_span / 1e6:.2f} Mb)")
+
+        cov_dir = work_dir / "cov"
+        cov_dir.mkdir(parents=True, exist_ok=True)
+        cov_files_by_idx: dict[int, tuple[Path | None, Path | None]] = {}
 
         logan_indexed: list[tuple[int, dict[str, Any], Path]] = []
         other_indexed: list[tuple[int, dict[str, Any], Path]] = []
@@ -1709,7 +2336,7 @@ def run_variationloop_galaxy(
             src_u = src.strip().upper()
             use_logan_for_job = (
                 (src_u in logan_avail and src not in local_map and sid not in local_map)
-                or (analysis_mode == "logan_unitigs" and Path(src).is_file())
+                or (analysis_mode == "logan_unitigs" and (allow_logan_local_unitigs or _job_allows_local(job)) and not src.startswith(("http://", "https://")) and Path(src).exists())
             )
             if use_logan_for_job:
                 logan_indexed.append((idx_j, job, s_vcf_gz))
@@ -1720,9 +2347,14 @@ def run_variationloop_galaxy(
         log_lock = threading.Lock()
 
         if logan_indexed:
-            from .malariavar.logan_var import run_varloop_logan_unitigs
+            from .malariavar import logan_var as LV
 
-            logan_workers = min(len(logan_indexed), max(1, int(threads) // 4))
+            avail_ram = LV.available_ram_bytes()
+            bed_loaded_bp = sum(ctg_lens[cn] for cn in {c for c, _, _ in bed_regions}) if bed_regions else total_genome_bp
+            idx_ram_per_w = (6 * total_genome_bp) if logan_aligner_selected == "bwa-mem2" else (2 * total_genome_bp)
+            per_w_ram = idx_ram_per_w + bed_loaded_bp + 20 * logan_pileup_span + (256 << 20)
+            ram_cap_w = max(1, int((0.75 * avail_ram) // max(per_w_ram, 256 << 20)))
+            logan_workers = min(len(logan_indexed), max(1, int(threads) // 4), ram_cap_w)
             logan_per_threads = max(1, int(threads) // logan_workers)
             if logan_workers > 1:
                 _log(
@@ -1730,13 +2362,20 @@ def run_variationloop_galaxy(
                     f"({logan_per_threads} aligner threads/worker)"
                 )
 
-            def _run_logan_item(item: tuple[int, dict[str, Any], Path]) -> tuple[int, dict[str, Any], Path, str]:
+            def _run_logan_item(item: tuple[int, dict[str, Any], Path]) -> tuple[int, dict[str, Any], Path, str, Path]:
                 idx_j, job, s_vcf_gz = item
                 sid = job["sample"]
                 src = job["src"]
                 src_u = src.strip().upper()
-                local_u = Path(src) if (analysis_mode == "logan_unitigs" and Path(src).is_file()) else None
-                tel = run_varloop_logan_unitigs(
+                is_local_u = (
+                    analysis_mode == "logan_unitigs"
+                    and (allow_logan_local_unitigs or _job_allows_local(job))
+                    and not src.startswith(("http://", "https://"))
+                    and Path(src).exists()
+                )
+                local_u = Path(src) if is_local_u else None
+                cov_tsv = cov_dir / f"{idx_j:04d}.cov.tsv"
+                tel = LV.run_varloop_logan_unitigs(
                     acc=src_u,
                     sample=sid,
                     ref_fa=eff_ref,
@@ -1754,6 +2393,7 @@ def run_variationloop_galaxy(
                     min_wsaf=eff_min_wsaf,
                     ploidy=eff_ploidy,
                     local_unitigs_path=local_u,
+                    out_cov_tsv=cov_tsv,
                     log=lambda m: _log(f"  [{idx_j}/{len(jobs)}] {m}"),
                 )
                 with log_lock:
@@ -1761,111 +2401,165 @@ def run_variationloop_galaxy(
                         f"  [{idx_j}/{len(jobs)}] {sid} (Logan): {tel.get('n_variants', 0)} variants, "
                         f"{tel.get('wire_bytes', 0) / 1e6:.2f} MB wire ({tel.get('wall_s', 0):.2f}s)"
                     )
-                return idx_j, tel, s_vcf_gz, sid
+                return idx_j, tel, s_vcf_gz, sid, cov_tsv
 
             if logan_workers > 1:
                 with ThreadPoolExecutor(max_workers=logan_workers) as ex:
-                    for idx_j, tel, s_vcf_gz, sid in ex.map(_run_logan_item, logan_indexed):
+                    for idx_j, tel, s_vcf_gz, sid, cov_tsv in ex.map(_run_logan_item, logan_indexed):
                         results_by_idx[idx_j] = (tel, s_vcf_gz, sid)
+                        cov_files_by_idx[idx_j] = (None, cov_tsv)
             else:
                 for item in logan_indexed:
-                    idx_j, tel, s_vcf_gz, sid = _run_logan_item(item)
+                    idx_j, tel, s_vcf_gz, sid, cov_tsv = _run_logan_item(item)
                     results_by_idx[idx_j] = (tel, s_vcf_gz, sid)
+                    cov_files_by_idx[idx_j] = (None, cov_tsv)
             used_engines.add("logan_unitigs")
 
         for idx_j, job, s_vcf_gz in other_indexed:
             sid = job["sample"]
             src = job["src"]
-            src_clean = src.split("?", 1)[0].lower()
-            aln_fmt = None
-            if src_clean.endswith(".cram"):
-                aln_fmt = "cram"
-            elif src_clean.endswith(".bam"):
-                aln_fmt = "bam"
-            elif not src.startswith(("http://", "https://")) and Path(src).is_file():
-                aln_fmt = _detect_aln_format(Path(src))
+            allow_loc = _job_allows_local(job)
+            cov_npz = cov_dir / f"{idx_j:04d}.cov.npz"
+            cleanup_paths: list[Path] = []
+            try:
+                src_clean = src.split("?", 1)[0].lower()
+                aln_fmt = None
+                if src_clean.endswith(".cram"):
+                    aln_fmt = "cram"
+                elif src_clean.endswith(".bam"):
+                    aln_fmt = "bam"
+                elif allow_loc and not src.startswith(("http://", "https://")) and Path(src).is_file():
+                    aln_fmt = _detect_aln_format(Path(src))
 
-            if aln_fmt in ("cram", "bam"):
-                crai_src = job["crai"] or (src + ".crai" if (aln_fmt == "cram" and (src.startswith(("http://", "https://")) or Path(src + ".crai").is_file())) else "")
-                use_cram_slicing = analysis_mode in ("auto", "focused_cram") and aln_fmt == "cram" and bool(crai_src)
-                if use_cram_slicing:
-                    if src.startswith(("http://", "https://")):
-                        cram_ref = src
+                if aln_fmt in ("cram", "bam"):
+                    if not src.startswith(("http://", "https://", "ftp://")) and not allow_loc:
+                        raise ValueError(
+                            f"Sample {sid!r}: local BAM/CRAM path in manifest requires --allow-local-manifest-paths"
+                        )
+                    crai_src = job["crai"] or (
+                        src + ".crai"
+                        if (aln_fmt == "cram" and (src.startswith(("http://", "https://")) or (allow_loc and Path(src + ".crai").is_file())))
+                        else ""
+                    )
+                    use_cram_slicing = analysis_mode in ("auto", "focused_cram") and aln_fmt == "cram" and bool(crai_src)
+                    if use_cram_slicing:
+                        if src.startswith(("http://", "https://")):
+                            cram_ref = src
+                        else:
+                            cram_ref = str(_stage_local_aln(Path(src), work_dir / "aln_links", sid, "cram"))
+                        crai_dst = work_dir / "crai" / f"{idx_j:04d}_{sid}.cram.crai"
+                        crai_local = _fetch_crai_file(crai_src, crai_dst, allow_local=allow_loc)
+                        cleanup_paths.append(crai_local)
+                        regs_use = bed_regions or [(cn, 0, ln) for cn, ln in ctg_lens.items()]
+                        tel = VG.run_varloop_crai_focused(
+                            g, eff_ref, cram_ref, crai_local, regs_use, s_vcf_gz,
+                            params=dp_params, sample=sid, pad_bp=int(cram_pad_bp), zoom_assisted=bool(enable_reassembly),
+                            clip_regions=bed_regions or None,
+                            callable_npz_out=cov_npz,
+                        )
+                        tel["sample"] = sid
+                        used_engines.add("focused_cram")
                     else:
-                        cram_ref = str(_stage_local_aln(Path(src), work_dir / "aln_links", sid, "cram"))
-                    crai_local = _fetch_crai_file(crai_src, work_dir / "crai" / f"{sid}.cram.crai")
-                    regs_use = bed_regions or [(cn, 0, ln) for cn, ln in ctg_lens.items()]
-                    tel = VG.run_varloop_crai_focused(
-                        g, eff_ref, cram_ref, crai_local, regs_use, s_vcf_gz,
-                        params=dp_params, sample=sid, pad_bp=int(cram_pad_bp), zoom_assisted=bool(enable_reassembly),
-                    )
-                    tel["sample"] = sid
-                    used_engines.add("focused_cram")
+                        if src.startswith(("http://", "https://")):
+                            local_aln = _materialize_remote_input(src, work_dir / "aln" / f"{idx_j:04d}_{sid}.{aln_fmt}", "remote_aln", threads=threads)
+                            cleanup_paths.append(local_aln)
+                        else:
+                            local_aln = _stage_local_aln(Path(src), work_dir / "aln_links", sid, aln_fmt)
+                            if crai_src and allow_loc and Path(crai_src).is_file():
+                                idx_ext = ".cram.crai" if aln_fmt == "cram" else ".bam.bai"
+                                idx_link = local_aln.parent / f"{sid}{idx_ext}"
+                                if idx_link.exists() or idx_link.is_symlink():
+                                    idx_link.unlink()
+                                os.symlink(Path(crai_src).resolve(), idx_link)
+                        tel = VG.run_varloop_bam_cram(
+                            g, eff_ref, local_aln, s_vcf_gz,
+                            params=dp_params, target_regions=bed_regions or None, zoom_regions=bed_regions or None,
+                            sample=sid, threads=threads, call_workers=min(4, max(1, threads // 2)),
+                            targets_bed=targets_bed,
+                            clip_regions=bed_regions or None,
+                            callable_npz_out=cov_npz,
+                        )
+                        used_engines.add("diploid_wgs")
                 else:
-                    if src.startswith(("http://", "https://")):
-                        local_aln = _materialize_remote_input(src, work_dir / "aln" / f"{sid}.{aln_fmt}", "remote_aln", threads=threads)
+                    if chosen_mapper is None:
+                        chosen_mapper = _select_mapper(mapper)
+                        if chosen_mapper in ("bwa-mem2", "bwa"):
+                            ext_c = ".bwt.2bit.64" if chosen_mapper == "bwa-mem2" else ".bwt"
+                            if not Path(str(eff_ref) + ext_c).exists():
+                                idx_fa = work_dir / "mapper_ref" / eff_ref.name
+                                idx_fa.parent.mkdir(parents=True, exist_ok=True)
+                                os.symlink(eff_ref, idx_fa)
+                                subprocess.run([chosen_mapper, "index", str(idx_fa)], check=True)
+                                eff_ref = idx_fa
+
+                    if job.get("direct_pair"):
+                        r1_ref, r2_ref = job["direct_pair"]
+                        rkind = "local_fastq"
                     else:
-                        local_aln = _stage_local_aln(Path(src), work_dir / "aln_links", sid, aln_fmt)
-                        if crai_src and Path(crai_src).is_file():
-                            idx_ext = ".cram.crai" if aln_fmt == "cram" else ".bam.bai"
-                            idx_link = local_aln.parent / f"{sid}{idx_ext}"
-                            if idx_link.exists() or idx_link.is_symlink():
-                                idx_link.unlink()
-                            os.symlink(Path(crai_src).resolve(), idx_link)
-                    tel = VG.run_varloop_bam_cram(
-                        g, eff_ref, local_aln, s_vcf_gz,
-                        params=dp_params, target_regions=bed_regions or None, zoom_regions=bed_regions or None,
-                        sample=sid, threads=threads, call_workers=min(4, max(1, threads // 2)),
-                        targets_bed=targets_bed,
+                        r1_ref, r2_ref, rkind = _resolve_fastq_pair_for_row(
+                            job["row"] or {"source": src, "mate2_url": job["mate2"]},
+                            local_map,
+                            work_dir,
+                            sid,
+                            allow_local=allow_loc,
+                        )
+                    if rkind == "insdc_odp":
+                        r1_dst = work_dir / "fq" / f"{idx_j:04d}_{sid}_R1.fq.gz"
+                        r2_dst = work_dir / "fq" / f"{idx_j:04d}_{sid}_R2.fq.gz"
+                        r1_local, r2_local = _materialize_odp_paired(r1_ref, r1_dst, r2_dst, threads=threads)
+                        cleanup_paths.extend([r1_local, r2_local])
+                    elif rkind != "local_fastq":
+                        if not r2_ref:
+                            raise ValueError(f"Sample {sid!r}: paired-end R1 and R2 FASTQ inputs are required for variant calling")
+                        r1_local = _materialize_remote_input(r1_ref, work_dir / "fq" / f"{idx_j:04d}_{sid}_R1.fq.gz", rkind, threads=threads)
+                        cleanup_paths.append(r1_local)
+                        r2_local = _materialize_remote_input(r2_ref, work_dir / "fq" / f"{idx_j:04d}_{sid}_R2.fq.gz", rkind, threads=threads)
+                        cleanup_paths.append(r2_local)
+                    else:
+                        if not r2_ref:
+                            raise ValueError(f"Sample {sid!r}: paired-end R1 and R2 FASTQ inputs are required for variant calling")
+                        r1_local = _stage_local_fastq(Path(r1_ref), work_dir / "fq_links", f"{idx_j:04d}_{sid}_R1")
+                        r2_local = _stage_local_fastq(Path(r2_ref), work_dir / "fq_links", f"{idx_j:04d}_{sid}_R2")
+
+                    if kset_tab is not None:
+                        VG._validate_fastq_input(Path(r1_local))
+                        VG._validate_fastq_input(Path(r2_local))
+                        filt_r1 = work_dir / "fq_filt" / f"{idx_j:04d}_{sid}_R1.fq.gz"
+                        filt_r2 = work_dir / "fq_filt" / f"{idx_j:04d}_{sid}_R2.fq.gz"
+                        cleanup_paths.extend([filt_r1, filt_r2])
+                        fstats = VG.extract_sieved_fastq_pair(
+                            r1_local, r2_local, filt_r1, filt_r2,
+                            kset_tab=kset_tab, stride=5, need=1, p_sample=p_frac,
+                            decomp_threads=min(4, threads), comp_threads=min(4, threads),
+                        )
+                        _log(f"  Target pre-filter {sid}: kept {fstats['spots_emitted']}/{fstats['spots_seen']} read pairs")
+                        if int(fstats["spots_seen"]) <= 0 or int(fstats["spots_emitted"]) <= 0:
+                            raise RuntimeError(
+                                f"Sample {sid!r}: zero read pairs retained after target 31-mer pre-filter "
+                                f"({fstats['spots_emitted']}/{fstats['spots_seen']})"
+                            )
+                        r1_use, r2_use, p_run = filt_r1, filt_r2, 1.0
+                        used_engines.add("wgs_stream")
+                    else:
+                        r1_use, r2_use, p_run = r1_local, r2_local, p_frac
+                        used_engines.add("diploid_wgs")
+
+                    tel = VG.run_varloop_fastq(
+                        g, eff_ref, r1_use, r2_use, s_vcf_gz,
+                        params=dp_params, map_threads=max(1, threads),
+                        target_regions=bed_regions or None, zoom_regions=bed_regions or None,
+                        sample=sid, p_sample=p_run, call_workers=min(4, max(1, threads // 2)),
+                        mapper_name=chosen_mapper,
+                        clip_regions=bed_regions or None,
+                        callable_npz_out=cov_npz,
                     )
-                    used_engines.add("diploid_wgs")
-            else:
-                if chosen_mapper is None:
-                    chosen_mapper = _select_mapper(mapper)
-                    if chosen_mapper in ("bwa-mem2", "bwa"):
-                        ext_c = ".bwt.2bit.64" if chosen_mapper == "bwa-mem2" else ".bwt"
-                        if not Path(str(eff_ref) + ext_c).exists():
-                            idx_fa = work_dir / "mapper_ref" / eff_ref.name
-                            idx_fa.parent.mkdir(parents=True, exist_ok=True)
-                            os.symlink(eff_ref, idx_fa)
-                            subprocess.run([chosen_mapper, "index", str(idx_fa)], check=True)
-                            eff_ref = idx_fa
-
-                r1_ref, r2_ref, rkind = _resolve_fastq_pair_for_row(job["row"] or {"source": src, "mate2_url": job["mate2"]}, local_map, work_dir, sid)
-                if rkind != "local_fastq":
-                    r1_local = _materialize_remote_input(r1_ref, work_dir / "fq" / f"{sid}_R1.fq.gz", rkind, threads=threads)
-                    r2_local = _materialize_remote_input(r2_ref, work_dir / "fq" / f"{sid}_R2.fq.gz", rkind, threads=threads) if r2_ref else None
-                else:
-                    r1_local = _stage_local_fastq(Path(r1_ref), work_dir / "fq_links", f"{sid}_R1")
-                    r2_local = _stage_local_fastq(Path(r2_ref), work_dir / "fq_links", f"{sid}_R2") if r2_ref else None
-
-                if r2_local is None:
-                    raise ValueError(f"Sample {sid!r}: paired-end R1 and R2 FASTQ inputs are required for variant calling")
-
-                if kset_tab is not None:
-                    filt_r1 = work_dir / "fq_filt" / f"{sid}_R1.fq.gz"
-                    filt_r2 = work_dir / "fq_filt" / f"{sid}_R2.fq.gz"
-                    fstats = VG.extract_sieved_fastq_pair(
-                        r1_local, r2_local, filt_r1, filt_r2,
-                        kset_tab=kset_tab, stride=5, need=1, p_sample=p_frac,
-                        decomp_threads=min(4, threads), comp_threads=min(4, threads),
-                    )
-                    _log(f"  Depletion filter {sid}: kept {fstats['spots_emitted']}/{fstats['spots_seen']} spots")
-                    r1_use, r2_use, p_run = filt_r1, filt_r2, 1.0
-                    used_engines.add("wgs_stream")
-                else:
-                    r1_use, r2_use, p_run = r1_local, r2_local, p_frac
-                    used_engines.add("diploid_wgs")
-
-                tel = VG.run_varloop_fastq(
-                    g, eff_ref, r1_use, r2_use, s_vcf_gz,
-                    params=dp_params, map_threads=max(1, threads),
-                    target_regions=bed_regions or None, zoom_regions=bed_regions or None,
-                    sample=sid, p_sample=p_run, call_workers=min(4, max(1, threads // 2)),
-                    mapper_name=chosen_mapper,
-                )
+            finally:
+                # Immediately unlink per-sample materialized FASTQ/BAM scratch files (#43)
+                for cp_tmp in cleanup_paths:
+                    cp_tmp.unlink(missing_ok=True)
 
             results_by_idx[idx_j] = (tel, s_vcf_gz, sid)
+            cov_files_by_idx[idx_j] = (cov_npz, None)
             _log(f"  [{idx_j}/{len(jobs)}] {sid}: {tel.get('n_variants', 0)} variants ({tel.get('total_wall_s', tel.get('wall_s', 0)):.2f}s)")
 
         import pyarrow as pa
@@ -1899,15 +2593,49 @@ def run_variationloop_galaxy(
         total_snv = 0
         total_indel = 0
         wrote_tsv_header = False
+        cohort_sites_set: set[tuple[str, int]] = set()
+        called_sample_sites: set[tuple[str, int, str]] = set()
+        high_dup_samples: list[str] = []
 
         with pq.ParquetWriter(str(pq_path), var_schema, compression="zstd") as pq_writer:
             for idx_j in range(1, len(jobs) + 1):
-                tel, s_vcf_gz, sid = results_by_idx[idx_j]
-                sample_tels.append(tel)
+                raw_tel, s_vcf_gz, sid = results_by_idx[idx_j]
+                if "reads_counted" in raw_tel:
+                    reads_cnt_j = int(raw_tel.get("reads_counted") or 0)
+                else:
+                    reads_cnt_j = int(
+                        raw_tel.get("counted_unitigs")
+                        or raw_tel.get("sam_records")
+                        or raw_tel.get("n_variants")
+                        or 0
+                    )
+                if reads_cnt_j <= 0:
+                    raise RuntimeError(f"Sample {sid!r}: zero reads/unitigs counted — refusing to pack invalid sample state")
+                raw_tel["reads_counted"] = reads_cnt_j
+                prim_j = int(raw_tel.get("primary_mapped") or raw_tel.get("sam_records") or 0)
+                dup_frac_j = float(raw_tel.get("pcr_dup_fraction") or 0.0)
+                if eff_dedup_mode != "off" and prim_j >= 100 and dup_frac_j > 0.95:
+                    high_dup_samples.append(sid)
+                    _log(
+                        f"WARNING: Sample {sid!r} had {100.0 * dup_frac_j:.1f}% PCR duplicates skipped "
+                        f"({int(raw_tel.get('pcr_dups_skipped') or 0)}/{prim_j}). "
+                        "If this is a targeted PCR amplicon library, set PCR duplicate removal to Off (--dedup-bits 0)."
+                    )
+                clean_tel = {
+                    k: v
+                    for k, v in raw_tel.items()
+                    if k not in ("vcf_path", "pileup_vcf_path")
+                }
+                sample_tels.append(clean_tel)
                 per_sample_vcfs.append(s_vcf_gz)
                 df_s = _vcf_to_dataframe(s_vcf_gz, sample_override=sid)
                 n_s = len(df_s)
                 if n_s > 0:
+                    for ch_v, pos_v in zip(df_s["chrom"], df_s["pos"]):
+                        ch_s = str(ch_v)
+                        pos_i = int(pos_v)
+                        cohort_sites_set.add((ch_s, pos_i))
+                        called_sample_sites.add((ch_s, pos_i, sid))
                     n_s_snv = int((df_s["kind"] == "SNV").sum())
                     total_variants += n_s
                     total_snv += n_s_snv
@@ -1948,6 +2676,20 @@ def run_variationloop_galaxy(
                 pd.DataFrame(columns=var_cols).to_csv(out_variants_p, sep="\t", index=False)
                 pq_writer.write_table(pa.Table.from_pydict({f.name: [] for f in var_schema}, schema=var_schema))
 
+        # Write site_nocalls.parquet recording uncovered/no-call samples at called cohort variant sites (#62)
+        nocall_rows: list[tuple[str, int, str]] = []
+        if cohort_sites_set:
+            ordered_sites = sorted(cohort_sites_set)
+            for idx_j in range(1, len(jobs) + 1):
+                _, _, sid = results_by_idx[idx_j]
+                c_npz, c_tsv = cov_files_by_idx.get(idx_j, (None, None))
+                cov_map = _load_sample_covered_intervals(c_npz, c_tsv)
+                for ch_s, pos_i in ordered_sites:
+                    if (ch_s, pos_i, sid) not in called_sample_sites:
+                        if not _is_pos0_covered(cov_map, ch_s, pos_i - 1):
+                            nocall_rows.append((ch_s, pos_i, sid))
+        _write_site_nocalls_parquet(state_root / "site_nocalls.parquet", nocall_rows)
+
         variants_preview_df = pd.concat(preview_chunks, ignore_index=True) if preview_chunks else pd.DataFrame(columns=var_cols)
 
         eff_mode = (
@@ -1959,11 +2701,12 @@ def run_variationloop_galaxy(
         if out_vcf_p:
             if len(per_sample_vcfs) == 1:
                 _materialize_vcf_output(per_sample_vcfs[0], out_vcf_p)
-            elif shutil.which("bcftools") and all(Path(str(p) + ".tbi").is_file() for p in per_sample_vcfs):
+            elif total_variants > 0 and shutil.which("bcftools") and all(Path(str(p) + ".tbi").is_file() for p in per_sample_vcfs):
                 merged_gz = work_dir / "merged.vcf.gz"
                 _bcftools_merge_batched(per_sample_vcfs, merged_gz, work_dir, threads=threads)
                 _materialize_vcf_output(merged_gz, out_vcf_p)
             else:
+                # Bypass bcftools merge on 0-variant cohorts to avoid bcftools 1.15.1 SIGSEGV (#37)
                 _merge_vcfs_pure_python(per_sample_vcfs, out_vcf_p)
 
         if out_drm_p:
@@ -1991,6 +2734,7 @@ def run_variationloop_galaxy(
             "mode": eff_mode,
             "ploidy": eff_ploidy,
             "min_wsaf": eff_min_wsaf,
+            "dedup": eff_dedup_mode,
             "reference_label": ref_lbl,
             "n_samples": len(jobs),
             "n_variants": total_variants,
@@ -1998,6 +2742,8 @@ def run_variationloop_galaxy(
             "n_indel": total_indel,
             "wall_s": round(time.time() - t_start, 2),
         }
+        if high_dup_samples:
+            summary_stats["high_dup_samples"] = high_dup_samples
         render_variationloop_report(
             out_report_p,
             analysis_mode=eff_mode,
@@ -2010,12 +2756,17 @@ def run_variationloop_galaxy(
         HypothesisLedger.from_store(store, alpha_budget=0.05)
         pd.DataFrame(sample_tels).to_parquet(state_root / "sample_telemetry.parquet", index=False)
         sample_records = []
-        for j in jobs:
-            rec = {"sample": j["sample"], "group": j["group"], "condition": j["group"]}
-            for k, v in (j.get("row") or {}).items():
-                if k and k not in rec and v:
-                    rec[k] = v
-            sample_records.append(rec)
+        for idx_j, j in enumerate(jobs, 1):
+            tel_j, _, _ = results_by_idx[idx_j]
+            sample_records.append(
+                _sanitize_state_sample_record(
+                    j["sample"],
+                    j["group"],
+                    j.get("row"),
+                    reads_counted=int(tel_j.get("reads_counted") or 0),
+                    median_depth=float(tel_j.get("median_depth") or 0.0),
+                )
+            )
         state_meta = {
             "engine": "variationloop",
             "version": "0.4.0",

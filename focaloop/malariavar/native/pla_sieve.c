@@ -54,7 +54,7 @@ static int radix_sort_u64(uint64_t *a, size_t n, int num_threads) {
     if (!tmp) return -1;
 
     int T = (n < 65536U) ? 1 : effective_threads(num_threads);
-    size_t *hist = (size_t *)malloc((size_t)T * 256U * sizeof(size_t));
+    size_t *hist = (size_t *)calloc((size_t)T * 256U, sizeof(size_t));
     if (!hist) {
         free(tmp);
         return -1;
@@ -65,29 +65,37 @@ static int radix_sort_u64(uint64_t *a, size_t n, int num_threads) {
 
     for (int pass = 0; pass < 8; ++pass) {
         const unsigned shift = (unsigned)(pass * 8);
+        int team_T = 1;
+        memset(hist, 0, (size_t)T * 256U * sizeof(size_t));
 
         #pragma omp parallel num_threads(T)
         {
 #ifdef _OPENMP
             int tid = omp_get_thread_num();
+            int actual_T = omp_get_num_threads();
 #else
             int tid = 0;
+            int actual_T = 1;
 #endif
-            size_t s0 = (n * (size_t)tid) / (size_t)T;
-            size_t s1 = (n * (size_t)(tid + 1)) / (size_t)T;
+            if (tid == 0) team_T = actual_T;
+            size_t s0 = (n * (size_t)tid) / (size_t)actual_T;
+            size_t s1 = (n * (size_t)(tid + 1)) / (size_t)actual_T;
             size_t local_h[256];
             memset(local_h, 0, sizeof(local_h));
             for (size_t i = s0; i < s1; ++i) {
                 local_h[(src[i] >> shift) & 0xFFU]++;
             }
-            memcpy(&hist[(size_t)tid * 256U], local_h, sizeof(local_h));
+            if (tid < T) {
+                memcpy(&hist[(size_t)tid * 256U], local_h, sizeof(local_h));
+            }
         }
+        if (team_T > T) team_T = T;
 
         // Check whether all n keys share a single byte value in this radix digit (skip scatter if so).
         int skip_pass = 0;
         for (size_t b = 0; b < 256U; ++b) {
             size_t col_sum = 0;
-            for (int t = 0; t < T; ++t) col_sum += hist[(size_t)t * 256U + b];
+            for (int t = 0; t < team_T; ++t) col_sum += hist[(size_t)t * 256U + b];
             if (col_sum == n) {
                 skip_pass = 1;
                 break;
@@ -97,28 +105,45 @@ static int radix_sort_u64(uint64_t *a, size_t n, int num_threads) {
 
         size_t running = 0;
         for (size_t b = 0; b < 256U; ++b) {
-            for (int t = 0; t < T; ++t) {
+            for (int t = 0; t < team_T; ++t) {
                 size_t c = hist[(size_t)t * 256U + b];
                 hist[(size_t)t * 256U + b] = running;
                 running += c;
             }
         }
 
-        #pragma omp parallel num_threads(T)
+        #pragma omp parallel num_threads(team_T)
         {
 #ifdef _OPENMP
             int tid = omp_get_thread_num();
+            int actual_T = omp_get_num_threads();
 #else
             int tid = 0;
+            int actual_T = 1;
 #endif
-            size_t s0 = (n * (size_t)tid) / (size_t)T;
-            size_t s1 = (n * (size_t)(tid + 1)) / (size_t)T;
-            size_t local_off[256];
-            memcpy(local_off, &hist[(size_t)tid * 256U], sizeof(local_off));
-            for (size_t i = s0; i < s1; ++i) {
-                uint64_t v = src[i];
-                unsigned byte = (unsigned)((v >> shift) & 0xFFU);
-                dst[local_off[byte]++] = v;
+            if (actual_T == team_T) {
+                size_t s0 = (n * (size_t)tid) / (size_t)team_T;
+                size_t s1 = (n * (size_t)(tid + 1)) / (size_t)team_T;
+                size_t local_off[256];
+                memcpy(local_off, &hist[(size_t)tid * 256U], sizeof(local_off));
+                for (size_t i = s0; i < s1; ++i) {
+                    uint64_t v = src[i];
+                    unsigned byte = (unsigned)((v >> shift) & 0xFFU);
+                    dst[local_off[byte]++] = v;
+                }
+            } else if (tid == 0) {
+                /* Fallback if OpenMP dynamically shrank team between the two parallel regions */
+                for (int t = 0; t < team_T; ++t) {
+                    size_t s0 = (n * (size_t)t) / (size_t)team_T;
+                    size_t s1 = (n * (size_t)(t + 1)) / (size_t)team_T;
+                    size_t local_off[256];
+                    memcpy(local_off, &hist[(size_t)t * 256U], sizeof(local_off));
+                    for (size_t i = s0; i < s1; ++i) {
+                        uint64_t v = src[i];
+                        unsigned byte = (unsigned)((v >> shift) & 0xFFU);
+                        dst[local_off[byte]++] = v;
+                    }
+                }
             }
         }
 
@@ -1562,12 +1587,24 @@ static inline int64_t fq_trim_cr(const uint8_t *buf, int64_t s, int64_t e) {
 }
 
 static inline int64_t fq_stem_len(const uint8_t *buf, int64_t s, int64_t e) {
-    int64_t j = e - 1;
-    while (j > s && buf[j] != '.' && buf[j] != '/' && buf[j] != ' ') {
+    int64_t w = s;
+    while (w < e && buf[w] != ' ' && buf[w] != '\t') w++;
+    if (w - s >= 2 && (buf[w - 2] == '/' || buf[w - 2] == '.') &&
+        (buf[w - 1] == '0' || buf[w - 1] == '1' || buf[w - 1] == '2')) {
+        return (w - 2) - s;
+    }
+    int64_t j = w - 1;
+    while (j > s && buf[j] != '.' && buf[j] != '/') {
         j--;
     }
-    if (j > s && (buf[j] == '.' || buf[j] == '/')) return j - s;
-    return e - s;
+    if (j > s && (buf[j] == '.' || buf[j] == '/')) {
+        int all_digits = (j + 1 < w);
+        for (int64_t k = j + 1; k < w; k++) {
+            if (buf[k] < '0' || buf[k] > '9') { all_digits = 0; break; }
+        }
+        if (all_digits && buf[j] == '/') return j - s;
+    }
+    return w - s;
 }
 
 static inline int64_t fq_adapter_pos(const uint8_t *buf, int64_t s, int64_t e, const uint8_t *ad, int64_t ad_len) {
@@ -2060,16 +2097,18 @@ int pla_generate_distinct_syncmers(
     init_pf_at81_markov(markov);
     int T = effective_threads(num_threads);
 
-    // Phase 1: Parallel generation of n_target raw open syncmers across T independent contigs.
+    // Phase 1: Parallel generation of n_target raw open syncmers across actual_T independent contigs.
     #pragma omp parallel num_threads(T)
     {
 #ifdef _OPENMP
         int tid = omp_get_thread_num();
+        int actual_T = omp_get_num_threads();
 #else
         int tid = 0;
+        int actual_T = 1;
 #endif
-        size_t s0 = (n_target * (size_t)tid) / (size_t)T;
-        size_t s1 = (n_target * (size_t)(tid + 1)) / (size_t)T;
+        size_t s0 = (n_target * (size_t)tid) / (size_t)actual_T;
+        size_t s1 = (n_target * (size_t)(tid + 1)) / (size_t)actual_T;
         if (s1 > s0) {
             gen_syncmer_chunk(
                 out_keys + s0, s1 - s0, mode_at81, k, s, markov,
@@ -2092,11 +2131,13 @@ int pla_generate_distinct_syncmers(
         {
 #ifdef _OPENMP
             int tid = omp_get_thread_num();
+            int actual_Tb = omp_get_num_threads();
 #else
             int tid = 0;
+            int actual_Tb = 1;
 #endif
-            size_t b0 = (batch * (size_t)tid) / (size_t)Tb;
-            size_t b1 = (batch * (size_t)(tid + 1)) / (size_t)Tb;
+            size_t b0 = (batch * (size_t)tid) / (size_t)actual_Tb;
+            size_t b1 = (batch * (size_t)(tid + 1)) / (size_t)actual_Tb;
             if (b1 > b0) {
                 gen_syncmer_chunk(
                     extra + b0, b1 - b0, mode_at81, k, s, markov,

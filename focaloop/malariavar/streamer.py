@@ -686,9 +686,24 @@ class EnaFastq(Source):
         if self.i >= len(self.pairs) or self.errors:
             return False
         r1, r2 = self.pairs[self.i]
-        p1 = subprocess.Popen(["curl", "-fsSL", "--retry", "5", str(r1)], stdout=subprocess.PIPE,
+        r1_s, r2_s = str(r1), str(r2)
+        if not r1_s.startswith(("http://", "https://", "ftp://")) and Path(r1_s).is_file() and Path(r2_s).is_file():
+            self.procs = []
+
+            def _open_local(fp_str):
+                p_obj = Path(fp_str)
+                self._add_bytes(p_obj.stat().st_size)
+                raw_f = open(p_obj, "rb")
+                magic = raw_f.peek(2)[:2]
+                if magic == b"\x1f\x8b":
+                    return gzip.GzipFile(fileobj=raw_f)
+                return raw_f
+
+            self._gz = (_open_local(r1_s), _open_local(r2_s))
+            return True
+        p1 = subprocess.Popen(["curl", "-fsSL", "--retry", "5", r1_s], stdout=subprocess.PIPE,
                               stderr=self.log, bufsize=0)
-        p2 = subprocess.Popen(["curl", "-fsSL", "--retry", "5", str(r2)], stdout=subprocess.PIPE,
+        p2 = subprocess.Popen(["curl", "-fsSL", "--retry", "5", r2_s], stdout=subprocess.PIPE,
                               stderr=self.log, bufsize=0)
         self.procs = [p1, p2]
         self._gz = (gzip.GzipFile(fileobj=io.BufferedReader(_CountedPipe(p1.stdout, self._add_bytes), 65536)),
@@ -898,37 +913,52 @@ class SangerCram(Source):
 
 def make_source(row, xsra_threads=2, log=None, prefer=None, stage_dir=None, decode_sem=None, prefetch_dir=None):
     """ODP first (flowcell-order archives streamed with xsra -Q -P https so the stop gate can cut them short,
-    coordinate-ordered archives staged once and decoded locally); ENA FASTQ only without ODP; Sanger CRAM
+    coordinate-ordered archives staged once and decoded locally); ENA/local paired FASTQ without ODP; Sanger CRAM
     (nuclear prefix by its .crai) when the sample has no usable ENA run."""
+    import re
     runs = list(row.get("ena_runs") if row.get("ena_runs") is not None else [])
     if prefer in (None, "odp", "odp_stream", "odp_stage") and bool(row.get("all_odp")) and runs:
         flow = row.get("order_hint") == "flowcell"
+        is_sorted = row.get("order_hint") == "sorted"
         d = row.get("mean_depth_est")
         h = row.get("unmapped_byte_frac")
         pf_depth = (d or 0) * (1 - (h if h is not None and np.isfinite(h) else 0.1)) if d is not None and np.isfinite(d) else 0
         # xsra over HTTPS pulls ~2.3x the object, so streaming only pays when the gate can stop before ~40%
         worth = pf_depth > 2.5 * 32
-        if prefer == "odp_stream" or (prefer != "odp_stage" and flow and worth):
+        if (prefer == "odp_stream" and (not is_sorted or stage_dir is None)) or (prefer != "odp_stage" and flow and worth):
             return OdpXsra(runs, threads=xsra_threads, log=log)
         # per-process dir: two arms (or reruns) staging the same isolate never share a file
         return OdpStaged(runs, Path(stage_dir) / f"{row['Sample']}.{os.getpid()}", threads=xsra_threads, log=log,
                          decode_sem=decode_sem, prefetch_dir=prefetch_dir)
-    if prefer in (None, "ena") and bool(row.get("all_paired_fastq")) and row.get("fastq_urls") is not None:
+    if prefer in (None, "ena", "odp_stream") and bool(row.get("all_paired_fastq")) and row.get("fastq_urls") is not None:
         urls = [u for u in list(row["fastq_urls"]) if u]
         pairs = []
         for u in urls:
-            parts = [("https://" + x if not x.startswith("http") else x) for x in str(u).split(";")]
-            r1 = [x for x in parts if x.endswith("_1.fastq.gz")]
-            r2 = [x for x in parts if x.endswith("_2.fastq.gz")]
+            raw_parts = [x.strip() for x in str(u).split(";") if x.strip()]
+            norm_parts = []
+            for x in raw_parts:
+                if x.startswith(("http://", "https://", "ftp://")) or Path(x).exists():
+                    norm_parts.append(x)
+                else:
+                    norm_parts.append("https://" + x)
+            r1 = [x for x in norm_parts if re.search(r"_(?:R?1)(?:_001)?\.f(?:ast)?q(?:\.gz)?$", x, re.I)]
+            r2 = [x for x in norm_parts if re.search(r"_(?:R?2)(?:_001)?\.f(?:ast)?q(?:\.gz)?$", x, re.I)]
             if r1 and r2:
                 pairs.append((r1[0], r2[0]))
+            elif len(norm_parts) == 2:
+                pairs.append((norm_parts[0], norm_parts[1]))
         if pairs:
             return EnaFastq(pairs, log=log)
+    cram_url = row.get("cram_url")
+    if not cram_url:
+        raise ValueError(
+            f"Sample {row.get('Sample')!r}: no usable ODP run, paired FASTQ source, or CRAM URL configured"
+        )
     crai = CRAI_DIR / f"{row['Sample']}.cram.crai"
     cb = row.get("crai_bytes")
     if not crai.exists() or (cb is not None and np.isfinite(cb) and crai.stat().st_size != int(cb)):
         crai = None
-    return SangerCram(row["cram_url"], row["cram_bytes"], log=log, crai=crai)
+    return SangerCram(cram_url, row["cram_bytes"], log=log, crai=crai)
 
 
 class Sieve:
@@ -987,12 +1017,12 @@ def mapper_cmd(threads, paired, ref=None, mapper="strobealign"):
             cmd.append("--interleaved")
         return cmd + [ref, "-"]
     if mapper in ("bwa-mem2", "bwa"):
-        cmd = [mapper, "mem", "-t", t]
+        cmd = [mapper, "mem", "-K", "1000000", "-t", t]
         if paired:
             cmd.append("-p")
         return cmd + [ref, "-"]
     if mapper == "minimap2":
-        return ["minimap2", "-t", t, "-K", "20M", "-ax", "sr", ref, "-"]
+        return ["minimap2", "-t", t, "-K", "1M", "-ax", "sr", ref, "-"]
     raise ValueError(f"unknown mapper: {mapper}")
 
 

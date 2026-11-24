@@ -161,12 +161,14 @@ def parse_crai(path):
     return np.loadtxt(io.StringIO(txt), dtype=np.int64, ndmin=2)
 
 
-def plan_ranges(crai, regs, read_pad=0):
+def plan_ranges(crai, regs, read_pad=0, cram_size=None):
     """(header end, [(a, b)] coalesced byte ranges of whole containers, n containers, covered spans).
     A container is needed when one of its slices overlaps a window: a slice's alignment span already runs to
     the end of its last read, so a read that starts before the window and reaches into it is caught by its own
     slice. Spans are the (contig, start, end) alignment extents of every slice in the chosen containers."""
     a = crai if isinstance(crai, np.ndarray) else parse_crai(crai)
+    if len(a) == 0:
+        raise ValueError("Empty CRAI index")
     offs = np.unique(a[:, 3])
     hdr_end = int(offs[0])
     nxt = {int(o): int(n) for o, n in zip(offs[:-1], offs[1:])}
@@ -176,10 +178,18 @@ def plan_ranges(crai, regs, read_pad=0):
         need |= (seq == ci) & (st <= e) & (st + sp - 1 >= s - read_pad)
     cont = sorted(set(a[need, 3].tolist()))
     ranges = []
+    eof_len = len(ST.CRAM_EOF)
     for o in cont:
         end = nxt.get(int(o))
         if end is None:
-            continue
+            if cram_size is None or not np.isfinite(cram_size) or int(cram_size) <= int(o):
+                raise ValueError(
+                    f"cram_size is required when target regions overlap the final CRAM container at offset {int(o)}"
+                )
+            cs = int(cram_size)
+            end = cs - eof_len if cs > int(o) + eof_len else cs
+            if end <= int(o):
+                raise ValueError(f"Invalid final CRAM container bounds [{int(o)}, {end}) for cram_size={cs}")
         if ranges and ranges[-1][1] == o:
             ranges[-1][1] = end
         else:
@@ -239,8 +249,9 @@ def site_subset(g, panel, regs):
 _REGS = None
 
 
-def _plan_one(s):
-    h, rr, nc, _ = plan_ranges(CRAI_DIR / f"{s}.cram.crai", _REGS)
+def _plan_one(item):
+    s, cbytes = item
+    h, rr, nc, _ = plan_ranges(CRAI_DIR / f"{s}.cram.crai", _REGS, cram_size=cbytes)
     return s, h, sum(b - a_ for a_, b in rr), len(rr), nc
 
 
@@ -251,7 +262,7 @@ def cmd_plan(a):
     regs = _REGS = regions(g)
     m = pd.read_parquet(MANIFEST, columns=["Sample", "cram_bytes"])
     with mp.get_context("fork").Pool(a.workers) as pool:
-        rows = pool.map(_plan_one, m.Sample.tolist(), chunksize=64)
+        rows = pool.map(_plan_one, list(zip(m.Sample.tolist(), m.cram_bytes.tolist())), chunksize=64)
     df = pd.DataFrame(rows, columns=["Sample", "header_bytes", "range_bytes", "n_ranges", "n_containers"])
     df = df.merge(m, on="Sample")
     df.to_parquet(a.out, index=False)
@@ -375,7 +386,7 @@ def focused_cnv(g, acc, p, sample_type, vb, excl):
     gene bin below 0.3 and a 300 bp exon window below 0.05), with ratios relative to the fetched baseline bins."""
     depth = C.bin_depth(g, acc)
     base = vb & (g.bin_core >= 0.9) & (depth > 0) & ~excl
-    gdna = str(sample_type) == "gDNA"
+    gdna = C._normalize_sample_type(sample_type) == "gdna"
     rows = []
     if base.sum() < 50:
         ratio, med = np.full(len(depth), np.nan), np.nan
@@ -440,6 +451,10 @@ def process_one(job):
         t_dec = time.time()
         buf, n_rec, n_spots = regroup(pr.stdout)
         del pr
+        if int(info.get("n_containers", 0)) > 0 and n_rec == 0:
+            raise RuntimeError(
+                f"Focused CRAM decode yielded 0 SAM records across {info['n_containers']} planned containers"
+            )
         acc = C.Accumulator(g, cp, zoom_mask=_WS["zm"])
         i = 0
         while i < len(buf):
@@ -607,7 +622,9 @@ def cmd_run(a):
         for r in rows.itertuples():
             row = dict(Sample=r.Sample, cram_bytes=r.cram_bytes, Sample_type=r.Sample_type)
             try:
-                hdr, rr, nc, spans = plan_ranges(CRAI_DIR / f"{r.Sample}.cram.crai", regs)
+                hdr, rr, nc, spans = plan_ranges(
+                    CRAI_DIR / f"{r.Sample}.cram.crai", regs, cram_size=r.cram_bytes
+                )
             except Exception as e:
                 results.put(dict(sample=r.Sample, stop_reason="crash", error=f"plan: {type(e).__name__}: {e}"))
                 continue

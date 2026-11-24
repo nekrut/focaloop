@@ -114,11 +114,8 @@ def classify_artemisinin(k13_val, who_set: set[str] = WHO_K13_ASSOC, k13_has_mis
     # Step 2: Heterozygous WHO delayed-clearance mutation -> Undetermined
     if het_muts & who_set:
         return "Undetermined"
-    # Step 3: 578S as homozygous (with no other unexplained NS mutant or missingness? Check exact rule)
+    # Step 3: 578S as homozygous with no other NS mutant and zero missing propeller codons -> Sensitive
     if "A578S" in hom_muts and len(hom_muts) == 1 and not het_muts and not has_special_miss:
-        return "Sensitive"
-    if "A578S" in hom_muts and not (hom_muts - {"A578S"}) and not het_muts:
-        # Note: in Pf8 Step 3 precedes Step 4 ("Any missing call in amino acids 349-726")
         return "Sensitive"
     # Step 4: Any missing call in amino acids 349-726 -> Undetermined
     if has_special_miss:
@@ -215,7 +212,12 @@ def classify_sample(row_dict: dict, who_set: set[str] = WHO_K13_ASSOC, wt_hom_on
     sdx = _single_codon_drug(row_dict.get("dhps_437"), "A", "G")
     mq = _cnv_drug(row_dict.get("mdr1_amp"))
     ppq = _cnv_drug(row_dict.get("pm2_pm3_amp"))
-    art = classify_artemisinin(row_dict.get("k13_ns"), who_set=who_set)
+    k13_miss_cnt = row_dict.get("k13_missing_codons", row_dict.get("aa_k13_missing_codons", 0))
+    try:
+        has_k13_miss = bool(row_dict.get("k13_has_missing")) or int(float(k13_miss_cnt or 0)) > 0
+    except (TypeError, ValueError):
+        has_k13_miss = bool(row_dict.get("k13_has_missing"))
+    art = classify_artemisinin(row_dict.get("k13_ns"), k13_has_missing=has_k13_miss, who_set=who_set)
     sp_u = classify_sp_uncomplicated(
         row_dict.get("dhfr_51"), row_dict.get("dhfr_59"), row_dict.get("dhfr_108"), wt_hom_only=wt_hom_only
     )

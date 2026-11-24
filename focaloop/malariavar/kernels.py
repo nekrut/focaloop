@@ -145,13 +145,24 @@ def _line_end(buf, i, n):
 
 @njit(cache=True)
 def _stem_len(buf, s, e):
-    """length of the read-name stem (strip trailing .0/.1 or /1 /2 segment marker)."""
-    j = e - 1
-    while j > s and buf[j] != 46 and buf[j] != 47 and buf[j] != 32:
+    """length of the read-name stem: truncate at first space/tab, then strip trailing .0/.1/.2 or /1 /2 marker."""
+    w = s
+    while w < e and buf[w] != 32 and buf[w] != 9:
+        w += 1
+    if w - s >= 2 and (buf[w - 2] == 46 or buf[w - 2] == 47) and (buf[w - 1] == 48 or buf[w - 1] == 49 or buf[w - 1] == 50):
+        return (w - 2) - s
+    j = w - 1
+    while j > s and buf[j] != 46 and buf[j] != 47:
         j -= 1
-    if j > s and (buf[j] == 46 or buf[j] == 47):
-        return j - s
-    return e - s
+    if j > s and buf[j] == 47 and j + 1 < w:
+        all_dig = True
+        for k in range(j + 1, w):
+            if buf[k] < 48 or buf[k] > 57:
+                all_dig = False
+                break
+        if all_dig:
+            return j - s
+    return w - s
 
 
 @njit(cache=True)
@@ -594,7 +605,31 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
                     trail_clip = num
                 q_cur += num
             num = 0
-        # 1 kb bins (MAPQ >= binmapq)
+        paired = (flag & 1) != 0
+        same_spot = prev[0] == spot
+        same_chr = f_e[6] - f_s[6] == 1 and buf[f_s[6]] == 61
+        pn = _atoi(buf, f_s[7], f_e[7]) if same_chr else 0
+        tlen = _atoi(buf, f_s[8], f_e[8])
+        # full 64-bit collision-free streaming coordinate + template-span PCR/optical duplicate filter
+        if len(dedup_tab) > 0 and paired and same_chr and tlen != 0 and mapq >= minmapq and (flag & 2) != 0:
+            left_p = np.uint64((pos if tlen > 0 else pn) & 0xFFFFFFFF)
+            span_u = np.uint64(abs(tlen) & 0xFFFFFFFF)
+            side_u = np.uint64(0x9E3779B97F4A7C15) if tlen > 0 else np.uint64(0xBF58476D1CE4E5B9)
+            dk = (mix64(mix64(np.uint64(c & 0xFFFFFFFF) ^ side_u) ^ mix64((left_p << np.uint64(32)) | span_u))
+                  | np.uint64(1))
+            ds = mix64(dk) & dmask
+            if dedup_tab[ds] == dk:
+                if len(stats) > 10:
+                    stats[10] += 1
+                if same_spot:
+                    prev[0] = -1
+                    prev[1] = -1
+                    prev[2] = 0
+                    prev[3] = 0
+                i = e + 1
+                continue
+            dedup_tab[ds] = dk
+        # 1 kb bins (MAPQ >= binmapq, accumulated after PCR duplicate removal when enabled)
         if mapq >= binmapq and rspan > 0:
             ce = coff[c + 1]
             a = g0
@@ -606,11 +641,6 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
                 binbases[bi] += nxt - a
                 pa += nxt - a
                 a = nxt
-        paired = (flag & 1) != 0
-        same_spot = prev[0] == spot
-        same_chr = f_e[6] - f_s[6] == 1 and buf[f_s[6]] == 61
-        pn = _atoi(buf, f_s[7], f_e[7]) if same_chr else 0
-        tlen = _atoi(buf, f_s[8], f_e[8])
         # face-away pair at a tandem-duplication junction: leftmost mate reverse, its mate forward
         if paired and mapq >= minmapq and (flag & 0x8) == 0 and (flag & 0x10) != 0 and (flag & 0x20) == 0 and same_chr:
             if pn > pos + 300 and pn < pos + 300000 and rf_n[0] < rf.shape[0]:
@@ -619,32 +649,13 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
                 rf[rf_n[0], 2] = pn
                 rf_n[0] += 1
         if mapq < minmapq or (paired and (flag & 2) == 0):
-            prev[0] = spot
-            prev[1] = c
-            prev[2] = g0
-            prev[3] = g0 + rspan
+            if same_spot:
+                prev[0] = -1
+                prev[1] = -1
+                prev[2] = 0
+                prev[3] = 0
             i = e + 1
             continue
-        # streaming coordinate + template-span PCR/optical duplicate filter (62-bit exact key, up to 4096 contigs & 4.29 Gb/contig)
-        if len(dedup_tab) > 0 and paired and same_chr and tlen != 0:
-            left_p = pos if tlen > 0 else pn
-            span_u = min(abs(tlen), 0x1FFFF)
-            side_u = 0 if tlen > 0 else 1
-            dk = ((np.uint64(c & 0xFFF) << np.uint64(50)) |
-                  (np.uint64(left_p & 0xFFFFFFFF) << np.uint64(18)) |
-                  (np.uint64(span_u) << np.uint64(1)) |
-                  np.uint64(side_u)) + np.uint64(1)
-            ds = mix64(dk) & dmask
-            if dedup_tab[ds] == dk:
-                if len(stats) > 10:
-                    stats[10] += 1
-                prev[0] = spot
-                prev[1] = c
-                prev[2] = g0
-                prev[3] = g0 + rspan
-                i = e + 1
-                continue
-            dedup_tab[ds] = dk
         ccount[c] += 1
         # mismatch filter from NM
         nm = -1
@@ -661,10 +672,11 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
             j += 1
         if nm >= 0 and rspan > 0 and (nm - indel) > max_mm_frac * rspan:
             stats[5] += 1
-            prev[0] = spot
-            prev[1] = c
-            prev[2] = g0
-            prev[3] = g0 + rspan
+            if same_spot:
+                prev[0] = -1
+                prev[1] = -1
+                prev[2] = 0
+                prev[3] = 0
             i = e + 1
             continue
         # mate overlap window to skip (second mate of a pair overlapping the first)
@@ -689,8 +701,13 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
                 zn[1] += ln
                 zn[0] += 1
                 stats[8] += 1
-        # BAQ-style mask over query positions
+        # BAQ-style mask over query positions + QUAL == '*' handling (#24)
         qlen = f_e[9] - f_s[9]
+        quallen = f_e[10] - f_s[10]
+        qual_star = (quallen == 1 and buf[f_s[10]] == 42)
+        if qlen <= 0 or (qlen == 1 and buf[f_s[9]] == 42) or (not qual_star and quallen != qlen):
+            i = e + 1
+            continue
         masked = use_mask and qlen <= 4096
         if masked:
             stats[9] += _base_mask(buf, f_s[5], f_e[5], f_s[9], qlen, g0, ref, flt, bmask, mmbuf)
@@ -717,19 +734,22 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
                     if masked and bmask[qp + t - f_s[9]]:
                         continue
                     b = ENC_T[buf[qp + t]]
-                    if b < 4 and buf[qq + t] - 33 >= minbq:
+                    bq_val = 30 if qual_star else (buf[qq + t] - 33)
+                    if b < 4 and bq_val >= minbq:
                         if counts[gg, b] < 65535:
                             counts[gg, b] += 1
                         counted += 1
                 qp += num
-                qq += num
+                if not qual_star:
+                    qq += num
                 g += num
             elif ch == 73:  # I
                 qi = qp - f_s[9]
                 bq_ok = qi >= ind_lo and (qi + num) <= ind_hi
                 if bq_ok:
                     for t in range(num):
-                        if ENC_T[buf[qp + t]] > 3 or buf[qq + t] - 33 < minbq:
+                        bq_val = 30 if qual_star else (buf[qq + t] - 33)
+                        if ENC_T[buf[qp + t]] > 3 or bq_val < minbq:
                             bq_ok = False
                             break
                 if bq_ok and not (g - 1 >= ov_a and g - 1 < ov_b) and g > coff[c]:
@@ -763,11 +783,12 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
                     else:
                         stats[6] += 1
                 qp += num
-                qq += num
+                if not qual_star:
+                    qq += num
             elif ch == 68:  # D
                 qi = qp - f_s[9]
                 bq_ok = qi >= ind_lo and qi <= ind_hi
-                if bq_ok:
+                if bq_ok and not qual_star:
                     if qi > 0 and buf[qq - 1] - 33 < minbq:
                         bq_ok = False
                     if qi < qlen and buf[qq] - 33 < minbq:
@@ -801,7 +822,21 @@ def sam_block(buf, n, names, name_off, coff, boff, ref, counts, delc, insc, binb
 @njit(cache=True)
 def runs_ge(depth, thr, offsets):
     """intervals [start, end) of depth >= thr that never cross contig boundaries."""
-    out = np.empty((max(16, len(depth) // 50), 2), np.int64)
+    n_runs = 0
+    for c in range(len(offsets) - 1):
+        a = offsets[c]
+        b = offsets[c + 1]
+        inrun = False
+        for g in range(a, b):
+            if depth[g] >= thr:
+                if not inrun:
+                    inrun = True
+                    n_runs += 1
+            elif inrun:
+                inrun = False
+    out = np.empty((n_runs, 2), np.int64)
+    if n_runs == 0:
+        return out
     k = 0
     for c in range(len(offsets) - 1):
         a = offsets[c]
@@ -815,11 +850,10 @@ def runs_ge(depth, thr, offsets):
                     s = g
             elif inrun:
                 inrun = False
-                if k < out.shape[0]:
-                    out[k, 0] = s
-                    out[k, 1] = g
-                    k += 1
-        if inrun and k < out.shape[0]:
+                out[k, 0] = s
+                out[k, 1] = g
+                k += 1
+        if inrun:
             out[k, 0] = s
             out[k, 1] = b
             k += 1

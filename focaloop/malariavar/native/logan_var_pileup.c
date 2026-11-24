@@ -8,10 +8,10 @@
 
 /*
  * Organism-agnostic, interval-backed ka-weighted SAM pileup + indel extractor
- * for Focaloop VariationLoop 0.4.0 Logan unitigs.
+ * for Focaloop VariationLoop 0.4.1 Logan unitigs.
  *
  * Usage:
- *   logan_var_pileup <ref.fa> <targets.bed|-> <out_cand.tsv> [min_mapq=20] [max_mm_frac=0.12] [midpoint_only=1]
+ *   logan_var_pileup <ref.fa> <targets.bed|-> <out_cand.tsv> [min_mapq=20] [max_mm_frac=0.12] [midpoint_only=1] [out_cov.tsv]
  */
 
 static const uint8_t ENC[256] = {
@@ -44,11 +44,13 @@ typedef struct {
 typedef struct {
     int32_t cid;
     int64_t pos0;
+    int64_t r_end0;
     uint8_t kind; /* 1=DEL, 2=INS */
     int32_t alen;
     char *seq;    /* insertion seq (kind==2) or NULL (kind==1) */
     double weight;
     uint64_t hash;
+    uint64_t last_uid_hash;
     int used;
 } IndelEntry;
 
@@ -66,6 +68,21 @@ static uint64_t fnv1a_bytes(const void *data, size_t n) {
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+static uint64_t unitig_parent_hash(const char *qname) {
+    /* Collapse tiled headers `<uid>c<tile>_<ka>` to `<uid>` so overlapping 30-bp tiles never double-count an indel */
+    const char *us = strrchr(qname, '_');
+    size_t end = us ? (size_t)(us - qname) : strlen(qname);
+    if (end > 2) {
+        size_t j = end;
+        while (j > 0 && isdigit((unsigned char)qname[j - 1])) j--;
+        if (j < end && j > 1 && qname[j - 1] == 'c' && isdigit((unsigned char)qname[j - 2])) {
+            end = j - 1;
+        }
+    }
+    uint64_t h = fnv1a_bytes(qname, end);
+    return h ? h : 1ULL;
 }
 
 static uint64_t hash_indel(int32_t cid, int64_t pos0, uint8_t kind, int32_t alen, const char *seq) {
@@ -101,16 +118,23 @@ static void im_grow(IndelMap *m) {
     *m = nm;
 }
 
-static void im_add(IndelMap *m, int32_t cid, int64_t pos0, uint8_t kind, int32_t alen, const char *seq, double w) {
+static int im_add(IndelMap *m, int32_t cid, int64_t pos0, int64_t r_end0, uint8_t kind, int32_t alen,
+                  const char *seq, double w, uint64_t uid_hash) {
     if (m->len * 2 >= m->cap) im_grow(m);
+    if (r_end0 < pos0) r_end0 = pos0;
     uint64_t h = hash_indel(cid, pos0, kind, alen, seq);
     size_t idx = (size_t)(h & (m->cap - 1));
     while (m->t[idx].used) {
         IndelEntry *e = &m->t[idx];
         if (e->hash == h && e->cid == cid && e->pos0 == pos0 && e->kind == kind && e->alen == alen) {
             if (kind == 1 || (e->seq && seq && memcmp(e->seq, seq, (size_t)alen) == 0)) {
+                if (r_end0 > e->r_end0) e->r_end0 = r_end0;
+                if (uid_hash != 0ULL && e->last_uid_hash == uid_hash) {
+                    return 0;
+                }
                 e->weight += w;
-                return;
+                e->last_uid_hash = uid_hash;
+                return 1;
             }
         }
         idx = (idx + 1) & (m->cap - 1);
@@ -118,6 +142,7 @@ static void im_add(IndelMap *m, int32_t cid, int64_t pos0, uint8_t kind, int32_t
     IndelEntry *e = &m->t[idx];
     e->cid = cid;
     e->pos0 = pos0;
+    e->r_end0 = r_end0;
     e->kind = kind;
     e->alen = alen;
     if (kind == 2 && seq && alen > 0) {
@@ -129,8 +154,10 @@ static void im_add(IndelMap *m, int32_t cid, int64_t pos0, uint8_t kind, int32_t
     }
     e->weight = w;
     e->hash = h;
+    e->last_uid_hash = uid_hash;
     e->used = 1;
     m->len++;
+    return 1;
 }
 
 typedef struct { char *key; int32_t val; } CtgEntry;
@@ -139,6 +166,11 @@ typedef struct { CtgEntry *t; size_t cap, len; } CtgMap;
 static void cm_init(CtgMap *m, size_t cap) {
     m->cap = cap; m->len = 0;
     m->t = calloc(cap, sizeof(CtgEntry));
+}
+static void cm_free(CtgMap *m) {
+    for (size_t i = 0; i < m->cap; i++) free(m->t[i].key);
+    free(m->t);
+    m->t = NULL; m->cap = 0; m->len = 0;
 }
 static void cm_grow(CtgMap *m) {
     CtgMap nm; cm_init(&nm, m->cap * 2);
@@ -207,7 +239,7 @@ static double parse_ka_from_qname(const char *qname) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: logan_var_pileup <ref.fa> <targets.bed|-> <out_cand.tsv> [min_mapq=20] [max_mm_frac=0.12] [midpoint_only=1]\n");
+        fprintf(stderr, "usage: logan_var_pileup <ref.fa> <targets.bed|-> <out_cand.tsv> [min_mapq=20] [max_mm_frac=0.12] [midpoint_only=1] [out_cov.tsv]\n");
         return 1;
     }
     const char *ref_path = argv[1];
@@ -216,8 +248,30 @@ int main(int argc, char **argv) {
     int min_mapq = (argc > 4) ? atoi(argv[4]) : 20;
     double max_mm_frac = (argc > 5) ? atof(argv[5]) : 0.12;
     int midpoint_only = (argc > 6) ? atoi(argv[6]) : 1;
+    const char *cov_path = (argc > 7 && argv[7][0] && strcmp(argv[7], "-") != 0) ? argv[7] : NULL;
 
-    /* 1. Load reference FASTA contigs */
+    static char line[1 << 20];
+
+    /* 0. Pre-scan BED contigs (L80) so non-target chromosomes are never allocated into RAM */
+    CtgMap want_cmap;
+    int filter_by_bed = 0;
+    if (bed_path) {
+        cm_init(&want_cmap, 256);
+        filter_by_bed = 1;
+        FILE *bf0 = fopen(bed_path, "r");
+        if (!bf0) { perror("fopen bed"); return 1; }
+        while (fgets(line, sizeof(line), bf0)) {
+            if (line[0] == '#' || line[0] == '\n' || strncmp(line, "track", 5) == 0 || strncmp(line, "browser", 7) == 0)
+                continue;
+            char cname[512];
+            long long s0 = 0, e0 = 0;
+            if (sscanf(line, "%511s %lld %lld", cname, &s0, &e0) < 3) continue;
+            if (e0 > s0) cm_put(&want_cmap, cname, 1);
+        }
+        fclose(bf0);
+    }
+
+    /* 1. Load reference FASTA contigs (allocating sequence only for wanted contigs) */
     FILE *rf = fopen(ref_path, "r");
     if (!rf) { perror("fopen ref"); return 1; }
     size_t c_cap = 64, n_ctgs = 0;
@@ -225,9 +279,9 @@ int main(int argc, char **argv) {
     CtgMap cmap;
     cm_init(&cmap, 1024);
 
-    static char line[1 << 20];
     size_t seq_cap = 0, seq_len = 0;
     int32_t cur_cid = -1;
+    int cur_keep_seq = 0;
     while (fgets(line, sizeof(line), rf)) {
         if (line[0] == '>') {
             if (cur_cid >= 0) ctgs[cur_cid].len = (int64_t)seq_len;
@@ -242,10 +296,16 @@ int main(int argc, char **argv) {
             }
             cur_cid = (int32_t)n_ctgs++;
             ctgs[cur_cid].name = strdup(p);
-            seq_cap = 65536;
+            cur_keep_seq = (!filter_by_bed) || (cm_get(&want_cmap, p) >= 0);
             seq_len = 0;
-            ctgs[cur_cid].seq = malloc(seq_cap);
-            ctgs[cur_cid].seq[0] = '\0';
+            if (cur_keep_seq) {
+                seq_cap = 65536;
+                ctgs[cur_cid].seq = malloc(seq_cap);
+                ctgs[cur_cid].seq[0] = '\0';
+            } else {
+                seq_cap = 0;
+                ctgs[cur_cid].seq = NULL;
+            }
             ctgs[cur_cid].len = 0;
             ctgs[cur_cid].reg_start = 0;
             ctgs[cur_cid].reg_count = 0;
@@ -253,18 +313,23 @@ int main(int argc, char **argv) {
         } else if (cur_cid >= 0) {
             size_t l = strlen(line);
             while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) l--;
-            if (seq_len + l + 1 > seq_cap) {
-                while (seq_len + l + 1 > seq_cap) seq_cap *= 2;
-                ctgs[cur_cid].seq = realloc(ctgs[cur_cid].seq, seq_cap);
+            if (cur_keep_seq) {
+                if (seq_len + l + 1 > seq_cap) {
+                    while (seq_len + l + 1 > seq_cap) seq_cap *= 2;
+                    ctgs[cur_cid].seq = realloc(ctgs[cur_cid].seq, seq_cap);
+                }
+                for (size_t i = 0; i < l; i++) {
+                    ctgs[cur_cid].seq[seq_len++] = (char)toupper((unsigned char)line[i]);
+                }
+                ctgs[cur_cid].seq[seq_len] = '\0';
+            } else {
+                seq_len += l;
             }
-            for (size_t i = 0; i < l; i++) {
-                ctgs[cur_cid].seq[seq_len++] = (char)toupper((unsigned char)line[i]);
-            }
-            ctgs[cur_cid].seq[seq_len] = '\0';
         }
     }
     if (cur_cid >= 0) ctgs[cur_cid].len = (int64_t)seq_len;
     fclose(rf);
+    if (filter_by_bed) cm_free(&want_cmap);
 
     /* 2. Build merged pileup regions (from BED +-500 bp, or all contigs) */
     size_t r_cap = n_ctgs + 64, n_raw = 0;
@@ -279,7 +344,7 @@ int main(int argc, char **argv) {
             long long s0 = 0, e0 = 0;
             if (sscanf(line, "%511s %lld %lld", cname, &s0, &e0) < 3) continue;
             int32_t cid = cm_get(&cmap, cname);
-            if (cid < 0) continue;
+            if (cid < 0 || !ctgs[cid].seq) continue;
             int64_t ps = (s0 > 500) ? (s0 - 500) : 0;
             int64_t pe = (e0 + 500 < ctgs[cid].len) ? (e0 + 500) : ctgs[cid].len;
             if (pe <= ps) continue;
@@ -289,13 +354,14 @@ int main(int argc, char **argv) {
         fclose(bf);
     } else {
         for (size_t c = 0; c < n_ctgs; c++) {
-            if (ctgs[c].len <= 0) continue;
+            if (ctgs[c].len <= 0 || !ctgs[c].seq) continue;
             if (n_raw >= r_cap) { r_cap *= 2; raw_regs = realloc(raw_regs, r_cap * sizeof(Region)); }
             raw_regs[n_raw++] = (Region){(int32_t)c, 0, ctgs[c].len, 0};
         }
     }
     if (n_raw == 0) {
         fprintf(stderr, "No callable reference regions matched.\n");
+        free(raw_regs);
         return 1;
     }
     qsort(raw_regs, n_raw, sizeof(Region), cmp_region);
@@ -338,6 +404,7 @@ int main(int argc, char **argv) {
     /* 3. Stream SAM from stdin */
     setvbuf(stdin, NULL, _IOFBF, 4 << 20);
     long long sam_records = 0, primary_mapped = 0, counted_unitigs = 0, counted_bases = 0, mm_filtered = 0;
+    char ins_buf[256];
     while (fgets(line, sizeof(line), stdin)) {
         if (line[0] == '@') continue;
         char *f[12];
@@ -355,7 +422,7 @@ int main(int argc, char **argv) {
         int flag = atoi(f[1]);
         if (flag & 0xF04) continue; /* unmapped, secondary, qcfail, dup, supplementary */
         int32_t cid = cm_get(&cmap, f[2]);
-        if (cid < 0 || ctgs[cid].reg_count == 0) continue;
+        if (cid < 0 || ctgs[cid].reg_count == 0 || !ctgs[cid].seq) continue;
         int64_t pos0 = atoll(f[3]) - 1;
         int mapq = atoi(f[4]);
         primary_mapped++;
@@ -392,6 +459,7 @@ int main(int argc, char **argv) {
         int q_hi = (midpoint_only && qlen > 30) ? (qlen - 15) : qlen;
         double w = parse_ka_from_qname(f[0]);
         float wf = (float)w;
+        uint64_t uid_hash = unitig_parent_hash(f[0]);
 
         /* Walk CIGAR */
         int qp = 0;
@@ -421,30 +489,73 @@ int main(int argc, char **argv) {
                 qp += num;
                 rpos += num;
             } else if (op == 'I') {
-                int ok_pos = (!midpoint_only) || (qlen <= 30) || (qp >= q_lo && qp < q_hi);
-                if (ok_pos && rpos > 0 && num > 0 && num <= 200) {
-                    int64_t idx = map_pos_to_pile(ctg, regs, rpos - 1);
-                    if (idx >= 0) {
-                        int ok_b = 1;
-                        for (int t = 0; t < num; t++) {
-                            if (ENC[(uint8_t)qseq[qp + t]] > 3) { ok_b = 0; break; }
-                        }
-                        if (ok_b) {
-                            im_add(&imap, cid, rpos - 1, 2, num, qseq + qp, w);
+                if (rpos > 0 && num > 0 && num <= 200 && qp + num <= qlen) {
+                    /* Compute full repeat-equivalent placement interval [qp_left, qp_right] (#70) */
+                    int qp_left = qp;
+                    int64_t r_left = rpos;
+                    while (qp_left > 0 && r_left > 1 &&
+                           (char)toupper((unsigned char)qseq[qp_left + num - 1]) == ctg->seq[r_left - 1] &&
+                           (char)toupper((unsigned char)qseq[qp_left - 1]) == ctg->seq[r_left - 1]) {
+                        /* Cyclic left-shift of inserted sequence matches left-flanking ref base */
+                        qp_left--;
+                        r_left--;
+                    }
+                    int qp_right = qp;
+                    int64_t r_right = rpos;
+                    while (qp_right + num < qlen && r_right < ctg->len &&
+                           (char)toupper((unsigned char)qseq[qp_right]) == ctg->seq[r_right] &&
+                           (char)toupper((unsigned char)qseq[qp_right + num]) == ctg->seq[r_right]) {
+                        qp_right++;
+                        r_right++;
+                    }
+                    int ok_pos = (!midpoint_only) || (qlen <= 30) || (qp_right >= q_lo && qp_left < q_hi);
+                    if (ok_pos && r_left > 0) {
+                        int64_t idx = map_pos_to_pile(ctg, regs, r_left - 1);
+                        if (idx >= 0) {
+                            int ok_b = 1;
+                            for (int t = 0; t < num; t++) {
+                                uint8_t enc_b = ENC[(uint8_t)qseq[qp_left + t]];
+                                if (enc_b > 3) { ok_b = 0; break; }
+                                ins_buf[t] = DEC[enc_b];
+                            }
+                            ins_buf[num] = '\0';
+                            if (ok_b) {
+                                im_add(&imap, cid, r_left - 1, r_right, 2, num, ins_buf, w, uid_hash);
+                            }
                         }
                     }
                 }
                 qp += num;
             } else if (op == 'D') {
-                int ok_pos = (!midpoint_only) || (qlen <= 30) || (qp >= q_lo && qp < q_hi);
-                if (ok_pos && rpos > 0 && num > 0 && num <= 200) {
-                    int64_t anchor_idx = map_pos_to_pile(ctg, regs, rpos - 1);
-                    for (int t = 0; t < num; t++) {
-                        int64_t didx = map_pos_to_pile(ctg, regs, rpos + t);
-                        if (didx >= 0) delc[didx] += wf;
+                if (rpos > 0 && num > 0 && num <= 200 && rpos + num <= ctg->len) {
+                    /* Compute full repeat-equivalent placement interval [qp_left, qp_right] (#70) */
+                    int qp_left = qp;
+                    int64_t r_left = rpos;
+                    while (qp_left > 0 && r_left > 1 &&
+                           ctg->seq[r_left - 1] == ctg->seq[r_left + num - 1] &&
+                           (char)toupper((unsigned char)qseq[qp_left - 1]) == ctg->seq[r_left - 1]) {
+                        qp_left--;
+                        r_left--;
                     }
-                    if (anchor_idx >= 0) {
-                        im_add(&imap, cid, rpos, 1, num, NULL, w);
+                    int qp_right = qp;
+                    int64_t r_right = rpos;
+                    while (qp_right < qlen && r_right + num < ctg->len &&
+                           ctg->seq[r_right] == ctg->seq[r_right + num] &&
+                           (char)toupper((unsigned char)qseq[qp_right]) == ctg->seq[r_right]) {
+                        qp_right++;
+                        r_right++;
+                    }
+                    int ok_pos = (!midpoint_only) || (qlen <= 30) || (qp_right >= q_lo && qp_left < q_hi);
+                    if (ok_pos && r_left > 0) {
+                        int64_t anchor_idx = map_pos_to_pile(ctg, regs, r_left - 1);
+                        if (anchor_idx >= 0) {
+                            if (im_add(&imap, cid, r_left, r_right, 1, num, NULL, w, uid_hash)) {
+                                for (int t = 0; t < num; t++) {
+                                    int64_t didx = map_pos_to_pile(ctg, regs, r_left + t);
+                                    if (didx >= 0) delc[didx] += wf;
+                                }
+                            }
+                        }
                     }
                 }
                 rpos += num;
@@ -461,10 +572,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* 4. Emit candidate SNVs and indels + compute sampled median callable depth */
+    /* 4. Emit candidate SNVs and indels + optional covered-intervals TSV (#62) + sampled median depth */
     FILE *of = fopen(out_path, "w");
     if (!of) { perror("fopen out"); return 1; }
     fprintf(of, "chrom\tpos\tref\talt\tkind\tdp\tad_ref\tad_alt\twsaf\n");
+
+    FILE *cf = cov_path ? fopen(cov_path, "w") : NULL;
 
     size_t sample_cap = 200000, sample_n = 0;
     float *depth_samp = malloc(sample_cap * sizeof(float));
@@ -474,11 +587,21 @@ int main(int argc, char **argv) {
     for (size_t ri = 0; ri < n_regs; ri++) {
         const Region *rg = &regs[ri];
         const Contig *ctg = &ctgs[rg->cid];
+        int in_cov = 0;
+        int64_t cov_s0 = 0;
         for (int64_t p0 = rg->start0; p0 < rg->end0; p0++) {
             int64_t idx = rg->pile_off + (p0 - rg->start0);
             const float *c = &counts[(size_t)idx * 4ULL];
             float tot = c[0] + c[1] + c[2] + c[3];
             float dp = tot + delc[idx];
+            if (cf) {
+                if (dp >= 1.0f) {
+                    if (!in_cov) { cov_s0 = p0; in_cov = 1; }
+                } else if (in_cov) {
+                    fprintf(cf, "%s\t%lld\t%lld\n", ctg->name, (long long)cov_s0, (long long)p0);
+                    in_cov = 0;
+                }
+            }
             if ((idx % stride) == 0 && dp > 0.0f && sample_n < sample_cap) {
                 depth_samp[sample_n++] = dp;
             }
@@ -487,7 +610,6 @@ int main(int argc, char **argv) {
             if (rb > 3) continue;
             float rc = c[rb];
             if (tot - rc < 1.5f) continue;
-            /* Emit top 1 or 2 alternate bases passing candidate floor */
             for (int b = 0; b < 4; b++) {
                 if (b == (int)rb) continue;
                 float ac = c[b];
@@ -498,19 +620,31 @@ int main(int argc, char **argv) {
                         ctg->name, (long long)(p0 + 1), DEC[rb], DEC[b], dp, rc, ac, wsaf);
             }
         }
+        if (cf && in_cov) {
+            fprintf(cf, "%s\t%lld\t%lld\n", ctg->name, (long long)cov_s0, (long long)rg->end0);
+        }
     }
+    if (cf) fclose(cf);
 
     for (size_t i = 0; i < imap.cap; i++) {
         const IndelEntry *e = &imap.t[i];
         if (!e->used || e->weight < 1.5) continue;
         const Contig *ctg = &ctgs[e->cid];
+        int64_t span_hi = e->r_end0;
+        if (span_hi > e->pos0 + 256) span_hi = e->pos0 + 256;
+        if (span_hi >= ctg->len) span_hi = ctg->len - 1;
         if (e->kind == 1) {
-            /* Deletion starting at e->pos0 (anchor at e->pos0 - 1) */
             if (e->pos0 <= 0 || e->pos0 + e->alen > ctg->len) continue;
-            int64_t idx = map_pos_to_pile(ctg, regs, e->pos0);
-            if (idx < 0) continue;
-            const float *c = &counts[(size_t)idx * 4ULL];
-            double dp = (double)(c[0] + c[1] + c[2] + c[3] + delc[idx]);
+            int64_t idx0 = map_pos_to_pile(ctg, regs, e->pos0);
+            if (idx0 < 0) continue;
+            double dp = 0.0;
+            for (int64_t rp = e->pos0; rp <= span_hi; rp++) {
+                int64_t ridx = map_pos_to_pile(ctg, regs, rp);
+                if (ridx < 0) continue;
+                const float *c = &counts[(size_t)ridx * 4ULL];
+                double d_rp = (double)(c[0] + c[1] + c[2] + c[3] + delc[ridx]);
+                if (d_rp > dp) dp = d_rp;
+            }
             if (dp < e->weight) dp = e->weight;
             double wsaf = e->weight / fmax(dp, 1e-9);
             if (wsaf < 0.05) continue;
@@ -520,12 +654,17 @@ int main(int argc, char **argv) {
                     ctg->name, (long long)e->pos0, anchor, e->alen, ctg->seq + e->pos0, anchor,
                     dp, rc, e->weight, wsaf);
         } else if (e->kind == 2 && e->seq) {
-            /* Insertion after e->pos0 (anchor at e->pos0) */
             if (e->pos0 < 0 || e->pos0 >= ctg->len) continue;
-            int64_t idx = map_pos_to_pile(ctg, regs, e->pos0);
-            if (idx < 0) continue;
-            const float *c = &counts[(size_t)idx * 4ULL];
-            double dp = (double)(c[0] + c[1] + c[2] + c[3] + delc[idx]);
+            int64_t idx0 = map_pos_to_pile(ctg, regs, e->pos0);
+            if (idx0 < 0) continue;
+            double dp = 0.0;
+            for (int64_t rp = e->pos0; rp <= span_hi; rp++) {
+                int64_t ridx = map_pos_to_pile(ctg, regs, rp);
+                if (ridx < 0) continue;
+                const float *c = &counts[(size_t)ridx * 4ULL];
+                double d_rp = (double)(c[0] + c[1] + c[2] + c[3] + delc[ridx]);
+                if (d_rp > dp) dp = d_rp;
+            }
             if (dp < e->weight) dp = e->weight;
             double wsaf = e->weight / fmax(dp, 1e-9);
             if (wsaf < 0.05) continue;
@@ -547,6 +686,15 @@ int main(int argc, char **argv) {
             "{\"sam_records\": %lld, \"primary_mapped\": %lld, \"counted_unitigs\": %lld, "
             "\"counted_bases\": %lld, \"mm_filtered\": %lld, \"median_depth\": %.2f, \"pileup_bp\": %lld}\n",
             sam_records, primary_mapped, counted_unitigs, counted_bases, mm_filtered, med_dp, (long long)total_pile_bp);
+
+    for (size_t i = 0; i < imap.cap; i++) free(imap.t[i].seq);
+    free(imap.t);
+    for (size_t c = 0; c < n_ctgs; c++) {
+        free(ctgs[c].name);
+        free(ctgs[c].seq);
+    }
+    free(ctgs);
+    cm_free(&cmap);
     free(depth_samp);
     free(counts);
     free(delc);

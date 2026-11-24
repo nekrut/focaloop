@@ -41,6 +41,7 @@ def no_network():
 
 class Warm:
     def __init__(self, cohort, load_dothash: bool = False, load_esscolor: bool = False):
+        import hashlib
         w = Path(cohort) / "warm"
         t0 = time.time()
         self.cohort = Path(cohort)
@@ -48,11 +49,59 @@ class Warm:
         self.wsaf = np.load(w / "wsaf_u8.npy", mmap_mode="r")
         self.dp = np.load(w / "dp_u8.npy", mmap_mode="r")
         self.ratio = np.load(w / "ratio_f16.npy", mmap_mode="r")
+        if len(self.samples) != self.wsaf.shape[0] or len(self.samples) != self.dp.shape[0]:
+            raise ValueError(
+                f"Corrupt warm state in {w}: samples={len(self.samples)}, wsaf={self.wsaf.shape}, dp={self.dp.shape}"
+            )
         self.cnv = pd.read_parquet(w / "cnv.parquet")
         self.calls_path = w / "calls.parquet"
-        self.panel = P.load_panel()
-        self.g = G.load()
-        self.genes = pd.read_parquet(G.REFDIR / "genes_all.parquet")
+        bman = json.loads((w / "bundle_manifest.json").read_text()) if (w / "bundle_manifest.json").exists() else {}
+
+        if (w / "panel.npz").exists():
+            if bman.get("panel_sha256"):
+                actual = hashlib.sha256((w / "panel.npz").read_bytes()).hexdigest()
+                if actual != bman["panel_sha256"]:
+                    raise ValueError(f"Warm panel.npz checksum mismatch in {w}")
+            with np.load(w / "panel.npz") as pz:
+                self.panel = {k: pz[k] for k in pz.files}
+        else:
+            self.panel = P.load_panel()
+
+        if self.wsaf.ndim == 2 and self.wsaf.shape[1] > 0 and len(self.panel["goff"]) != self.wsaf.shape[1]:
+            raise ValueError(
+                f"Panel site count ({len(self.panel['goff'])}) does not match wsaf_u8 width ({self.wsaf.shape[1]})"
+            )
+
+        if (w / "genome_meta.npz").exists():
+            if bman.get("genome_sha256"):
+                actual_g = hashlib.sha256((w / "genome_meta.npz").read_bytes()).hexdigest()
+                if actual_g != bman["genome_sha256"]:
+                    raise ValueError(f"Warm genome_meta.npz checksum mismatch in {w}")
+            with np.load(w / "genome_meta.npz") as gz:
+                g_genes = (
+                    json.loads((w / "genes_curated.json").read_text())
+                    if (w / "genes_curated.json").exists()
+                    else {}
+                )
+                self.g = G.Genome(
+                    names=[str(x) for x in gz["names"]],
+                    lengths=gz["lengths"],
+                    offsets=gz["offsets"],
+                    seq=np.empty(0, dtype=np.uint8),
+                    core=np.empty(0, dtype=bool),
+                    bin_offsets=gz["bin_offsets"],
+                    bin_gc=gz["bin_gc"],
+                    bin_core=gz["bin_core"],
+                    genes=g_genes,
+                )
+        else:
+            self.g = G.load()
+
+        if (w / "genes_all.parquet").exists():
+            self.genes = pd.read_parquet(w / "genes_all.parquet")
+        else:
+            self.genes = pd.read_parquet(G.REFDIR / "genes_all.parquet")
+
         self.dothash = SS.load_dothash_index(cohort) if (load_dothash and (w / "dothash_i16.npy").exists()) else None
         self.esscolor, self.esscolor_meta = (
             SS.load_esscolor_drm_panel(cohort)
@@ -318,21 +367,25 @@ def q_dothash_knn(W, sample_or_idx=0, k_top=5, n_threads=1):
         q_idx = int(matches[0])
     else:
         q_idx = int(sample_or_idx)
+        if q_idx < 0 or q_idx >= len(W.samples):
+            return {"query": "dothash_knn", "error": f"query index {q_idx} out of range (n={len(W.samples)})", "seconds": time.time() - t0}
+    eff_k = max(0, int(k_top))
     q_hv = W.dothash.matrix[q_idx]
     q_card = float(W.dothash.cardinalities[q_idx])
-    top_idx, top_sim = W.dothash.knn_1_vs_n(q_hv, k_top=int(k_top) + 1, query_card=q_card, n_threads=n_threads)
+    top_idx, top_sim = W.dothash.knn_1_vs_n(q_hv, k_top=eff_k + 1, query_card=q_card, n_threads=n_threads)
     hits = []
     for idx_i, sim in zip(top_idx, top_sim):
-        if int(idx_i) == q_idx:
+        ii = int(idx_i)
+        if ii < 0 or ii == q_idx or ii >= len(W.samples):
             continue
-        row = W.samples.iloc[int(idx_i)]
+        row = W.samples.iloc[ii]
         hits.append({
-            "sample": str(row.get("sample", idx_i)),
+            "sample": str(row.get("sample", ii)),
             "population": str(row.get("Population", "")) if "Population" in row else None,
             "country": str(row.get("Country", "")) if "Country" in row else None,
             "jaccard_est": float(sim),
         })
-        if len(hits) >= int(k_top):
+        if len(hits) >= eff_k:
             break
     return {
         "query": "dothash_knn",

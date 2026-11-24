@@ -138,7 +138,13 @@ def seal_shard(cohort, shard_id, samples):
     if tmp.exists():
         shutil.rmtree(tmp)
     tmp.mkdir(parents=True)
-    present = [s for s in samples if is_done(cohort, s)]
+    seen = set()
+    unique_samples = []
+    for s in samples:
+        if s not in seen:
+            seen.add(s)
+            unique_samples.append(s)
+    present = [s for s in unique_samples if is_done(cohort, s)]
     for name in TABLES:
         files = [sample_dir(cohort, s) / f"{name}.parquet" for s in present]
         files = [f for f in files if f.exists()]
@@ -395,25 +401,35 @@ def build_warm(cohort, meta=None, use_dothash_knn: bool = False, use_esscolor_pa
         tel = tel[tel["error"].isna()]
     if "stop_reason" in tel.columns:
         tel = tel[tel["stop_reason"] != "error"]
+    if len(tel):
+        tel = tel.drop_duplicates("sample", keep="last").reset_index(drop=True)
     valid = set(tel["sample"])
-    ws = ws[ws["sample"].isin(valid)].reset_index(drop=True)
+    ws = ws[ws["sample"].isin(valid)].drop_duplicates("sample", keep="last").reset_index(drop=True)
     dep = read_table(cohort, "depth_1kb_bins", columns=["sample", "ratio_f16"])
+    if len(dep):
+        dep = dep.drop_duplicates("sample", keep="last")
     order = ws["sample"].tolist()
     wsaf_mat = u8_from_bytes(ws["wsaf_u8"])
     dp_mat = u8_from_bytes(ws["dp_u8"])
     np.save(warm / "wsaf_u8.npy", wsaf_mat)
     np.save(warm / "dp_u8.npy", dp_mat)
     dep = dep.set_index("sample").loc[order]
-    np.save(warm / "ratio_f16.npy", f16_from_bytes(dep["ratio_f16"]))
+    ratio_mat = f16_from_bytes(dep["ratio_f16"])
+    np.save(warm / "ratio_f16.npy", ratio_mat)
     idx = tel.set_index("sample").loc[order].reset_index()
     rp = Path(cohort) / "replay"
     if (rp / "curated.parquet").exists():  # curated calls re-derived with the final rules (zero network)
-        cur = pd.read_parquet(rp / "curated.parquet").set_index("sample")
+        cur = pd.read_parquet(rp / "curated.parquet").drop_duplicates("sample", keep="last").set_index("sample")
         cols = [c for c in cur.columns if c.startswith("aa_") or c == "k13_ns"]
         idx = idx.drop(columns=[c for c in cols if c in idx.columns]).merge(cur[cols], left_on="sample",
                                                                             right_index=True, how="left")
     if meta is not None:
-        idx = idx.merge(meta, left_on="sample", right_on="Sample", how="left", suffixes=("", "_meta"))
+        meta_dedup = meta.drop_duplicates("Sample", keep="last") if "Sample" in meta.columns else meta
+        idx = idx.merge(meta_dedup, left_on="sample", right_on="Sample", how="left", suffixes=("", "_meta"))
+    assert len(idx) == wsaf_mat.shape[0] == dp_mat.shape[0] == ratio_mat.shape[0], (
+        f"Warm state sample row mismatch: samples={len(idx)}, wsaf={wsaf_mat.shape[0]}, "
+        f"dp={dp_mat.shape[0]}, ratio={ratio_mat.shape[0]}"
+    )
     idx.to_parquet(warm / "samples.parquet", index=False)
     calls = read_table(cohort, "variant_calls", columns=["sample", "chrom", "pos", "ref", "alt", "kind", "gt", "wsaf"])
     calls = calls[(calls["gt"] > 0) & calls["sample"].isin(valid)]
@@ -421,7 +437,41 @@ def build_warm(cohort, meta=None, use_dothash_knn: bool = False, use_esscolor_pa
     cnv = pd.read_parquet(rp / "cnv.parquet") if (rp / "cnv.parquet").exists() else read_table(cohort, "cnv_del_calls")
     if len(cnv):
         cnv = cnv[cnv["sample"].isin(valid)]
+        if {"sample", "locus"}.issubset(cnv.columns):
+            cnv = cnv.drop_duplicates(["sample", "locus"], keep="last")
     cnv.to_parquet(warm / "cnv.parquet", index=False)
+
+    # Persist self-contained panel + genome metadata + genes_all inside warm/ for portable Warm queries (L46)
+    bundle_manifest = {"n_samples": int(len(order)), "n_sites": int(wsaf_mat.shape[1]) if wsaf_mat.ndim == 2 else 0}
+    try:
+        from . import prepare as P
+        if P.SITE_PANEL.exists():
+            panel_obj = P.load_panel()
+            np.savez_compressed(warm / "panel.npz", **{k: np.asarray(v) for k, v in panel_obj.items()})
+            bundle_manifest["panel_sha256"] = hashlib.sha256((warm / "panel.npz").read_bytes()).hexdigest()
+    except Exception:
+        pass
+    try:
+        if G.REF_FASTA.exists() or (G.REFDIR / "genome_cache.npz").exists():
+            g_obj = G.load()
+            np.savez_compressed(
+                warm / "genome_meta.npz",
+                names=np.asarray(g_obj.names),
+                lengths=np.asarray(g_obj.lengths, dtype=np.int64),
+                offsets=np.asarray(g_obj.offsets, dtype=np.int64),
+                bin_offsets=np.asarray(g_obj.bin_offsets, dtype=np.int64),
+                bin_gc=np.asarray(g_obj.bin_gc, dtype=np.float32),
+                bin_core=np.asarray(g_obj.bin_core, dtype=np.float32),
+            )
+            (warm / "genes_curated.json").write_text(json.dumps(g_obj.genes, default=list))
+            bundle_manifest["genome_sha256"] = hashlib.sha256((warm / "genome_meta.npz").read_bytes()).hexdigest()
+        if (G.REFDIR / "genes_all.parquet").exists():
+            shutil.copy2(G.REFDIR / "genes_all.parquet", warm / "genes_all.parquet")
+            bundle_manifest["genes_sha256"] = hashlib.sha256((warm / "genes_all.parquet").read_bytes()).hexdigest()
+    except Exception:
+        pass
+    (warm / "bundle_manifest.json").write_text(json.dumps(bundle_manifest, indent=1))
+
     out = {"samples": len(order)}
     if use_dothash_knn:
         out["dothash"] = build_dothash_index(
