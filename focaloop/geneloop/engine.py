@@ -64,7 +64,9 @@ from .stream import (
     ingest_bam_to_evidence,
     ingest_per_run_junc_tsv,
     load_unw_junc_stats,
+    minimap2_index_size_args,
     probe_logan_runs,
+    validate_bam_header_against_genome,
 )
 from .synthesis import (
     LOGAN_WIDE_COHORT_MIN_RUNS,
@@ -76,7 +78,18 @@ from .synthesis import (
     split_safe_ortholog_chimeras,
     synthesize,
 )
-from .telemetry import NicCounter, ScratchMonitor, StageLog, StageRecord, dir_bytes, run_cmd, safe_env
+from .telemetry import (
+    NicCounter,
+    ScratchMonitor,
+    StageLog,
+    StageRecord,
+    available_ram_bytes,
+    dir_bytes,
+    effective_total_ram_bytes,
+    run_cmd,
+    safe_env,
+    samtools_sort_mem_arg,
+)
 
 RUN_ROOT = Path(os.environ.get("GENELOOP_RUN_ROOT", str(Path(tempfile.gettempdir()) / "geneloop_runs")))
 SEED_LOGIC_VERSION = "v2_b0_b1_b2"
@@ -161,33 +174,24 @@ def _available_cpus() -> list[int]:
     return list(range(max(1, os.cpu_count() or 1)))
 
 
+class TiberiusMemoryError(MemoryError):
+    """Raised when available cgroup/scheduler/host RAM cannot fit even a single bs=1 Tiberius worker."""
+
+
 def _read_mem_available_gib() -> float | None:
-    """Read /proc/meminfo MemAvailable in GiB on Linux (None when /proc/meminfo is unavailable)."""
-    meminfo = Path("/proc/meminfo")
-    if not meminfo.exists():
+    """Read effective available RAM in GiB across cgroup v1/v2 hierarchy, scheduler limits, and /proc/meminfo."""
+    avail_b = available_ram_bytes()
+    if avail_b is None:
         return None
-    try:
-        for line in meminfo.read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                kb = int(line.split()[1])
-                return kb / (1024.0 * 1024.0)
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
+    return avail_b / float(1024 ** 3)
 
 
 def _read_mem_total_gib() -> float | None:
-    """Read /proc/meminfo MemTotal in GiB on Linux (None when /proc/meminfo is unavailable)."""
-    meminfo = Path("/proc/meminfo")
-    if not meminfo.exists():
+    """Read effective total RAM cap in GiB across cgroup v1/v2 hierarchy, scheduler limits, and /proc/meminfo."""
+    tot_b = effective_total_ram_bytes()
+    if tot_b is None:
         return None
-    try:
-        for line in meminfo.read_text().splitlines():
-            if line.startswith("MemTotal:"):
-                return int(line.split()[1]) / (1024.0 * 1024.0)
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
+    return tot_b / float(1024 ** 3)
 
 
 def _effective_reserve_gib(reserve_gib: float) -> float:
@@ -196,13 +200,18 @@ def _effective_reserve_gib(reserve_gib: float) -> float:
     return min(reserve_gib, round(0.15 * tot, 2)) if (tot is not None and tot < 128.0) else reserve_gib
 
 
+def _cpu_bs_rss_ladder(model_cfg: str) -> list[tuple[int, float]]:
+    """Ordered (batch_size, estimated_rss_gib) step-down ladder down to bs=1 for Tiberius CPU inference."""
+    if "mammalia" in model_cfg:
+        return [(2, 62.0), (1, 34.0)]
+    if "angiosperms" in model_cfg:
+        return [(2, 19.0), (1, 12.0)]
+    return [(4, 28.0), (2, 19.0), (1, 12.0)]
+
+
 def _default_cpu_bs_and_rss(model_cfg: str) -> tuple[int, float]:
     """Default approved CPU batch size and estimated per-worker RSS (GiB) by Tiberius model config."""
-    if "mammalia" in model_cfg:
-        return 2, 62.0
-    if "angiosperms" in model_cfg:
-        return 2, 19.0
-    return 4, 28.0
+    return _cpu_bs_rss_ladder(model_cfg)[0]
 
 
 def _approve_wave_workers_and_bs(
@@ -210,22 +219,25 @@ def _approve_wave_workers_and_bs(
     model_cfg: str,
     reserve_gib: float = 40.0,
 ) -> tuple[int, int, bool, float | None]:
-    """Reserve-honoring dynamic RAM gate (G-A2/R2): never breaches reserve_gib; raises MemoryError if K_eff <= 0."""
-    approved_bs, rss_est = _default_cpu_bs_and_rss(model_cfg)
+    """Reserve-honoring cgroup-aware RAM gate: steps down to bs=1 before raising TiberiusMemoryError."""
+    ladder = _cpu_bs_rss_ladder(model_cfg)
+    approved_bs, rss_est = ladder[0]
     avail = _read_mem_available_gib()
     k_req = max(1, int(k_cfg))
     if avail is None:
         return k_req, approved_bs, False, None
     k_eff = min(k_req, math.floor((avail - reserve_gib) / rss_est))
     bs_stepdown = False
-    if k_eff <= 0 and approved_bs == 4:
-        approved_bs = 2
-        rss_est = 19.0
+    for cand_bs, cand_rss in ladder[1:]:
+        if k_eff > 0:
+            break
+        approved_bs = cand_bs
+        rss_est = cand_rss
         bs_stepdown = True
         k_eff = min(k_req, math.floor((avail - reserve_gib) / rss_est))
     if k_eff <= 0:
-        raise MemoryError(
-            f"Insufficient MemAvailable ({avail:.2f} GiB) for Tiberius CPU worker "
+        raise TiberiusMemoryError(
+            f"Insufficient available RAM ({avail:.2f} GiB) for Tiberius CPU worker "
             f"(reserve={reserve_gib:.1f} GiB, rss_est={rss_est:.1f} GiB, bs={approved_bs})"
         )
     return k_eff, approved_bs, bs_stepdown, avail
@@ -279,7 +291,8 @@ class LoopParams:
     min_exon_depth: float = 20.0
     max_singleton_ratio: float = 0.01
     paralog_multimap_frac: float = 0.5
-    caps: tuple = (40, 120, 40)  # per 1-kb bin: unspliced, spliced, soft-clipped primary reads retained
+    caps: tuple = (40, 120, 40)  # per 1-kb bin: unspliced, spliced, soft-clipped primary short reads retained
+    long_caps: tuple = (80, 240, 80)  # separate per 1-kb bin caps for long-read libraries (never starved by short reads)
     hotspot_frac: float = 0.002
     sieve_min_hits: int = 2
     sieve_max_miss: int = 2
@@ -310,6 +323,7 @@ class LoopParams:
     tiberius_reserve_gib: float = 40.0
     enable_structural_ncrna: str = "auto"
     logan_mode: str = "auto"
+    long_stranded: bool = False
 
 
 class GateRun:
@@ -358,6 +372,18 @@ class GateRun:
 
     def stage_rec(self, name: str) -> dict | None:
         return self.log.latest(name)
+
+    def _seed_protein_path(self) -> Path:
+        return seedmod.seed_protein_path(self.dir / "seed", self.gate)
+
+    def _is_long_run_stranded(self, run_id: str) -> bool:
+        if bool(getattr(self.lp, "long_stranded", False)):
+            return True
+        loc = self._local_streams.get(run_id)
+        if loc and bool(loc.get("stranded", False)):
+            return True
+        stranded_runs = {str(r) for r in (self.gate.get("sra_long_stranded_runs") or ())}
+        return str(run_id) in stranded_runs
 
     def prepare(self) -> dict:
         self.meta = seedmod.prepare_genome(self.gate_id, self.dir, self.log, gate=self.gate)
@@ -721,6 +747,7 @@ class GateRun:
                 "requested_short_runs": list(sra_short),
                 "logan_runs": [],
                 "fallback_short_runs": fb_all,
+                "skipped_short_runs": [],
                 "local_short_runs": list(local_short),
                 "total_compressed_bytes": 0,
             }
@@ -729,16 +756,31 @@ class GateRun:
         probe_p = self.dir / "seed" / "logan_probe.json"
         probe_res = probe_logan_runs(sra_short, cache_path=probe_p, timeout=8.0, retries=2)
         logan_runs = list(probe_res.get("logan_runs", []))
+        logan_set = set(logan_runs)
+        skipped_short_runs: list[str] = []
         if mode == "logan_only":
+            transient_failed = [str(r) for r in (probe_res.get("transient_failed_runs") or [])]
+            if transient_failed:
+                raise RuntimeError(
+                    f"Logan-only probe failed transiently on {len(transient_failed)} run(s) "
+                    f"({', '.join(transient_failed[:5])}). Retry or switch --logan-mode to auto."
+                )
             if not logan_runs:
                 raise ValueError(
                     "Logan-only mode found no pre-assembled Logan contig archives for the requested SRA accessions. "
                     "Switch Logan mode to Automatic to fall back to raw SRA/ENA streaming."
                 )
+            skipped_short_runs = [r for r in sra_short if r not in logan_set]
             fb_runs = list(local_short)
         else:
             fb_runs = list(probe_res.get("fallback_short_runs", [])) + list(local_short)
-        info = {"logan_mode": mode, **probe_res, "fallback_short_runs": fb_runs, "local_short_runs": list(local_short)}
+        info = {
+            "logan_mode": mode,
+            **probe_res,
+            "fallback_short_runs": fb_runs,
+            "skipped_short_runs": skipped_short_runs,
+            "local_short_runs": list(local_short),
+        }
         self._logan_partition_cache[ck] = (logan_runs, fb_runs, info)
         return list(logan_runs), list(fb_runs), dict(info)
 
@@ -787,13 +829,15 @@ class GateRun:
         rem = self.lp.scout_spots % n_sel
         waves: list[dict] = []
         spots_total = 0
+        has_remote_scout = any(r not in self._local_streams for r in short_runs)
         for i_r, rid in enumerate(short_runs):
             target_spots = base_per_run + (1 if i_r < rem else 0)
             if target_spots <= 0:
                 continue
+            is_local_r = rid in self._local_streams
             st = self._scout_streams.get(rid)
             if st is None:
-                if rid in self._local_streams:
+                if is_local_r:
                     st = self._local_streams[rid]["stream"]
                 else:
                     st = RunStream(rid, info[rid]["n_segments"], info[rid]["total_spots"], scout_dir / "logs", threads=4)
@@ -803,17 +847,23 @@ class GateRun:
             while rem_r > 0:
                 slice_n = min(self.lp.wave_spots, rem_r)
                 tag = f"scout_{i_r}_{w_idx}_{rid}"
-                if getattr(st, "segs", 2) == 1:
-                    res = align_slice_short_se(
-                        st, slice_n, idx, scout_dir / "waves", tag, cap_state, self.lp.caps,
-                        threads=self.lp.hisat_threads, nic=self.nic,
-                    )
-                else:
-                    res = align_slice_short(
-                        st, slice_n, idx, scout_dir / "waves", tag, scout_active, cap_state, self.lp.caps,
-                        threads=self.lp.hisat_threads, nic=self.nic,
-                        min_hits=self.lp.sieve_min_hits, max_miss=self.lp.sieve_max_miss,
-                    )
+                use_nic = None if is_local_r else self.nic
+                try:
+                    if getattr(st, "segs", 2) == 1:
+                        res = align_slice_short_se(
+                            st, slice_n, idx, scout_dir / "waves", tag, cap_state, self.lp.caps,
+                            threads=self.lp.hisat_threads, nic=use_nic,
+                        )
+                    else:
+                        res = align_slice_short(
+                            st, slice_n, idx, scout_dir / "waves", tag, scout_active, cap_state, self.lp.caps,
+                            threads=self.lp.hisat_threads, nic=use_nic,
+                            min_hits=self.lp.sieve_min_hits, max_miss=self.lp.sieve_max_miss,
+                        )
+                except Exception:
+                    if getattr(st, "stream_failed", False):
+                        break
+                    raise
                 if res.spots == 0:
                     break
                 waves.append({
@@ -834,7 +884,7 @@ class GateRun:
                 rem_r -= res.spots
                 w_idx += 1
         wall_s = time.time() - t0
-        wire_bytes = self.nic.rx() - rx0
+        wire_bytes = max(0, self.nic.rx() - rx0) if has_remote_scout else 0
         self.log.append(StageRecord(
             name="scout_rna", wall_seconds=wall_s,
             cpu_user=sum(sum(w["cpu"].values()) for w in waves),
@@ -1242,7 +1292,7 @@ class GateRun:
                     _write_json_atomic(part_json, cached_summ)
                 return cached_summ
 
-        prot = sd / f"proteins_no_{self.gate.get('exclude_genus') or 'target'}.faa"
+        prot = self._seed_protein_path()
         if need_hisat_in_seed:
             avail_cpus = _available_cpus()
             pool = avail_cpus[: max(1, self.lp.threads)]
@@ -1528,30 +1578,41 @@ class GateRun:
         raw_p = ncrna_dir / "raw_ncrna_candidates.json"
         done_p = ncrna_dir / "done.json"
         taxon_group = ncrna_mod.resolve_rfam_taxon_group(self.gate)
-        expected_ck = ncrna_mod.compute_ncrna_raw_cache_key(self._genome_identity_digest(), taxon_group)
 
         if done_p.exists() and raw_p.exists():
             try:
                 done_data = json.loads(done_p.read_text())
             except (OSError, ValueError):
                 done_data = {}
+            done_stages = done_data.get("stages") if isinstance(done_data, dict) else None
+            stages_arg = done_stages if isinstance(done_stages, dict) else None
+            expected_ck = ncrna_mod.compute_ncrna_raw_cache_key(
+                self._genome_identity_digest(), taxon_group, stages=stages_arg
+            )
+            full_stages = stages_arg is None or all(
+                bool(stages_arg.get(k, False)) for k in ("trnascan", "barrnap", "rfam")
+            )
+            rfam_used = stages_arg is None or bool(stages_arg.get("rfam", False))
+            exp_asset_sha = ncrna_mod.PINNED_RFAM_ASSETS if rfam_used else {}
             if (
                 isinstance(done_data, dict)
+                and (mode != "on" or full_stages)
                 and done_data.get("cache_key") == expected_ck
-                and done_data.get("asset_sha256") == ncrna_mod.PINNED_RFAM_ASSETS
+                and done_data.get("asset_sha256") == exp_asset_sha
             ):
                 actual_sha = _sha256_file(raw_p)
                 if done_data.get("raw_candidates_sha256") == actual_sha:
-                    rdir_cand = ncrna_mod.default_rfam_dir()
-                    for fname, exp_sha in ncrna_mod.PINNED_RFAM_ASSETS.items():
-                        fp = rdir_cand / fname
-                        if fp.is_file() and _sha256_file(fp) != exp_sha:
-                            raise RuntimeError(f"Pinned Rfam 15.1 SHA256 mismatch for {fp}")
+                    if rfam_used:
+                        rdir_cand = ncrna_mod.default_rfam_dir()
+                        for fname, exp_sha in ncrna_mod.PINNED_RFAM_ASSETS.items():
+                            fp = rdir_cand / fname
+                            if fp.is_file() and _sha256_file(fp) != exp_sha:
+                                raise RuntimeError(f"Pinned Rfam 15.1 SHA256 mismatch for {fp}")
                     return json.loads(raw_p.read_text()), actual_sha, {**done_data, "cached": True}
 
         if run_if_missing:
             info = self.ensure_structural_ncrna()
-            if info.get("status") == "ok" and info.get("raw_candidates_path"):
+            if info.get("status") in ("ok", "partial") and info.get("raw_candidates_path"):
                 rp = Path(info["raw_candidates_path"])
                 return json.loads(rp.read_text()), str(info["raw_candidates_sha256"]), info
             st_tok = str(info.get("status") or "skipped_missing_assets")
@@ -1568,7 +1629,7 @@ class GateRun:
         if self._skip_tiberius:
             self.prepare()
             sd = self.dir / "seed"
-            prot = sd / f"proteins_no_{self.gate.get('exclude_genus') or 'target'}.faa"
+            prot = self._seed_protein_path()
             seedmod.run_miniprot(
                 self.genome_fa, prot, sd, self.log,
                 threads=self.lp.threads,
@@ -1615,10 +1676,21 @@ class GateRun:
                 bench["bs6"] = _tib_summary(r6)
             prod_tag = "bs6" if (sd / "tiberius_bs6.done.json").exists() else "bs4"
         else:
-            prod_tag, rec_t = self._run_tiberius_with_fallback(self.genome_fa, sd, cpu_only=cpu_only)
+            fb_kw: dict = {}
+            if cpu_only and getattr(self._run_tiberius_with_fallback, "__func__", None) is GateRun._run_tiberius_with_fallback:
+                eff_res = _effective_reserve_gib(self.lp.tiberius_reserve_gib)
+                _keff, approved_bs, bs_stepdown, _avail = _approve_wave_workers_and_bs(
+                    1, str(self.gate.get("tiberius_model_cfg", "")), eff_res
+                )
+                fb_kw = {
+                    "approved_bs": approved_bs,
+                    "bs_stepdown": bs_stepdown,
+                    "effective_reserve_gib": eff_res,
+                }
+            prod_tag, rec_t = self._run_tiberius_with_fallback(self.genome_fa, sd, cpu_only=cpu_only, **fb_kw)
             bench[prod_tag] = _tib_summary(rec_t)
         tib_gtf = sd / f"tiberius_{prod_tag}.gtf"
-        prot = sd / f"proteins_no_{self.gate.get('exclude_genus') or 'target'}.faa"
+        prot = self._seed_protein_path()
         if self.lp.seed_mode == "full":
             seedmod.run_miniprot(self.genome_fa, prot, sd, self.log, threads=self.lp.threads)
         else:
@@ -1655,7 +1727,7 @@ class GateRun:
         bdir.mkdir(parents=True, exist_ok=True)
         prod_tag = "bs6" if (sd / "tiberius_bs6.done.json").exists() else "bs4"
         tib_gtf = sd / f"tiberius_{prod_tag}.gtf"
-        prot = sd / f"proteins_no_{self.gate.get('exclude_genus') or 'target'}.faa"
+        prot = self._seed_protein_path()
         rec_v02 = seedmod.run_targeted_miniprot(self.genome_fa, prot, tib_gtf, bdir, self.log, threads=self.lp.threads)
         plen = seedmod.protein_lengths(prot)
         tib = seedmod.load_tiberius(tib_gtf)
@@ -1746,8 +1818,12 @@ class GateRun:
             return mmi
         rec = StageRecord(name="minimap2_index")
         t0 = time.time()
+        mm2_i_args = minimap2_index_size_args(sum(self.genome.lengths.values()))
         with open(self.dir / "genome" / "mm2_index.log", "w") as lf:
-            _, _, u, s = run_cmd(["minimap2", "-x", "splice:hq", "-t", str(self.lp.threads), "-d", str(mmi), str(self.genome_fa)], stderr=lf)
+            _, _, u, s = run_cmd(
+                ["minimap2", "-x", "splice:hq", *mm2_i_args, "-t", str(self.lp.threads), "-d", str(mmi), str(self.genome_fa)],
+                stderr=lf,
+            )
         rec.wall_seconds, rec.cpu_user, rec.cpu_sys = time.time() - t0, u, s
         rec.extra = {"index_bytes": mmi.stat().st_size}
         self.log.append(rec)
@@ -1802,6 +1878,7 @@ class GateRun:
             res = synthesize(
                 self.genome, s["tiberius"], s["hits"], s["loci"], params=self.sp, prefix="GLA",
                 organelle_contigs=org_set, raw_ncrna_candidates=raw_ncrna, zoom=self._enable_zoom,
+                threads=self.lp.threads,
             )
             write_gff3(res.models, out)
             write_gff3(_tiberius_models(s["tiberius"]), ad / "tiberius_standalone.gff3")
@@ -1829,7 +1906,13 @@ class GateRun:
                 if done.exists():
                     summary["runs"][r] = json.loads(done.read_text())
                     continue
-                res = align_run_full(r, lr, idx, mmi, aln, threads=self.lp.hisat_threads, nic=self.nic)
+                res = align_run_full(
+                    r, lr, idx, mmi, aln,
+                    threads=self.lp.hisat_threads,
+                    nic=None if r in self._local_streams else self.nic,
+                    stranded=self._is_long_run_stranded(r),
+                    genome_bp=sum(self.genome.lengths.values()),
+                )
                 d = asdict(res)
                 d["long_read"] = lr
                 d["total_spots"] = info[r]["total_spots"]
@@ -1886,7 +1969,7 @@ class GateRun:
                 params=self.sp, prefix="GLB",
                 bait_intervals=ctx["bait_intervals"], organelle_contigs=ctx["organelle_contigs"],
                 readthrough_targets=ctx["readthrough_targets"], raw_ncrna_candidates=raw_ncrna,
-                scanned_tib_windows=scanned_wins,
+                scanned_tib_windows=scanned_wins, threads=self.lp.threads,
             )
             write_gff3(res.models, out)
             synth_wall = time.time() - t2
@@ -1974,9 +2057,13 @@ class GateRun:
             mult_stats: dict = {}
             act_stats: dict = {}
             sieve_index_wall = 0.0
-            if fallback_short_runs:
-                # ---- Stage 1 index: genome-wide multiplicity of candidate syncmers (needed only for short-read SRA fallback)
-                t0 = time.time()
+
+            def _ensure_short_sieve_ready() -> None:
+                nonlocal idx, cand_m, bait, locked, mult, active, mult_stats, act_stats, sieve_index_wall
+                if mult is not None and active is not None:
+                    return
+                idx = self.hisat_index(force=True)
+                t0_s = time.time()
                 cand_m, bait, locked = self._sieve_inputs(s, cd)
                 mult = cd / "sieve" / "cand.mult"
                 mres = subprocess.run(
@@ -1984,7 +2071,7 @@ class GateRun:
                     capture_output=True, text=True, check=True, env=safe_env(),
                 )
                 mult_stats = json.loads(mres.stderr.strip().splitlines()[-1])
-                sieve_index_wall = time.time() - t0
+                sieve_index_wall = time.time() - t0_s
                 self.log.append(
                     StageRecord(
                         name=f"arm{self.c_tag}_sieve_index",
@@ -1995,6 +2082,10 @@ class GateRun:
                 )
                 active = cd / "sieve" / "active_0.bin"
                 act_stats = _activate(glc, active, bait=bait)
+
+            if fallback_short_runs:
+                # ---- Stage 1 index: genome-wide multiplicity of candidate syncmers (needed only for short-read SRA fallback)
+                _ensure_short_sieve_ready()
 
             # ---- loop state
             locked_introns = set()
@@ -2031,6 +2122,8 @@ class GateRun:
             stop_reason = ""
             loop_t0, loop_c0 = time.time(), self_cpu()
             rx0 = self.nic.rx()
+            genome_bp_total = sum(g.lengths.values())
+            rerouted_zero_logan_runs: list[str] = []
 
             # ---- Step A: Logan HTTP-200 Contigs + ka + glcore logan (A1/A2)
             logan_meta: dict | None = None
@@ -2045,80 +2138,122 @@ class GateRun:
                 mm2_flags = ["-ax", "splice", "-k14"] if is_cross else ["-ax", "splice"]
                 logan_dir = cd / "logan"
                 logan_tmp = cd / "logan_tmp"
-                logan_bam_target = (ev_dir / "capped_short.bam") if not fallback_short_runs else (logan_dir / "logan_contigs.bam")
-                logan_meta = align_logan_contigs(
-                    logan_runs=logan_runs,
-                    genome_fa=self.genome_fa,
-                    mm2_flags=mm2_flags,
-                    glcore_bin=glc,
-                    out_dir=logan_dir,
-                    tmp_dir=logan_tmp,
-                    bam_out=logan_bam_target,
-                    threads=lp.threads,
-                    nic=self.nic,
-                )
-                logan_meta["cross_species"] = cross_meta
-                logan_wire_bytes = int(logan_meta.get("wire_bytes", 0))
-                for k_proc, v_cpu in (logan_meta.get("cpu_by_proc_s") or {}).items():
-                    cpu_by_tool[k_proc] = cpu_by_tool.get(k_proc, 0.0) + float(v_cpu)
-                self.log.append(
-                    StageRecord(
-                        name=f"arm{self.c_tag}_logan_align",
-                        wall_seconds=float(logan_meta.get("wall_s", 0.0)),
-                        cpu_user=float(logan_meta.get("total_cpu_s", 0.0)),
-                        wire_bytes=logan_wire_bytes,
-                        extra={
-                            "n_logan_runs": len(logan_runs),
-                            "mm2_flags": mm2_flags,
-                            "cross_species": cross_meta,
-                            "stream_stats": logan_meta.get("stream_stats", {}),
-                        },
+                # #58: ALWAYS write Logan alignments to logan/logan_contigs.bam; never overwrite state/capped_short.bam!
+                logan_bam_target = logan_dir / "logan_contigs.bam"
+                try:
+                    logan_meta = align_logan_contigs(
+                        logan_runs=logan_runs,
+                        genome_fa=self.genome_fa,
+                        mm2_flags=mm2_flags,
+                        glcore_bin=glc,
+                        out_dir=logan_dir,
+                        tmp_dir=logan_tmp,
+                        bam_out=logan_bam_target,
+                        threads=lp.threads,
+                        nic=self.nic,
+                        genome_bp=genome_bp_total,
                     )
-                )
-                # v3(b): Keep ALL ka junctions intact (never drop single-contig unw_ua==1 bridges)
-                logan_added = ingest_per_run_junc_tsv(js, Path(logan_meta["junc_ka_path"]), g)
-                bins.ingest_tsv(Path(logan_meta["bins_ka_path"]))
-                unw_runs, unw_ua = load_unw_junc_stats(Path(logan_meta["junc_unw_path"]))
-                touched_logan: set[str] = set()
-                for k_j, nua_j, nt_j in logan_added:
-                    reg = region_of.get(k_j)
-                    if reg is None:
-                        reg = _region(k_j, locked_introns, lidx_locked, lidx_uns)
-                        region_of[k_j] = reg
-                    if reg in (REGION_LOCKED_KNOWN, REGION_LOCKED_NOVEL):
-                        for l in lidx_locked.containing(k_j[0], k_j[1], k_j[2]):
-                            lo = locus_obs.setdefault(l.locus_id, {"keys": {}, "ua": 0, "total": 0})
-                            lo["keys"][k_j] = lo["keys"].get(k_j, 0) + nua_j
-                            lo["ua"] += nua_j
-                            lo["total"] += nt_j
-                            touched_logan.add(l.locus_id)
-                for lid in touched_logan:
-                    if lid in saturated:
-                        continue
-                    lo = locus_obs[lid]
-                    intr = locus_introns.get(lid, ())
-                    ctg = locus_by_id[lid].contig
-                    sup = [js.support((ctg, a, b)) for a, b in intr]
-                    if not sup:
-                        continue
-                    st_l = LocusSaturationState(
-                        locus_id=lid,
-                        min_exon_depth=float(min(sup)),
-                        min_junction_depth=int(min(sup)),
-                        total_spliced_obs=lo["ua"],
-                        singleton_junctions=sum(1 for c in lo["keys"].values() if c == 1),
-                        has_unresolved_paralog_eq=(
-                            lo["total"] > 0 and (lo["total"] - lo["ua"]) / lo["total"] > lp.paralog_multimap_frac
-                        ),
+                except RuntimeError as exc_logan:
+                    if lp.logan_mode == "logan_only":
+                        raise
+                    if "stub" in str(exc_logan).lower() or "empty" in str(exc_logan).lower() or "0-record" in str(exc_logan).lower():
+                        rerouted_zero_logan_runs = list(logan_runs)
+                        for zr in rerouted_zero_logan_runs:
+                            if zr not in fallback_short_runs:
+                                fallback_short_runs.append(zr)
+                        logan_runs = []
+                        logan_bam_target = None
+                        logan_meta = None
+                    else:
+                        raise
+                if logan_meta is not None:
+                    zero_rec_runs = [str(r) for r in (logan_meta.get("zero_record_runs") or [])]
+                    if zero_rec_runs:
+                        if lp.logan_mode == "logan_only":
+                            raise RuntimeError(
+                                f"Logan-only mode encountered zero-record Logan contig archive(s): {', '.join(zero_rec_runs)}"
+                            )
+                        rerouted_zero_logan_runs = list(zero_rec_runs)
+                        zero_set = set(zero_rec_runs)
+                        logan_runs = [r for r in logan_runs if r not in zero_set]
+                        for zr in zero_rec_runs:
+                            if zr not in fallback_short_runs:
+                                fallback_short_runs.append(zr)
+                        if not logan_runs:
+                            for p_rm in (logan_bam_target, Path(f"{logan_bam_target}.bai")):
+                                if p_rm is not None:
+                                    p_rm.unlink(missing_ok=True)
+                            logan_bam_target = None
+                if rerouted_zero_logan_runs:
+                    sra_stream_runs = [(r, False) for r in fallback_short_runs] + [(r, True) for r in long_runs]
+                    new_runs = [(r, False) for r in fallback_short_runs if r not in info]
+                    if new_runs:
+                        info.update(self.run_info(runs=new_runs))
+                    if fallback_short_runs:
+                        _ensure_short_sieve_ready()
+                if logan_meta is not None and logan_runs:
+                    logan_meta["cross_species"] = cross_meta
+                    logan_wire_bytes = int(logan_meta.get("wire_bytes", 0))
+                    for k_proc, v_cpu in (logan_meta.get("cpu_by_proc_s") or {}).items():
+                        cpu_by_tool[k_proc] = cpu_by_tool.get(k_proc, 0.0) + float(v_cpu)
+                    self.log.append(
+                        StageRecord(
+                            name=f"arm{self.c_tag}_logan_align",
+                            wall_seconds=float(logan_meta.get("wall_s", 0.0)),
+                            cpu_user=float(logan_meta.get("total_cpu_s", 0.0)),
+                            wire_bytes=logan_wire_bytes,
+                            extra={
+                                "n_logan_runs": len(logan_runs),
+                                "mm2_flags": mm2_flags,
+                                "cross_species": cross_meta,
+                                "stream_stats": logan_meta.get("stream_stats", {}),
+                            },
+                        )
                     )
-                    if gate_sieve.locus_ready(st_l):
-                        saturated[lid] = 0
-                if saturated and fallback_short_runs and mult is not None and cand_m is not None and bait is not None:
-                    lst_0 = cd / "sieve" / "saturated_loci.txt"
-                    lst_0.write_text("\n".join(sorted(saturated)) + "\n")
-                    active = cd / "sieve" / "active_logan.bin"
-                    act_stats = {**act_stats, **_activate(glc, active, mult=mult, cand=cand_m, loci=lst_0, bait=bait)}
-                mon.sample()
+                    # v3(b): Keep ALL ka junctions intact (never drop single-contig unw_ua==1 bridges)
+                    logan_added = ingest_per_run_junc_tsv(js, Path(logan_meta["junc_ka_path"]), g)
+                    bins.ingest_tsv(Path(logan_meta["bins_ka_path"]))
+                    unw_runs, unw_ua = load_unw_junc_stats(Path(logan_meta["junc_unw_path"]))
+                    touched_logan: set[str] = set()
+                    for k_j, nua_j, nt_j in logan_added:
+                        reg = region_of.get(k_j)
+                        if reg is None:
+                            reg = _region(k_j, locked_introns, lidx_locked, lidx_uns)
+                            region_of[k_j] = reg
+                        if reg in (REGION_LOCKED_KNOWN, REGION_LOCKED_NOVEL):
+                            for l in lidx_locked.containing(k_j[0], k_j[1], k_j[2]):
+                                lo = locus_obs.setdefault(l.locus_id, {"keys": {}, "ua": 0, "total": 0})
+                                lo["keys"][k_j] = lo["keys"].get(k_j, 0) + nua_j
+                                lo["ua"] += nua_j
+                                lo["total"] += nt_j
+                                touched_logan.add(l.locus_id)
+                    for lid in touched_logan:
+                        if lid in saturated:
+                            continue
+                        lo = locus_obs[lid]
+                        intr = locus_introns.get(lid, ())
+                        ctg = locus_by_id[lid].contig
+                        sup = [js.support((ctg, a, b)) for a, b in intr]
+                        if not sup:
+                            continue
+                        st_l = LocusSaturationState(
+                            locus_id=lid,
+                            min_exon_depth=float(min(sup)),
+                            min_junction_depth=int(min(sup)),
+                            total_spliced_obs=lo["ua"],
+                            singleton_junctions=sum(1 for c in lo["keys"].values() if c == 1),
+                            has_unresolved_paralog_eq=(
+                                lo["total"] > 0 and (lo["total"] - lo["ua"]) / lo["total"] > lp.paralog_multimap_frac
+                            ),
+                        )
+                        if gate_sieve.locus_ready(st_l):
+                            saturated[lid] = 0
+                    if saturated and fallback_short_runs and mult is not None and cand_m is not None and bait is not None:
+                        lst_0 = cd / "sieve" / "saturated_loci.txt"
+                        lst_0.write_text("\n".join(sorted(saturated)) + "\n")
+                        active = cd / "sieve" / "active_logan.bin"
+                        act_stats = {**act_stats, **_activate(glc, active, mult=mult, cand=cand_m, loci=lst_0, bait=bait)}
+                    mon.sample()
 
             # ---- Step B: SRA Streaming Loop on Fallback (HTTP-404) Short Runs + Long-Read Runs
             n_unsettled = sum(1 for l in s["loci"] if l.status == UNSETTLED)
@@ -2139,6 +2274,8 @@ class GateRun:
                 if (w.get("run_id") in fb_short_set if lp.logan_mode in ("auto", "logan_only") else True)
             ]
             streams: dict[str, RunStream] = {}
+            stream_failures: list[tuple[str, str]] = []
+            short_budget_hit = False
             if sra_stream_runs:
                 # Seed judge with unsettled/locked junctions already observed in Logan so GT-UCB focuses on uncovered introns
                 if logan_runs and js.ua:
@@ -2165,7 +2302,10 @@ class GateRun:
                     if r in self._scout_streams and not self._scout_streams[r].eof:
                         streams[r] = self._scout_streams.pop(r)
                     elif r in self._local_streams:
-                        streams[r] = self._local_streams[r]["stream"]
+                        st_loc = self._local_streams[r]["stream"]
+                        if r in scout_consumed and st_loc.records_consumed < scout_consumed[r]:
+                            st_loc.records_consumed = scout_consumed[r]
+                        streams[r] = st_loc
                     else:
                         st_r = RunStream(r, info[r]["n_segments"], info[r]["total_spots"], cd / "logs", threads=4)
                         if r in scout_consumed:
@@ -2174,6 +2314,7 @@ class GateRun:
                 total_short_spots = sum(info[r]["total_spots"] for r, lr in sra_stream_runs if not lr)
                 budget = int(lp.max_frac_spots * total_short_spots)
                 cap_state = cd / "cap_state.u16"
+                cap_state_long = cd / "cap_state_long.u16"
                 if scout_data.get("cap_state") and Path(scout_data["cap_state"]).exists() and not cap_state.exists():
                     shutil.copy2(scout_data["cap_state"], cap_state)
                 bait_extra_done = False
@@ -2285,7 +2426,12 @@ class GateRun:
                 while True:
                     rid = judge.select_next_library_gt_ucb()
                     if rid is None:
-                        stop_reason = "ALL_LIBRARIES_HALTED_OR_EXHAUSTED"
+                        if short_budget_hit and not long_runs:
+                            stop_reason = f"MAX_BUDGET_{lp.max_frac_spots}"
+                        elif short_budget_hit:
+                            stop_reason = f"SHORT_MAX_BUDGET_{lp.max_frac_spots}_LONG_COMPLETE"
+                        else:
+                            stop_reason = "ALL_LIBRARIES_HALTED_OR_EXHAUSTED"
                         break
                     if judge.saturated():
                         stop_reason = (
@@ -2296,30 +2442,50 @@ class GateRun:
                         break
                     lr = info[rid]["long_read"]
                     if not lr and spots_used >= budget:
-                        stop_reason = f"MAX_BUDGET_{lp.max_frac_spots}"
-                        break
+                        short_budget_hit = True
+                        for r_s, lr_s in sra_stream_runs:
+                            if not lr_s and r_s in judge.libraries and not judge.libraries[r_s].halted:
+                                judge.libraries[r_s].halted = True
+                                judge.libraries[r_s].halt_reason = f"MAX_BUDGET_{lp.max_frac_spots}"
+                        continue
                     tag = f"w{wave:03d}_{rid}"
-                    if lr:
-                        res = align_slice_long(
-                            streams[rid], lp.long_wave_spots, mmi, waves_dir, tag, cap_state, lp.caps,
-                            threads=lp.hisat_threads, nic=self.nic,
-                        )
-                    elif getattr(streams[rid], "segs", 2) == 1:
-                        res = align_slice_short_se(
-                            streams[rid], lp.wave_spots, idx, waves_dir, tag, cap_state, lp.caps,
-                            threads=lp.hisat_threads, nic=self.nic,
-                        )
-                    else:
-                        res = align_slice_short(
-                            streams[rid], lp.wave_spots, idx, waves_dir, tag, active, cap_state, lp.caps,
-                            threads=lp.hisat_threads, nic=self.nic,
-                            min_hits=lp.sieve_min_hits, max_miss=lp.sieve_max_miss,
-                        )
+                    use_nic_w = None if rid in self._local_streams else self.nic
+                    try:
+                        if lr:
+                            res = align_slice_long(
+                                streams[rid], lp.long_wave_spots, mmi, waves_dir, tag,
+                                cap_state_long, lp.long_caps,
+                                threads=lp.hisat_threads, nic=use_nic_w,
+                                stranded=self._is_long_run_stranded(rid),
+                                genome_bp=genome_bp_total,
+                            )
+                        elif getattr(streams[rid], "segs", 2) == 1:
+                            res = align_slice_short_se(
+                                streams[rid], lp.wave_spots, idx, waves_dir, tag, cap_state, lp.caps,
+                                threads=lp.hisat_threads, nic=use_nic_w,
+                            )
+                        else:
+                            res = align_slice_short(
+                                streams[rid], lp.wave_spots, idx, waves_dir, tag, active, cap_state, lp.caps,
+                                threads=lp.hisat_threads, nic=use_nic_w,
+                                min_hits=lp.sieve_min_hits, max_miss=lp.sieve_max_miss,
+                            )
+                    except Exception as exc_w:
+                        if getattr(streams[rid], "stream_failed", False):
+                            judge.libraries[rid].halted = True
+                            judge.libraries[rid].halt_reason = "STREAM_FAILED"
+                            stream_failures.append((rid, str(exc_w)))
+                            continue
+                        raise
                     if res.spots == 0:
                         for k, v in res.cpu.items():
                             cpu_by_tool[k] = cpu_by_tool.get(k, 0.0) + v
                         judge.libraries[rid].halted = True
-                        judge.libraries[rid].halt_reason = "EXHAUSTED"
+                        if getattr(streams[rid], "stream_failed", False):
+                            judge.libraries[rid].halt_reason = "STREAM_FAILED"
+                            stream_failures.append((rid, "stream terminated prematurely before expected total_spots"))
+                        else:
+                            judge.libraries[rid].halt_reason = "EXHAUSTED"
                         continue
                     _record_wave(
                         rid, lr, res.spots, res.wire_bytes, res.wall, res.cpu, res.sieve, res.junc,
@@ -2333,17 +2499,20 @@ class GateRun:
 
             if self._local_bams:
                 bam_cap_state = cd / "bam_cap_state.u16"
+                bam_cap_state_long = cd / "bam_cap_state_long.u16"
                 for bi, binfo in enumerate(self._local_bams):
+                    is_lr_b = bool(binfo.get("long_read", False))
                     bres = ingest_bam_to_evidence(
                         Path(binfo["bam"]),
                         binfo["run_id"],
                         waves_dir,
                         f"bam_{bi:03d}_{binfo['run_id']}",
-                        bam_cap_state,
-                        lp.caps,
-                        is_long_read=bool(binfo.get("long_read", False)),
+                        bam_cap_state_long if is_lr_b else bam_cap_state,
+                        lp.long_caps if is_lr_b else lp.caps,
+                        is_long_read=is_lr_b,
+                        genome_lengths=g.lengths,
                     )
-                    wave_bams["long" if binfo.get("long_read", False) else "short"].append(bres.bam)
+                    wave_bams["long" if is_lr_b else "short"].append(bres.bam)
                     wj = js.ingest_tsv(binfo["run_id"], bres.junc_tsv, g)
                     bins.ingest_tsv(bres.bins_tsv)
                     for k, _nua, _nt in wj:
@@ -2354,16 +2523,32 @@ class GateRun:
                 if stop_reason == "NO_RNA_RUNS":
                     stop_reason = f"HISTORY_BAMS_{len(self._local_bams)}"
 
+            if stream_failures:
+                ok_stream_libs = [
+                    r
+                    for r, _ in sra_stream_runs
+                    if r in judge.libraries
+                    and judge.libraries[r].halt_reason != "STREAM_FAILED"
+                    and (judge.libraries[r].waves_completed > 0 or (r in streams and streams[r].spots_consumed > 0))
+                ]
+                if not ok_stream_libs and not logan_runs and not self._local_bams:
+                    fail_msg = ", ".join(f"{r}: {m}" for r, m in stream_failures[:3])
+                    raise RuntimeError(
+                        f"All RNA streaming libraries failed ({len(stream_failures)} failed: {fail_msg})"
+                    )
+
             loop_wall = time.time() - loop_t0
             cpu_by_tool["geneloop_python"] = self_cpu() - loop_c0
             scout_wire = sum(int(w.get("wire_bytes", 0)) for w in scout_waves)
-            nic_loop_wire = max(0, self.nic.rx() - rx0)
+            has_remote_streams = any(r not in self._local_streams for r, _ in sra_stream_runs)
+            nic_loop_wire = max(0, self.nic.rx() - rx0) if (has_remote_streams or logan_wire_bytes > 0) else 0
             wire = scout_wire + max(logan_wire_bytes, nic_loop_wire)
             mon.sample()
 
             # ---- Step C: Compact retained alignments + StringTie default mode + v3 chimera splitter
             t1 = time.time()
             merged = ev_dir / "capped_short.bam"
+            merged_bai = Path(f"{merged}.bai")
             post_cpu = 0.0
             merged_long = ev_dir / "capped_long.bam" if wave_bams["long"] else None
             if merged_long:
@@ -2388,7 +2573,7 @@ class GateRun:
                     os.replace(logan_bam_target, merged)
                     bai_src = Path(f"{logan_bam_target}.bai")
                     if bai_src.exists():
-                        os.replace(bai_src, Path(f"{merged}.bai"))
+                        os.replace(bai_src, merged_bai)
                     else:
                         _, _, ui, si = run_cmd(["samtools", "index", str(merged)])
                         post_cpu += ui + si
@@ -2406,7 +2591,7 @@ class GateRun:
                     os.replace(logan_raw_gtf, gtf)
                 rna_tx_short = tx_logan
             else:
-                assert logan_bam_target is not None
+                assert logan_bam_target is not None and logan_bam_target.resolve() != merged.resolve()
                 fb_short_bam = cd / "logan" / "fallback_short.bam"
                 post_cpu += _cat_sort(wave_bams["short"], fb_short_bam, lp.threads)
                 mon.sample()
@@ -2430,13 +2615,19 @@ class GateRun:
                 )
                 _, _, ui, si = run_cmd(["samtools", "index", "-@", str(min(16, lp.threads)), str(merged)])
                 post_cpu += um + sm + ui + si
+                protected_paths = {merged.resolve(), merged_bai.resolve()}
                 for p_tmp in (logan_bam_target, Path(f"{logan_bam_target}.bai"), fb_short_bam, Path(f"{fb_short_bam}.bai")):
-                    p_tmp.unlink(missing_ok=True)
+                    if p_tmp.resolve() not in protected_paths:
+                        p_tmp.unlink(missing_ok=True)
 
             waves_root = waves_dir.resolve()
+            protected_final = {merged.resolve(), merged_bai.resolve()}
+            if merged_long is not None:
+                protected_final.add(merged_long.resolve())
+                protected_final.add(Path(f"{merged_long}.bai").resolve())
             for b in wave_bams["short"] + wave_bams["long"]:
                 bp = Path(b).resolve()
-                if bp == waves_root or waves_root in bp.parents:
+                if bp not in protected_final and (bp == waves_root or waves_root in bp.parents):
                     bp.unlink(missing_ok=True)
 
             rna_tx = list(rna_tx_short)
@@ -2494,6 +2685,8 @@ class GateRun:
                 "n_logan_runs": len(logan_runs),
                 "logan_runs": logan_runs,
                 "fallback_short_runs": fallback_short_runs,
+                "skipped_short_runs": list(logan_probe.get("skipped_short_runs") or []),
+                "zero_record_rerouted_runs": rerouted_zero_logan_runs,
                 "long_runs": long_runs,
                 "align": logan_meta,
                 "v3_wide_cohort_active": len(logan_runs) >= LOGAN_WIDE_COHORT_MIN_RUNS,
@@ -2974,9 +3167,9 @@ class GateRun:
     def _synth_context(self, s: dict, cache_dir: Path | None = None, include_raw_alignments: bool = True) -> dict:
         """Load auxiliary synthesis inputs in memory without mutating seed/ (N6 persisted readthrough fallback)."""
         sd = self.dir / "seed"
-        excl = self.gate.get("exclude_genus", "")
-        prot = sd / f"proteins_no_{excl}.faa"
+        prot = self._seed_protein_path()
         rt_ids: set[str] = set()
+        rt_seed = sd / "readthrough_targets.json"
         rt_state = (cache_dir / "state" / "readthrough_targets.json") if cache_dir is not None else None
         rt_cache = (cache_dir / "readthrough_targets.json") if cache_dir is not None else None
         if self.gate.get("egapx_protein_bin"):
@@ -2984,11 +3177,16 @@ class GateRun:
             if src_prot.exists():
                 rt_ids |= seedmod.scan_readthrough_protein_ids(src_prot, cache_json=rt_cache)
         if not rt_ids:
-            for cand_rt in (rt_state, rt_cache):
+            for cand_rt in (rt_seed, rt_state, rt_cache):
                 if cand_rt is not None and cand_rt.exists():
                     try:
-                        rt_ids |= set(json.loads(cand_rt.read_text()))
-                        break
+                        loaded_rt = json.loads(cand_rt.read_text())
+                        if isinstance(loaded_rt, dict):
+                            rt_ids |= {str(x) for x in (loaded_rt.get("ids") or ())}
+                        elif isinstance(loaded_rt, list):
+                            rt_ids |= {str(x) for x in loaded_rt}
+                        if rt_ids:
+                            break
                     except (OSError, ValueError, TypeError):
                         pass
         if not rt_ids and prot.exists():
@@ -3126,19 +3324,33 @@ class GateRun:
             except (OSError, ValueError) as exc:
                 raise RuntimeError(f"Corrupt structural ncRNA cache JSON in {ncrna_dir}") from exc
             taxon_grp = ncrna_mod.resolve_rfam_taxon_group(self.gate)
-            exp_nc_ck = ncrna_mod.compute_ncrna_raw_cache_key(self._genome_identity_digest(), taxon_grp)
+            done_stages_c = done_nc.get("stages") if isinstance(done_nc, dict) else None
+            stages_arg_c = done_stages_c if isinstance(done_stages_c, dict) else None
+            exp_nc_ck = ncrna_mod.compute_ncrna_raw_cache_key(
+                self._genome_identity_digest(), taxon_grp, stages=stages_arg_c
+            )
+            full_stages_c = stages_arg_c is None or all(
+                bool(stages_arg_c.get(k, False)) for k in ("trnascan", "barrnap", "rfam")
+            )
+            rfam_used_c = stages_arg_c is None or bool(stages_arg_c.get("rfam", False))
+            exp_asset_sha_c = ncrna_mod.PINNED_RFAM_ASSETS if rfam_used_c else {}
+            if nc_mode == "on" and not full_stages_c:
+                raise RuntimeError(
+                    f"Partial structural ncRNA cache in {ncrna_dir} cannot satisfy enable_structural_ncrna='on'"
+                )
             if (
                 not isinstance(done_nc, dict)
                 or done_nc.get("raw_candidates_sha256") != actual_nc_sha
                 or done_nc.get("cache_key") != exp_nc_ck
-                or done_nc.get("asset_sha256") != ncrna_mod.PINNED_RFAM_ASSETS
+                or done_nc.get("asset_sha256") != exp_asset_sha_c
             ):
                 raise RuntimeError(f"Stale or tampered structural ncRNA done.json in {ncrna_dir}")
-            rdir_cand = ncrna_mod.default_rfam_dir()
-            for fname, exp_sha in ncrna_mod.PINNED_RFAM_ASSETS.items():
-                fp = rdir_cand / fname
-                if fp.is_file() and _sha256_file(fp) != exp_sha:
-                    raise RuntimeError(f"Pinned Rfam 15.1 SHA256 mismatch for {fp}")
+            if rfam_used_c:
+                rdir_cand = ncrna_mod.default_rfam_dir()
+                for fname, exp_sha in ncrna_mod.PINNED_RFAM_ASSETS.items():
+                    fp = rdir_cand / fname
+                    if fp.is_file() and _sha256_file(fp) != exp_sha:
+                        raise RuntimeError(f"Pinned Rfam 15.1 SHA256 mismatch for {fp}")
             ncrna_raw_c = [] if nc_mode == "off" else list(ncrna_raw_loaded)
             ncrna_info_c = (
                 {"status": "disabled", "n_raw_candidates": 0}
@@ -3252,6 +3464,10 @@ class GateRun:
         bf_win_p = ev_dir / "backfill_windows.json"
         use_bf = bool(self.lp.cpu_focaloop_tiberius and self.lp.enable_orphan_backfill)
         eff_lnc_eligible = lnc_eligible_introns
+        m_mp = microexons_from_models(
+            [h for h in s["hits"] if h.quality >= self.sp.hit_candidate_min_quality],
+            max_len=_RESCUE_PARAMS["pair_max_len"],
+        )
         if cached_bam_zoom is None:
             if not bf_gtf_p.exists():
                 bf_gtf_p.write_text("")
@@ -3266,11 +3482,14 @@ class GateRun:
             else:
                 bf_models = []
                 bf_windows = []
+            tib_all = list(s["tiberius"]) + list(bf_models)
+            m_tib = microexons_from_models(tib_all, max_len=_RESCUE_PARAMS["pair_max_len"])
             jl = js.by_contig(min_support=_RESCUE_PARAMS["pair_min_support"])
             micro_pairs = microexons_from_junction_pairs(
                 jl, min_support=_RESCUE_PARAMS["pair_min_support"], max_len=_RESCUE_PARAMS["pair_max_len"]
             )
-            micro_clip = (
+            clip_sides: dict[tuple[str, int, int], dict[tuple[int, int], tuple[int, int]]] = {}
+            micro_clip_raw = (
                 rescue_microexons_from_bam(
                     [str(merged)],
                     jl,
@@ -3279,10 +3498,27 @@ class GateRun:
                     min_intron=_RESCUE_PARAMS["min_intron"],
                     min_clip=_RESCUE_PARAMS["min_clip"],
                     max_reads_per_site=_RESCUE_PARAMS["max_reads_per_site"],
+                    sided_votes_out=clip_sides,
                 )
                 if merged.exists()
                 else {}
             )
+            # #56: Require independent corroboration (paired junctions, Tiberius/miniprot model, or bidirectional
+            # >=2 donor + >=2 acceptor soft-clip votes) before inserting 1-codon (3 bp) soft-clip micro-exons.
+            micro_clip: dict[tuple[str, int, int], list[tuple[int, int, int]]] = {}
+            for gk, cvals in micro_clip_raw.items():
+                pair_coords = {(x, y) for x, y, _ in micro_pairs.get(gk, [])}
+                model_coords = {(x, y) for x, y, _ in m_tib.get(gk, [])} | {(x, y) for x, y, _ in m_mp.get(gk, [])}
+                sides_gk = clip_sides.get(gk, {})
+                kept_cvals: list[tuple[int, int, int]] = []
+                for ms, me, sup in cvals:
+                    if me - ms <= 3:
+                        r_cnt, l_cnt = sides_gk.get((ms, me), (0, 0))
+                        if (ms, me) not in pair_coords and (ms, me) not in model_coords and not (r_cnt >= 2 and l_cnt >= 2):
+                            continue
+                    kept_cvals.append((ms, me, sup))
+                if kept_cvals:
+                    micro_clip[gk] = kept_cvals
             rna_direct = merge_microexon_maps(micro_pairs, micro_clip)
             n_pairs = sum(len(v) for v in micro_pairs.values())
             n_clip = sum(len(v) for v in micro_clip.values())
@@ -3322,16 +3558,10 @@ class GateRun:
             bf_windows = bf_windows_c if use_bf else []
             n_pairs = cached_counts["junction_pairs"]
             n_clip = cached_counts["softclip"]
-
-        # B3: Merge backfill models into a fresh copy (never mutating s["tiberius"] or seed/partition.pkl)
-        tib_all = list(s["tiberius"]) + list(bf_models)
+            tib_all = list(s["tiberius"]) + list(bf_models)
+            m_tib = microexons_from_models(tib_all, max_len=_RESCUE_PARAMS["pair_max_len"])
 
         # model-called micro-exons need independent corroboration: Tiberius AND miniprot agree, or direct RNA evidence
-        m_tib = microexons_from_models(tib_all, max_len=_RESCUE_PARAMS["pair_max_len"])
-        m_mp = microexons_from_models(
-            [h for h in s["hits"] if h.quality >= self.sp.hit_candidate_min_quality],
-            max_len=_RESCUE_PARAMS["pair_max_len"],
-        )
         micro_models = {}
         for k, v in m_tib.items():
             corrob = {(x, y) for x, y, _ in m_mp.get(k, [])} | {(x, y) for x, y, _ in rna_direct.get(k, [])}
@@ -3350,7 +3580,7 @@ class GateRun:
             raw_alignments=ctx["raw_alignments"], bait_intervals=ctx["bait_intervals"],
             organelle_contigs=ctx["organelle_contigs"], readthrough_targets=eff_rt_ids,
             raw_ncrna_candidates=raw_ncrna, scanned_tib_windows=scanned_wins, gap_continuity=gap_cont,
-            lnc_eligible_introns=eff_lnc_eligible,
+            lnc_eligible_introns=eff_lnc_eligible, threads=self.lp.threads,
         )
         write_gff3(res.models, cd / f"arm{self.c_tag}.gff3")
         synth_wall = time.time() - t3
@@ -3362,6 +3592,7 @@ class GateRun:
                 bait_intervals=ctx["bait_intervals"], organelle_contigs=ctx["organelle_contigs"],
                 readthrough_targets=eff_rt_ids, raw_ncrna_candidates=raw_ncrna,
                 scanned_tib_windows=scanned_wins, lnc_eligible_introns=eff_lnc_eligible,
+                threads=self.lp.threads,
             )
             write_gff3(res_nz.models, cd / f"arm{self.c_tag}_nozoom.gff3")
             nz_stats = res_nz.stats
@@ -3473,7 +3704,7 @@ class GateRun:
             params=self.sp, prefix="GLB",
             bait_intervals=ctx["bait_intervals"], organelle_contigs=ctx["organelle_contigs"],
             readthrough_targets=ctx["readthrough_targets"], raw_ncrna_candidates=raw_ncrna,
-            scanned_tib_windows=scanned_wins,
+            scanned_tib_windows=scanned_wins, threads=self.lp.threads,
         )
         write_gff3(res.models, bd / "armB.gff3")
         tot_cpu = (self_cpu() - c0) + float(res.stats.get("diamond_cpu_s", 0.0))
@@ -3754,19 +3985,54 @@ def _activate(glc: Path, out: Path, mult: Path | None = None, cand: Path | None 
 
 
 def _cat_sort(bams: list[str], out: Path, threads: int) -> float:
-    env = safe_env()
-    cat = subprocess.Popen(["samtools", "cat", "-o", "-"] + bams, stdout=subprocess.PIPE, env=env)
-    srt = subprocess.Popen(["samtools", "sort", "-@", str(min(8, threads)), "-m", "1G", "-T", f"{out}.tmp", "-o", str(out), "-"],
-                           stdin=cat.stdout, env=env)
-    cat.stdout.close()
-    from .telemetry import wait_rusage
-
-    _, u1, s1 = wait_rusage(cat)
-    rc, u2, s2 = wait_rusage(srt)
-    if rc != 0:
-        raise RuntimeError("samtools sort failed")
-    _, _, u3, s3 = run_cmd(["samtools", "index", str(out)])
-    return u1 + s1 + u2 + s2 + u3 + s3
+    """Coordinate-sort and name-aware merge BAMs (never using samtools cat across mismatched @SQ headers)."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sort_threads = max(1, min(8, int(threads)))
+    sort_mem = samtools_sort_mem_arg(sort_threads)
+    cpu_tot = 0.0
+    if len(bams) == 1:
+        _, _, u1, s1 = run_cmd(
+            [
+                "samtools", "sort",
+                "-@", str(sort_threads),
+                "-m", sort_mem,
+                "-T", f"{out}.tmp",
+                "-o", str(out),
+                str(bams[0]),
+            ]
+        )
+        cpu_tot += u1 + s1
+    else:
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f".{out.name}.merge.", dir=str(out.parent)))
+        try:
+            sorted_parts: list[str] = []
+            for idx_b, bam_p in enumerate(bams):
+                part_bam = tmp_dir / f"part_{idx_b:04d}.sorted.bam"
+                _, _, us, ss = run_cmd(
+                    [
+                        "samtools", "sort",
+                        "-@", str(sort_threads),
+                        "-m", sort_mem,
+                        "-T", str(tmp_dir / f"sort_{idx_b:04d}"),
+                        "-o", str(part_bam),
+                        str(bam_p),
+                    ]
+                )
+                cpu_tot += us + ss
+                sorted_parts.append(str(part_bam))
+            _, _, um, sm = run_cmd(
+                [
+                    "samtools", "merge", "-f",
+                    "-@", str(max(1, min(16, int(threads)))),
+                    "-o", str(out),
+                    *sorted_parts,
+                ]
+            )
+            cpu_tot += um + sm
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    _, _, ui, si = run_cmd(["samtools", "index", str(out)])
+    return cpu_tot + ui + si
 
 
 def _tib_summary(r: StageRecord) -> dict:

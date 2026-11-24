@@ -41,7 +41,7 @@ dUTP (ISR / SR) orientation, so per-run strandedness can be inferred afterwards.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import ctypes
 import gzip
@@ -742,7 +742,10 @@ class MappyKernel(Kernel):
                 spans = [(s, min(n, s + step)) for s in range(cur, n, step)]
                 _FORK_CTX = (self.aligner, cal, r1, r2, trace)
                 try:
-                    with mp.get_context("fork").Pool(processes=min(nproc, len(spans))) as pool:
+                    with ProcessPoolExecutor(
+                        max_workers=min(nproc, len(spans)),
+                        mp_context=mp.get_context("fork"),
+                    ) as pool:
                         for res in pool.map(_fork_worker, spans):
                             out.merge(res)
                 finally:
@@ -752,6 +755,16 @@ class MappyKernel(Kernel):
         out.n_reads = n
         out.wall_seconds = time.time() - t0
         return out
+
+
+def _tail_stderr(err_fh, max_chars: int = 2000) -> str:
+    try:
+        err_fh.seek(0)
+        raw = err_fh.read()
+        txt = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        return " | ".join(ln.strip() for ln in txt.strip().splitlines() if ln.strip())[-max_chars:]
+    except Exception:
+        return ""
 
 
 class SamKernel(Kernel):
@@ -783,14 +796,18 @@ class SamKernel(Kernel):
         if self.index_kind == "bwa":
             prefix = idx_dir / "bwa_mem2_idx"
             if not Path(f"{prefix}.bwt.2bit.64").exists():
-                subprocess.run([tool_path("bwa-mem2"), "index", "-p", str(prefix), str(fasta)], check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                r = subprocess.run([tool_path("bwa-mem2"), "index", "-p", str(prefix), str(fasta)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"bwa-mem2 index failed with exit code {r.returncode}: {(r.stderr or '').strip()[-2000:]}")
             self.index_paths["idx"] = prefix
         elif self.index_kind == "bt2":
             prefix = idx_dir / "bowtie2_idx"
             if not Path(f"{prefix}.1.bt2").exists() and not Path(f"{prefix}.1.bt2l").exists():
-                subprocess.run([tool_path("bowtie2-build"), "--quiet", "--threads", str(self.threads), str(fasta), str(prefix)],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                r = subprocess.run([tool_path("bowtie2-build"), "--quiet", "--threads", str(self.threads), str(fasta), str(prefix)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"bowtie2-build failed with exit code {r.returncode}: {(r.stderr or '').strip()[-2000:]}")
             self.index_paths["idx"] = prefix
         else:
             self.index_paths["idx"] = Path(fasta)
@@ -807,25 +824,32 @@ class SamKernel(Kernel):
         n = len(r1) if r2 is None else min(len(r1), len(r2))
         if n == 0:
             return MapResult()
-        proc = subprocess.Popen(self.command(paired), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=4 * 1024 * 1024)
-        assert proc.stdin is not None and proc.stdout is not None
-        pf = _NAME_PREFIX.get()
+        with tempfile.SpooledTemporaryFile(max_size=65536, mode="w+b") as err_fh:
+            proc = subprocess.Popen(self.command(paired), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=err_fh, bufsize=4 * 1024 * 1024)
+            assert proc.stdin is not None and proc.stdout is not None
+            pf = _NAME_PREFIX.get()
 
-        def _feed() -> None:
-            try:
-                for blk in _iter_interleaved_fastq_chunks(r1[:n], r2[:n] if paired else None, pf=pf):
-                    proc.stdin.write(blk)
-            except BrokenPipeError:
-                pass
-            finally:
-                proc.stdin.close()
+            def _feed() -> None:
+                try:
+                    for blk in _iter_interleaved_fastq_chunks(r1[:n], r2[:n] if paired else None, pf=pf):
+                        proc.stdin.write(blk)
+                except BrokenPipeError:
+                    pass
+                finally:
+                    proc.stdin.close()
 
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_feed)
-            res = parse_sam_stream(proc.stdout, self.as_scale, paired, trace)
-            fut.result()
-        proc.wait()
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_feed)
+                res = parse_sam_stream(proc.stdout, self.as_scale, paired, trace)
+                fut.result()
+            rc = proc.wait()
+            if rc != 0:
+                detail = _tail_stderr(err_fh)
+                raise RuntimeError(
+                    f"{self.name} ({self.exe}) failed with exit code {rc}"
+                    + (f": {detail}" if detail else "")
+                )
         res.n_reads = n
         res.wall_seconds = time.time() - t0
         return res
@@ -902,13 +926,16 @@ class SalmonKernel(Kernel):
             Path(idx_dir), self.name, [Path(fasta)] + ([Path(decoys_txt)] if decoys_txt else []),
             extra_tag="k31", index_cache_dir=kw.get("index_cache_dir"),
         )
+        eff_dir.mkdir(parents=True, exist_ok=True)
         idx = eff_dir / "salmon_idx"
         self.index_paths["fasta"] = Path(fasta)
         if not (idx / "versionInfo.json").exists() and not (idx / "info.json").exists():
             cmd = [tool_path("salmon"), "index", "-t", str(fasta), "-i", str(idx), "-k", "31", "-p", str(self.threads)]
             if decoys_txt is not None:
                 cmd += ["-d", str(decoys_txt)]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"salmon index failed with exit code {r.returncode}: {(r.stderr or '').strip()[-2000:]}")
         self.index_paths["idx"] = idx
 
     def map_batch(self, r1: list[Read], r2: list[Read] | None, calibrator: OnlineErrorCalibrator | None = None,
@@ -928,7 +955,10 @@ class SalmonKernel(Kernel):
             f1 = td / "r1.fq"
             write_fastq(f1, r1_in, "/1" if r2_in is not None else "")
             cmd = [tool_path("salmon"), "quant", "-i", str(self.index_paths["idx"]), "-l", "A", "-p", str(self.threads),
-                   "-o", str(td / "q"), "--dumpEqWeights", "-q"] + self.extra_args
+                   "-o", str(td / "q"), "--dumpEqWeights", "-q"]
+            if "--minAssignedFrags" not in self.extra_args:
+                cmd += ["--minAssignedFrags", "1"]
+            cmd += list(self.extra_args)
             if trace:
                 cmd += ["--writeMappings", str(td / "map.sam")]
             if r2_in is not None:
@@ -937,17 +967,55 @@ class SalmonKernel(Kernel):
                 cmd += ["-1", str(f1), "-2", str(f2)]
             else:
                 cmd += ["-r", str(f1)]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            meta_p = td / "q" / "aux_info" / "meta_info.json"
+            zero_assigned = False
+            if meta_p.exists():
+                try:
+                    minfo = json.loads(meta_p.read_text())
+                    if int(minfo.get("num_mapped", -1)) == 0 or int(minfo.get("num_assigned_fragments", -1)) == 0:
+                        zero_assigned = True
+                except Exception:
+                    pass
+            stderr_txt = (proc.stderr or "").strip()
+            stderr_low = stderr_txt.lower()
+            if any(tok in stderr_low for tok in (
+                "num_assigned_fragments == 0",
+                "insufficient assigned fragments",
+                "0 fragments were mapped",
+                "0 fragments were assigned",
+                "fewer than",
+            )):
+                zero_assigned = True
+            if proc.returncode != 0:
+                if zero_assigned:
+                    res.n_reads = n
+                    res.wall_seconds = time.time() - t0
+                    if trace:
+                        res.per_read = {}
+                    return res
+                raise RuntimeError(
+                    f"salmon quant failed with exit code {proc.returncode}"
+                    + (f": {stderr_txt[-2000:]}" if stderr_txt else "")
+                )
             if trace and (td / "map.sam").exists():
                 with open(td / "map.sam", "rb") as fh:
                     traced = parse_sam_stream(fh, 0.0, r2 is not None, trace=True)
                 res.per_read = traced.per_read or {}
+            elif trace:
+                res.per_read = {}
             mode, p_rev = _salmon_lib_orientation(td / "q")
             eff_lens = _salmon_eff_lengths(td / "q")
             flag_val = False if mode == "forward" else True
             eq = td / "q" / "aux_info" / "eq_classes.txt.gz"
             if not eq.exists():
                 eq = td / "q" / "aux_info" / "eq_classes.txt"
+            if not eq.exists():
+                if zero_assigned:
+                    res.n_reads = n
+                    res.wall_seconds = time.time() - t0
+                    return res
+                raise RuntimeError("salmon quant completed without writing eq_classes output")
             opener = gzip.open if str(eq).endswith(".gz") else open
             with opener(eq, "rt") as fh:
                 n_tx = int(fh.readline())
@@ -1008,13 +1076,22 @@ class KallistoKernel(Kernel):
         return tool_path("kallisto") is not None and tool_path("samtools") is not None
 
     def ensure_index(self, fasta: Path, idx_dir: Path, **kw) -> None:
-        idx = Path(idx_dir) / "kallisto.idx"
+        idx_dir_p = Path(idx_dir)
+        idx_dir_p.mkdir(parents=True, exist_ok=True)
+        idx = idx_dir_p / "kallisto.idx"
         self.index_paths["fasta"] = Path(fasta)
         if not idx.exists():
-            ktmp = Path(idx_dir) / "kallisto_tmp"      # kallisto defaults to ./tmp, which collides between concurrent jobs
-            subprocess.run([tool_path("kallisto"), "index", "-i", str(idx), "-t", str(self.threads), "-T", str(ktmp), str(fasta)], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            shutil.rmtree(ktmp, ignore_errors=True)
+            ktmp = idx_dir_p / "kallisto_tmp"      # kallisto defaults to ./tmp, which collides between concurrent jobs
+            ktmp.mkdir(parents=True, exist_ok=True)
+            try:
+                r = subprocess.run(
+                    [tool_path("kallisto"), "index", "-i", str(idx), "-t", str(self.threads), "-T", str(ktmp), str(fasta)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                )
+                if r.returncode != 0:
+                    raise RuntimeError(f"kallisto index failed with exit code {r.returncode}: {(r.stderr or '').strip()[-2000:]}")
+            finally:
+                shutil.rmtree(ktmp, ignore_errors=True)
         self.index_paths["idx"] = idx
 
     def map_batch(self, r1: list[Read], r2: list[Read] | None, calibrator: OnlineErrorCalibrator | None = None,
@@ -1035,11 +1112,37 @@ class KallistoKernel(Kernel):
                 cmd += [str(f1), str(f2)]
             else:
                 cmd += ["--single", "-l", str(self.frag_len), "-s", str(self.frag_sd), str(f1)]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            kproc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            run_info_p = td / "q" / "run_info.json"
+            zero_pseudo = False
+            if run_info_p.exists():
+                try:
+                    rinfo = json.loads(run_info_p.read_text())
+                    if int(rinfo.get("n_pseudoaligned", -1)) == 0:
+                        zero_pseudo = True
+                except Exception:
+                    pass
+            kerr = (kproc.stderr or "").strip()
+            if "zero reads pseudoaligned" in kerr.lower() or "0 reads pseudoaligned" in kerr.lower():
+                zero_pseudo = True
+            if kproc.returncode != 0:
+                if zero_pseudo:
+                    return MapResult(n_reads=n, n_mapped=0, wall_seconds=time.time() - t0, per_read=({} if trace else None))
+                raise RuntimeError(
+                    f"kallisto quant failed with exit code {kproc.returncode}"
+                    + (f": {kerr[-2000:]}" if kerr else "")
+                )
             bam = td / "q" / "pseudoalignments.bam"
-            proc = subprocess.Popen([tool_path("samtools"), "view", str(bam)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            res = parse_sam_stream(proc.stdout, 0.0, r2 is not None, trace)
-            proc.wait()
+            if not bam.exists() and zero_pseudo:
+                return MapResult(n_reads=n, n_mapped=0, wall_seconds=time.time() - t0, per_read=({} if trace else None))
+            with tempfile.SpooledTemporaryFile(max_size=65536, mode="w+b") as err_fh:
+                proc = subprocess.Popen([tool_path("samtools"), "view", str(bam)], stdout=subprocess.PIPE, stderr=err_fh)
+                assert proc.stdout is not None
+                res = parse_sam_stream(proc.stdout, 0.0, r2 is not None, trace)
+                rc = proc.wait()
+                if rc != 0:
+                    detail = _tail_stderr(err_fh)
+                    raise RuntimeError(f"samtools view failed with exit code {rc}" + (f": {detail}" if detail else ""))
         res.n_reads = n
         res.wall_seconds = time.time() - t0
         return res
@@ -1177,11 +1280,18 @@ class StarKernel(Kernel):
                    "--outFilterMultimapNmax", "20",
                    "--quantTranscriptomeBan", "Singleend", "--outFileNamePrefix", str(td / "s_"),
                    "--outSAMattributes", "NH", "HI", "AS", "nM"]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            r_star = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if r_star.returncode != 0:
+                raise RuntimeError(f"STAR failed with exit code {r_star.returncode}: {(r_star.stderr or '').strip()[-2000:]}")
             bam = td / "s_Aligned.toTranscriptome.out.bam"
-            proc = subprocess.Popen([tool_path("samtools"), "view", str(bam)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            res = parse_sam_stream(proc.stdout, 1.0, r2 is not None, trace)
-            proc.wait()
+            with tempfile.SpooledTemporaryFile(max_size=65536, mode="w+b") as err_fh:
+                proc = subprocess.Popen([tool_path("samtools"), "view", str(bam)], stdout=subprocess.PIPE, stderr=err_fh)
+                assert proc.stdout is not None
+                res = parse_sam_stream(proc.stdout, 1.0, r2 is not None, trace)
+                rc = proc.wait()
+                if rc != 0:
+                    detail = _tail_stderr(err_fh)
+                    raise RuntimeError(f"samtools view failed with exit code {rc}" + (f": {detail}" if detail else ""))
         res.n_reads = n
         res.wall_seconds = time.time() - t0
         return res
@@ -1817,34 +1927,51 @@ def read_rad_bulk(path: str | Path) -> tuple[list[str], list[list[tuple[int, int
 
     Returns (reference names, records) where every record is the list of (ref index, orientation) alignments of
     one mapped fragment, in file order.  ``compressed_ori_ref`` keeps the reference id in the low 30 bits and the
-    orientation in the top two: 0b10 = read 1 forward, 0b01 = read 1 reverse complement (0b00 / 0b11 unknown).  Unmapped fragments are absent from RAD.  Tag descriptions are read from the
-    header, so extra read- or alignment-level tags are skipped by their declared widths."""
-    import struct
-
+    orientation in the top two: 0b10 = read 1 forward, 0b01 = read 1 reverse complement (0b00 / 0b11 unknown).
+    For second-mate orphans (``frag_map_type == 3``), piscem stores mate-2 orientation, which is inverted here to
+    true fragment/R1 orientation (#11).  Truncated headers or chunks raise ``RuntimeError`` (L76)."""
     data = Path(path).read_bytes()
+    total_len = len(data)
+    if total_len < 17:
+        raise RuntimeError(f"Truncated or empty RAD file: {path} ({total_len} bytes)")
     o = 0
+
+    def _need(nb: int) -> None:
+        if nb < 0 or o + nb > total_len:
+            raise RuntimeError(f"Truncated RAD file {path} at byte offset {o} (needed {nb} bytes, size {total_len})")
+
     if data[:8] == b"RAD_FILE":
+        _need(14)
         o = 8 + 6                                    # magic + format version / flags
+    _need(9)
     is_paired = data[o]; o += 1
     (nref,) = struct.unpack_from("<Q", data, o); o += 8
     names = []
     for _ in range(nref):
+        _need(2)
         (L,) = struct.unpack_from("<H", data, o); o += 2
-        names.append(data[o:o + L].decode()); o += L
-    (_nchunks,) = struct.unpack_from("<Q", data, o); o += 8
+        _need(L)
+        names.append(data[o:o + L].decode("utf-8", errors="replace")); o += L
+    _need(8)
+    (expected_chunks,) = struct.unpack_from("<Q", data, o); o += 8
     width = {1: 1, 2: 2, 3: 4, 4: 8, 5: 4, 6: 8}
 
     def read_descs():
         nonlocal o
+        _need(2)
         (cnt,) = struct.unpack_from("<H", data, o); o += 2
         out = []
         for _ in range(cnt):
+            _need(2)
             (L,) = struct.unpack_from("<H", data, o); o += 2
-            nm = data[o:o + L].decode(); o += L
+            _need(L + 1)
+            nm = data[o:o + L].decode("utf-8", errors="replace"); o += L
             ty = data[o]; o += 1
             sub = None
             if ty == 7:
+                _need(2)
                 sub = (data[o], data[o + 1]); o += 2
+            _need(2)
             o += 2                                    # tag id
             out.append((nm, ty, sub))
         return out
@@ -1854,31 +1981,95 @@ def read_rad_bulk(path: str | Path) -> tuple[list[str], list[list[tuple[int, int
     aln_tags = read_descs()
     for _nm, ty, sub in file_tags:                    # skip file-level tag values
         if ty == 8:
-            (L,) = struct.unpack_from("<H", data, o); o += 2 + L
+            _need(2)
+            (L,) = struct.unpack_from("<H", data, o); o += 2
+            _need(L)
+            o += L
         elif ty == 7:
+            if sub is None or sub[0] not in width or sub[1] not in width:
+                raise RuntimeError(f"Unsupported RAD array tag descriptor in {path}")
             lw, ew = width[sub[0]], width[sub[1]]
-            n = int.from_bytes(data[o:o + lw], "little"); o += lw + n * ew
+            _need(lw)
+            n = int.from_bytes(data[o:o + lw], "little"); o += lw
+            _need(n * ew)
+            o += n * ew
         else:
+            if ty not in width:
+                raise RuntimeError(f"Unsupported RAD file tag type {ty} in {path}")
+            _need(width[ty])
             o += width[ty]
-    rw = sum(width[t] for _, t, _ in read_tags)
+
+    if any(t not in width for _, t, _ in read_tags) or any(t not in width for _, t, _ in aln_tags):
+        raise RuntimeError(f"Unsupported RAD read/alignment tag type in {path}")
+    r_widths = [width[t] for _, t, _ in read_tags]
+    rw = sum(r_widths)
     aw = [width[t] for _, t, _ in aln_tags]
-    ori_i = next(i for i, (nm, _, _) in enumerate(aln_tags) if nm.startswith("compressed_ori_ref"))
+    ori_i = next((i for i, (nm, _, _) in enumerate(aln_tags) if nm.startswith("compressed_ori_ref")), -1)
+    if ori_i < 0:
+        raise RuntimeError(f"Missing compressed_ori_ref alignment tag in RAD file {path}")
     ori_off = sum(aw[:ori_i])
     astride = sum(aw)
+
+    fmt_scope = 0  # 0=absent, 1=read_tag, 2=aln_tag
+    fmt_off = 0
+    fmt_w = 0
+    for ri_t, (nm, ty, _) in enumerate(read_tags):
+        if nm in ("frag_map_type", "map_type") and width[ty] in (1, 2, 4):
+            fmt_scope = 1
+            fmt_off = sum(r_widths[:ri_t])
+            fmt_w = width[ty]
+            break
+    if fmt_scope == 0:
+        for ai_t, (nm, ty, _) in enumerate(aln_tags):
+            if nm in ("frag_map_type", "map_type") and width[ty] in (1, 2, 4):
+                fmt_scope = 2
+                fmt_off = sum(aw[:ai_t])
+                fmt_w = width[ty]
+                break
+
+    def _read_uint(pos: int, w_b: int) -> int:
+        return int.from_bytes(data[pos:pos + w_b], "little")
+
     recs: list[list[tuple[int, int]]] = []
-    while o + 8 <= len(data):
+    chunks_seen = 0
+    while o < total_len:
+        if o + 8 > total_len:
+            raise RuntimeError(f"Truncated RAD chunk header in {path} at offset {o} (size {total_len})")
         nbytes, nrec = struct.unpack_from("<II", data, o)
+        if nbytes < 8 or o + nbytes > total_len:
+            raise RuntimeError(
+                f"Truncated RAD chunk body in {path} at offset {o} (chunk nbytes={nbytes}, size={total_len})"
+            )
         end = o + nbytes
         o += 8
         for _ in range(nrec):
-            (na,) = struct.unpack_from("<I", data, o); o += 4 + rw
+            if o + 4 + rw > end:
+                raise RuntimeError(f"Truncated RAD record in {path} at offset {o} (chunk_end={end})")
+            (na,) = struct.unpack_from("<I", data, o)
+            rec_fmt = _read_uint(o + 4 + fmt_off, fmt_w) if fmt_scope == 1 else 0
+            o += 4 + rw
+            if o + na * astride > end:
+                raise RuntimeError(f"Truncated RAD alignment array in {path} at offset {o} (na={na}, chunk_end={end})")
             alns = []
             for _a in range(na):
                 (v,) = struct.unpack_from("<I", data, o + ori_off)
-                alns.append((v & 0x3FFFFFFF, v >> 30))
+                ref_i = v & 0x3FFFFFFF
+                if ref_i >= nref:
+                    raise RuntimeError(f"Corrupt RAD ref_idx={ref_i} >= nref={nref} in {path}")
+                ori = v >> 30
+                aln_fmt = _read_uint(o + fmt_off, fmt_w) if fmt_scope == 2 else rec_fmt
+                if aln_fmt == 3 and ori in (1, 2):
+                    ori = 3 - ori
+                alns.append((ref_i, ori))
                 o += astride
             recs.append(alns)
-        o = end
+        if o != end:
+            raise RuntimeError(f"Corrupt RAD chunk framing in {path}: ended at {o}, expected {end}")
+        chunks_seen += 1
+    if expected_chunks > 0 and chunks_seen != expected_chunks:
+        raise RuntimeError(
+            f"Truncated RAD stream in {path}: expected {expected_chunks} chunk(s), saw {chunks_seen}"
+        )
     _ = is_paired
     return names, recs
 
@@ -1921,9 +2112,13 @@ class PiscemKernel(Kernel):
             with open(ref, "w") as out, open(fasta) as fin:
                 shutil.copyfileobj(fin, out)
                 out.write(f"\n>{SENTINEL_ID}\n{_sentinel_seq()}\n")
-            subprocess.run([tool_path("piscem"), "build", "-s", str(ref), "-k", str(self.k), "-m", str(self.m), "-t", str(self.threads),
-                            "-o", str(idx)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(idx_dir))
+            r_build = subprocess.run(
+                [tool_path("piscem"), "build", "-s", str(ref), "-k", str(self.k), "-m", str(self.m), "-t", str(self.threads), "-o", str(idx)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, cwd=str(idx_dir),
+            )
             ref.unlink(missing_ok=True)
+            if r_build.returncode != 0:
+                raise RuntimeError(f"piscem build failed with exit code {r_build.returncode}: {(r_build.stderr or '').strip()[-2000:]}")
         self.index_paths["idx"] = idx
 
     def _run_cmd(self, td: Path, r1: list[Read], r2: list[Read] | None, threads: int, tag: str) -> Path:
@@ -1935,7 +2130,9 @@ class PiscemKernel(Kernel):
             cmd += ["-1", str(f1), "-2", str(f2)]
         else:
             cmd += ["-r", str(f1)]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        r_map = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if r_map.returncode != 0:
+            raise RuntimeError(f"piscem map-bulk failed with exit code {r_map.returncode}: {(r_map.stderr or '').strip()[-2000:]}")
         return td / f"{tag}.rad"
 
     def _run(self, td: Path, r1: list[Read], r2: list[Read] | None, threads: int, tag: str):
@@ -1943,9 +2140,19 @@ class PiscemKernel(Kernel):
         return read_rad_bulk(rad_path)
 
     @staticmethod
-    def _cands(alns: list[tuple[int, int]], names: list[str]) -> dict[tuple[str, bool], float]:
-        # dUTP orientation == read 1 reverse complement (ori 0b01); forward (0b10) is the other strand
-        return {(names[r], ori != 2): 0.0 for r, ori in alns}
+    def _cands(alns: list[tuple], names: list[str]) -> dict[tuple[str, bool], float]:
+        # dUTP orientation == read 1 reverse complement (ori 0b01); forward (0b10) is the other strand.
+        # If raw frag_map_type == 3 is passed explicitly as a 3-tuple (r, ori, fmt), invert mate-2 ori (#11).
+        out: dict[tuple[str, bool], float] = {}
+        for item in alns:
+            if len(item) >= 3:
+                r, ori, fmt = item[0], item[1], item[2]
+                fl = (ori == 2) if fmt == 3 else (ori != 2)
+            else:
+                r, ori = item[0], item[1]
+                fl = (ori != 2)
+            out[(names[r], fl)] = 0.0
+        return out
 
     def map_batch(self, r1: list[Read], r2: list[Read] | None, calibrator: OnlineErrorCalibrator | None = None,
                   trace: bool = False) -> MapResult:
@@ -1976,11 +2183,12 @@ class PiscemKernel(Kernel):
                     if c:
                         resolve_pair(c, None, res)
             if trace:
-                # single-thread pass with a sentinel fragment after every read: RAD keeps input order with one
-                # thread and drops unmapped fragments, so sentinel records delimit read indices.
+                # single-thread pass with a fixed >=100-bp sentinel fragment after every read: RAD keeps input order
+                # with one thread and drops unmapped fragments, so sentinel records delimit read indices (L20).
                 s = _sentinel_seq()
-                sr1 = (revcomp_str(s[400:400 + min(100, len(r1[0][0]))]), "I" * min(100, len(r1[0][0])))
-                sr2 = (s[100:100 + min(100, len(r1[0][0]))], "I" * min(100, len(r1[0][0])))
+                slen = max(100, self.k + 20)
+                sr1 = (revcomp_str(s[400:400 + slen]), "I" * slen)
+                sr2 = (s[100:100 + slen], "I" * slen)
                 t1, t2 = [], ([] if r2_in is not None else None)
                 for i in range(n):
                     t1 += [r1_in[i], sr1]
@@ -1990,14 +2198,20 @@ class PiscemKernel(Kernel):
                 sid = tnames.index(SENTINEL_ID)
                 per: dict[int, tuple[tuple[str, ...], tuple[bool, ...]]] = {}
                 i = 0
+                n_sentinels = 0
                 for alns in trecs:
                     if alns and all(r == sid for r, _ in alns):
                         i += 1
+                        n_sentinels += 1
                         continue
                     tmp = MapResult()
                     resolve_pair(self._cands(alns, tnames), None, tmp, read_idx=i)
                     if tmp.per_read:
                         per.update(tmp.per_read)
+                if n_sentinels != n:
+                    raise RuntimeError(
+                        f"Piscem trace sentinel count mismatch: expected {n} sentinel fragments, observed {n_sentinels}"
+                    )
                 res.per_read = per
         res.n_reads = n
         res.wall_seconds = wall

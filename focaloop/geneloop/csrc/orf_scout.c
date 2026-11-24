@@ -23,8 +23,8 @@ typedef uint8_t u8;
 
 typedef struct {
     int contig_idx;
-    int start;
-    int end;
+    int64_t start;
+    int64_t end;
     int strand;
     float gc;
     float dinuc_entropy;
@@ -150,7 +150,7 @@ static int st_grow(SyncTable *t) {
 /* --------------------------------------------------------------------------
  * Canonical open syncmer scanner (identical semantics to glcore.c)
  * -------------------------------------------------------------------------- */
-static void scan_seq_syncmers_insert(const char *seq, int len, int k, int s, SyncTable *ht) {
+static void scan_seq_syncmers_insert(const char *seq, int64_t len, int k, int s, SyncTable *ht) {
     if (len < k || k <= 0 || s <= 0 || s > k || k > 32) return;
     const int n_s = k - s + 1;
     const int target_off = (k - s) / 2;
@@ -159,8 +159,8 @@ static void scan_seq_syncmers_insert(const char *seq, int len, int k, int s, Syn
     const int rc_shift = 2 * (k - 1);
 
     u64 f = 0, r = 0;
-    int run = 0;
-    for (int i = 0; i < len; i++) {
+    int64_t run = 0;
+    for (int64_t i = 0; i < len; i++) {
         u8 b = BASE_CODE[(unsigned char)seq[i]];
         if (b > 3) {
             run = 0;
@@ -188,7 +188,7 @@ static void scan_seq_syncmers_insert(const char *seq, int len, int k, int s, Syn
     }
 }
 
-static void scan_seq_syncmers_count(const char *seq, int len, int k, int s, SyncTable *ht, u32 cap_mult) {
+static void scan_seq_syncmers_count(const char *seq, int64_t len, int k, int s, SyncTable *ht, u32 cap_mult) {
     if (len < k || k <= 0 || s <= 0 || s > k || k > 32) return;
     const int n_s = k - s + 1;
     const int target_off = (k - s) / 2;
@@ -197,8 +197,8 @@ static void scan_seq_syncmers_count(const char *seq, int len, int k, int s, Sync
     const int rc_shift = 2 * (k - 1);
 
     u64 f = 0, r = 0;
-    int run = 0;
-    for (int i = 0; i < len; i++) {
+    int64_t run = 0;
+    for (int64_t i = 0; i < len; i++) {
         u8 b = BASE_CODE[(unsigned char)seq[i]];
         if (b > 3) {
             run = 0;
@@ -233,7 +233,7 @@ static void scan_seq_syncmers_count(const char *seq, int len, int k, int s, Sync
 }
 
 static void eval_orf_syncmers(
-    const char *seq, int len, int k, int s,
+    const char *seq, int64_t len, int k, int s,
     const SyncTable *ht, int max_sync_mult,
     int *out_n_sync, float *out_lowcopy_frac
 ) {
@@ -249,9 +249,9 @@ static void eval_orf_syncmers(
     const int rc_shift = 2 * (k - 1);
 
     u64 f = 0, r = 0;
-    int run = 0;
-    int n_sync = 0, n_low = 0;
-    for (int i = 0; i < len; i++) {
+    int64_t run = 0;
+    int64_t n_sync = 0, n_low = 0;
+    for (int64_t i = 0; i < len; i++) {
         u8 b = BASE_CODE[(unsigned char)seq[i]];
         if (b > 3) {
             run = 0;
@@ -280,7 +280,7 @@ static void eval_orf_syncmers(
             if ((int)mult <= max_sync_mult) n_low++;
         }
     }
-    *out_n_sync = n_sync;
+    *out_n_sync = (n_sync > INT32_MAX) ? INT32_MAX : (int)n_sync;
     *out_lowcopy_frac = (n_sync > 0) ? ((float)n_low / (float)n_sync) : 0.0f;
 }
 
@@ -288,18 +288,18 @@ static void eval_orf_syncmers(
  * Sequence composition & Shannon dinucleotide entropy check
  * -------------------------------------------------------------------------- */
 static int check_orf_seq(
-    const char *seq, int len,
+    const char *seq, int64_t len,
     float max_soft_n_frac, float min_gc, float max_gc, float min_entropy,
     float *out_gc, float *out_ent, float *out_soft_n
 ) {
     if (len <= 0) return 0;
-    int soft_n = 0, gc_cnt = 0, acgt_cnt = 0;
-    int dinuc[16];
+    int64_t soft_n = 0, gc_cnt = 0, acgt_cnt = 0;
+    int64_t dinuc[16];
     memset(dinuc, 0, sizeof(dinuc));
-    int dinuc_tot = 0;
+    int64_t dinuc_tot = 0;
     u8 prev = 4;
 
-    for (int i = 0; i < len; i++) {
+    for (int64_t i = 0; i < len; i++) {
         unsigned char ch = (unsigned char)seq[i];
         if (IS_SOFT_OR_N[ch]) soft_n++;
         u8 b = BASE_CODE[ch];
@@ -314,10 +314,10 @@ static int check_orf_seq(
         prev = b;
     }
 
-    float sn_frac = (float)soft_n / (float)len;
+    float sn_frac = (float)((double)soft_n / (double)len);
     if (sn_frac >= max_soft_n_frac || acgt_cnt == 0) return 0;
 
-    float gc = (float)gc_cnt / (float)acgt_cnt;
+    float gc = (float)((double)gc_cnt / (double)acgt_cnt);
     if (gc < min_gc || gc > max_gc) return 0;
 
     double H = 0.0;
@@ -325,7 +325,7 @@ static int check_orf_seq(
         double inv = 1.0 / (double)dinuc_tot;
         for (int d = 0; d < 16; d++) {
             if (dinuc[d] > 0) {
-                double p = dinuc[d] * inv;
+                double p = (double)dinuc[d] * inv;
                 H -= p * log2(p);
             }
         }
@@ -358,32 +358,69 @@ static int cv_push(CandVec *v, const OrfCandidate *c) {
 
 typedef struct {
     int contig_idx;
-    int start;
-    int end;
+    int64_t seg_a;
+    int64_t seg_b;
+    int64_t chunk_lo;
+    int64_t chunk_hi;
 } IntervalTask;
 
 static void scan_interval(
-    int ctg_idx, const char *seq, int a, int b,
-    int min_orf_bp, float max_soft_n_frac, float min_gc, float max_gc, float min_entropy,
+    int ctg_idx, const char *seq,
+    int64_t seg_a, int64_t seg_b, int64_t c_lo, int64_t c_hi,
+    int64_t min_orf_bp, float max_soft_n_frac, float min_gc, float max_gc, float min_entropy,
     CandVec *out
 ) {
-    /* Forward (+) strand: frames 0, 1, 2 */
+    /* Forward (+) strand: disjoint ownership of opening ATGs in [c_lo, c_hi),
+     * skipping internal ATGs inside an ORF opened < c_lo and scanning up to seg_b to close open ORFs.
+     */
     for (int frame = 0; frame < 3; frame++) {
-        int orf_start = -1;
-        for (int pos = a + frame; pos + 3 <= b; pos += 3) {
+        int64_t rem = ((c_lo % 3) + 3) % 3;
+        int64_t first = c_lo + ((frame - rem + 3) % 3);
+        if (first >= c_hi || first + 3 > seg_b) continue;
+
+        int in_upstream_orf = 0;
+        if (first > seg_a) {
+            for (int64_t q = first - 3; q >= seg_a; q -= 3) {
+                u8 b0 = BASE_CODE[(unsigned char)seq[q]];
+                u8 b1 = BASE_CODE[(unsigned char)seq[q + 1]];
+                u8 b2 = BASE_CODE[(unsigned char)seq[q + 2]];
+                if (b0 > 3 || b1 > 3 || b2 > 3) {
+                    if (b0 > 3 && b1 > 3 && b2 > 3) break;
+                    continue;
+                }
+                int cod = (b0 << 4) | (b1 << 2) | b2;
+                if (cod == 48 || cod == 50 || cod == 56) break;
+                if (cod == 14) { in_upstream_orf = 1; break; }
+            }
+        }
+
+        int64_t orf_start = -1;
+        for (int64_t pos = first; pos + 3 <= seg_b; pos += 3) {
+            if (orf_start < 0 && pos >= c_hi) break;
             u8 b0 = BASE_CODE[(unsigned char)seq[pos]];
             u8 b1 = BASE_CODE[(unsigned char)seq[pos + 1]];
             u8 b2 = BASE_CODE[(unsigned char)seq[pos + 2]];
             if (b0 > 3 || b1 > 3 || b2 > 3) {
-                if (b0 > 3 && b1 > 3 && b2 > 3) orf_start = -1;
+                if (b0 > 3 && b1 > 3 && b2 > 3) {
+                    in_upstream_orf = 0;
+                    orf_start = -1;
+                    if (pos >= c_hi) break;
+                }
                 continue;
             }
             int cod = (b0 << 4) | (b1 << 2) | b2;
+            if (in_upstream_orf) {
+                if (cod == 48 || cod == 50 || cod == 56) {
+                    in_upstream_orf = 0;
+                    if (pos >= c_hi) break;
+                }
+                continue;
+            }
             if (orf_start < 0) {
                 if (cod == 14) orf_start = pos; /* ATG */
             } else if (cod == 48 || cod == 50 || cod == 56) { /* TAA, TAG, TGA */
-                int orf_end = pos + 3;
-                int len = orf_end - orf_start;
+                int64_t orf_end = pos + 3;
+                int64_t len = orf_end - orf_start;
                 if (len >= min_orf_bp) {
                     float gc = 0.0f, ent = 0.0f, sn = 0.0f;
                     if (check_orf_seq(seq + orf_start, len, max_soft_n_frac, min_gc, max_gc, min_entropy, &gc, &ent, &sn)) {
@@ -392,30 +429,65 @@ static void scan_interval(
                     }
                 }
                 orf_start = -1;
+                if (pos >= c_hi) break;
             }
         }
     }
 
-    /* Reverse (-) strand: frames 0, 1, 2 */
+    /* Reverse (-) strand: disjoint ownership of opening minus-ATGs with pos in [c_lo, c_hi),
+     * skipping internal minus-ATGs inside an ORF opened >= c_hi and scanning down to seg_a to close open ORFs.
+     */
     for (int frame = 0; frame < 3; frame++) {
-        int orf_end = -1;
-        for (int pos = b - frame - 3; pos >= a; pos -= 3) {
+        int64_t max_pos = c_hi - 1;
+        if (max_pos > seg_b - 3) max_pos = seg_b - 3;
+        if (max_pos < c_lo || max_pos < seg_a) continue;
+        int64_t rem = ((max_pos % 3) + 3) % 3;
+        int64_t first = max_pos - ((rem - frame + 3) % 3);
+        if (first < c_lo || first < seg_a) continue;
+
+        int in_upstream_orf = 0;
+        if (first + 6 <= seg_b) {
+            for (int64_t q = first + 3; q + 3 <= seg_b; q += 3) {
+                u8 r0 = BASE_CODE[(unsigned char)seq[q + 2]];
+                u8 r1 = BASE_CODE[(unsigned char)seq[q + 1]];
+                u8 r2 = BASE_CODE[(unsigned char)seq[q]];
+                if (r0 > 3 || r1 > 3 || r2 > 3) {
+                    if (r0 > 3 && r1 > 3 && r2 > 3) break;
+                    continue;
+                }
+                int cod = ((3 - r0) << 4) | ((3 - r1) << 2) | (3 - r2);
+                if (cod == 48 || cod == 50 || cod == 56) break;
+                if (cod == 14) { in_upstream_orf = 1; break; }
+            }
+        }
+
+        int64_t orf_end = -1;
+        for (int64_t pos = first; pos >= seg_a; pos -= 3) {
+            if (orf_end < 0 && pos < c_lo) break;
             u8 r0 = BASE_CODE[(unsigned char)seq[pos + 2]];
             u8 r1 = BASE_CODE[(unsigned char)seq[pos + 1]];
             u8 r2 = BASE_CODE[(unsigned char)seq[pos]];
             if (r0 > 3 || r1 > 3 || r2 > 3) {
-                if (r0 > 3 && r1 > 3 && r2 > 3) orf_end = -1;
+                if (r0 > 3 && r1 > 3 && r2 > 3) {
+                    in_upstream_orf = 0;
+                    orf_end = -1;
+                    if (pos < c_lo) break;
+                }
                 continue;
             }
-            u8 b0 = 3 - r0;
-            u8 b1 = 3 - r1;
-            u8 b2 = 3 - r2;
-            int cod = (b0 << 4) | (b1 << 2) | b2;
+            int cod = ((3 - r0) << 4) | ((3 - r1) << 2) | (3 - r2);
+            if (in_upstream_orf) {
+                if (cod == 48 || cod == 50 || cod == 56) {
+                    in_upstream_orf = 0;
+                    if (pos < c_lo) break;
+                }
+                continue;
+            }
             if (orf_end < 0) {
                 if (cod == 14) orf_end = pos + 3; /* ATG on - strand */
             } else if (cod == 48 || cod == 50 || cod == 56) { /* TAA, TAG, TGA on - strand */
-                int orf_start = pos;
-                int len = orf_end - orf_start;
+                int64_t orf_start = pos;
+                int64_t len = orf_end - orf_start;
                 if (len >= min_orf_bp) {
                     float gc = 0.0f, ent = 0.0f, sn = 0.0f;
                     if (check_orf_seq(seq + orf_start, len, max_soft_n_frac, min_gc, max_gc, min_entropy, &gc, &ent, &sn)) {
@@ -424,6 +496,7 @@ static void scan_interval(
                     }
                 }
                 orf_end = -1;
+                if (pos < c_lo) break;
             }
         }
     }
@@ -441,10 +514,10 @@ static int cmp_cand(const void *pa, const void *pb) {
 int scan_orphan_orfs(
     int n_contigs,
     const char **contig_seqs,
-    const int *contig_lens,
+    const int64_t *contig_lens,
     const int *n_excl_per_contig,
-    const int **excl_starts,
-    const int **excl_ends,
+    const int64_t **excl_starts,
+    const int64_t **excl_ends,
     int min_orf_bp,
     float max_soft_n_frac,
     float min_gc,
@@ -462,6 +535,10 @@ int scan_orphan_orfs(
     *out_cands = NULL;
     *out_count = 0;
     if (n_contigs <= 0) return 0;
+    if (min_orf_bp < 3 || !contig_seqs || !contig_lens) return -2;
+    for (int c = 0; c < n_contigs; c++) {
+        if (contig_lens[c] < 0) return -2;
+    }
 
 #ifdef _OPENMP
     if (threads > 0) omp_set_num_threads(threads);
@@ -469,39 +546,36 @@ int scan_orphan_orfs(
     (void)threads;
 #endif
 
-    /* Build allowed intervals (complement of sorted/merged excluded spans), chunked to <= 2 Mb for parallelism */
+    /* Build allowed intervals (complement of sorted/merged excluded spans), partitioned into disjoint 2 Mb chunks */
     int task_cap = 256, n_tasks = 0;
     IntervalTask *tasks = (IntervalTask *)malloc((size_t)task_cap * sizeof(IntervalTask));
     if (!tasks) return -1;
 
-    const int CHUNK_BP = 2000000;
-    const int OVERLAP_BP = 20000;
+    const int64_t CHUNK_BP = 2000000;
     for (int c = 0; c < n_contigs; c++) {
-        int L = contig_lens[c];
+        int64_t L = contig_lens[c];
         int ne = n_excl_per_contig ? n_excl_per_contig[c] : 0;
-        int cur = 0;
+        if (ne < 0) { free(tasks); return -2; }
+        int64_t cur = 0;
         for (int j = 0; j <= ne; j++) {
-            int es = (j < ne) ? excl_starts[c][j] : L;
-            int ee = (j < ne) ? excl_ends[c][j] : L;
+            int64_t es = (j < ne) ? excl_starts[c][j] : L;
+            int64_t ee = (j < ne) ? excl_ends[c][j] : L;
             if (es < 0) es = 0;
             if (es > L) es = L;
             if (ee > L) ee = L;
             if (es > cur) {
-                int seg_a = cur, seg_b = es;
-                if (seg_b - seg_a >= min_orf_bp) {
-                    for (int off = seg_a; off < seg_b; off += (CHUNK_BP - OVERLAP_BP)) {
-                        int hi = off + CHUNK_BP;
+                int64_t seg_a = cur, seg_b = es;
+                if (seg_b - seg_a >= (int64_t)min_orf_bp) {
+                    for (int64_t off = seg_a; off < seg_b; off += CHUNK_BP) {
+                        int64_t hi = off + CHUNK_BP;
                         if (hi > seg_b) hi = seg_b;
-                        if (hi - off >= min_orf_bp) {
-                            if (n_tasks >= task_cap) {
-                                task_cap *= 2;
-                                IntervalTask *nt = (IntervalTask *)realloc(tasks, (size_t)task_cap * sizeof(IntervalTask));
-                                if (!nt) { free(tasks); return -1; }
-                                tasks = nt;
-                            }
-                            tasks[n_tasks++] = (IntervalTask){c, off, hi};
+                        if (n_tasks >= task_cap) {
+                            task_cap *= 2;
+                            IntervalTask *nt = (IntervalTask *)realloc(tasks, (size_t)task_cap * sizeof(IntervalTask));
+                            if (!nt) { free(tasks); return -1; }
+                            tasks = nt;
                         }
-                        if (hi >= seg_b) break;
+                        tasks[n_tasks++] = (IntervalTask){c, seg_a, seg_b, off, hi};
                     }
                 }
             }
@@ -531,8 +605,9 @@ int scan_orphan_orfs(
         for (int ti = 0; ti < n_tasks; ti++) {
             IntervalTask tk = tasks[ti];
             scan_interval(
-                tk.contig_idx, contig_seqs[tk.contig_idx], tk.start, tk.end,
-                min_orf_bp, max_soft_n_frac, min_gc, max_gc, min_entropy,
+                tk.contig_idx, contig_seqs[tk.contig_idx],
+                tk.seg_a, tk.seg_b, tk.chunk_lo, tk.chunk_hi,
+                (int64_t)min_orf_bp, max_soft_n_frac, min_gc, max_gc, min_entropy,
                 &vecs[tid]
             );
         }
@@ -541,8 +616,9 @@ int scan_orphan_orfs(
     for (int ti = 0; ti < n_tasks; ti++) {
         IntervalTask tk = tasks[ti];
         scan_interval(
-            tk.contig_idx, contig_seqs[tk.contig_idx], tk.start, tk.end,
-            min_orf_bp, max_soft_n_frac, min_gc, max_gc, min_entropy,
+            tk.contig_idx, contig_seqs[tk.contig_idx],
+            tk.seg_a, tk.seg_b, tk.chunk_lo, tk.chunk_hi,
+            (int64_t)min_orf_bp, max_soft_n_frac, min_gc, max_gc, min_entropy,
             &vecs[0]
         );
     }
@@ -573,7 +649,7 @@ int scan_orphan_orfs(
     }
     free(vecs);
 
-    /* Deduplicate candidates from chunk overlaps */
+    /* Deterministic coordinate sort + deduplication */
     qsort(raw, (size_t)total_raw, sizeof(OrfCandidate), cmp_cand);
     int n_uniq = 0;
     for (int i = 0; i < total_raw; i++) {
@@ -604,13 +680,13 @@ int scan_orphan_orfs(
         int gcap = 128, ng = 0;
         IntervalTask *gtasks = (IntervalTask *)malloc((size_t)gcap * sizeof(IntervalTask));
         if (!gtasks) { st_free(&ht); free(raw); return -1; }
-        const int GCHUNK = 4000000;
-        const int GOVL = sync_k - 1;
+        const int64_t GCHUNK = 4000000;
+        const int64_t GOVL = sync_k - 1;
         for (int c = 0; c < n_contigs; c++) {
-            int L = contig_lens[c];
+            int64_t L = contig_lens[c];
             if (L < sync_k) continue;
-            for (int off = 0; off < L; off += GCHUNK) {
-                int hi = off + GCHUNK + GOVL;
+            for (int64_t off = 0; off < L; off += GCHUNK) {
+                int64_t hi = off + GCHUNK + GOVL;
                 if (hi > L) hi = L;
                 if (hi - off >= sync_k) {
                     if (ng >= gcap) {
@@ -619,7 +695,7 @@ int scan_orphan_orfs(
                         if (!nt) { free(gtasks); st_free(&ht); free(raw); return -1; }
                         gtasks = nt;
                     }
-                    gtasks[ng++] = (IntervalTask){c, off, hi};
+                    gtasks[ng++] = (IntervalTask){c, off, hi, off, hi};
                 }
                 if (off + GCHUNK >= L) break;
             }
@@ -631,7 +707,7 @@ int scan_orphan_orfs(
         for (int gi = 0; gi < ng; gi++) {
             IntervalTask tk = gtasks[gi];
             scan_seq_syncmers_count(
-                contig_seqs[tk.contig_idx] + tk.start, tk.end - tk.start,
+                contig_seqs[tk.contig_idx] + tk.chunk_lo, tk.chunk_hi - tk.chunk_lo,
                 sync_k, sync_s, &ht, (u32)max_sync_mult
             );
         }

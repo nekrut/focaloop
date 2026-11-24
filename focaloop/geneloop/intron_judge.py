@@ -285,7 +285,11 @@ class GoodTuringUCBJudge(MultiRunIntronBanditJudge):
                 self.unsettled_total += j.count
                 lu[k] = lu.get(k, 0) + j.count
                 self.lib_unsettled_total[run_id] += j.count
-        mb = max(wave_bytes / 1e6, 0.1)
+        # Derive saturation slope deterministically from spots when available (NIC wave_bytes is telemetry only)
+        if spots is not None:
+            mb = max(float(spots) / 12_500.0, 0.1)
+        else:
+            mb = max(wave_bytes / 1e6, 0.1)
         slope = (novel_coding + novel_ncrna) / mb * 10.0
         lib.recent_novel_slopes_per_10mb.append(slope)
         self.recent_ncrna_slopes.append(novel_ncrna / mb * 10.0)

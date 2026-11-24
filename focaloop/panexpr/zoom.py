@@ -11,7 +11,7 @@ consistent across the cohort.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -133,6 +133,7 @@ class ZoomResult:
     reads_mapped: int
     per_run_scale: dict[str, float]
     sieve_mode: str = "include"
+    per_run_zoom_bytes: dict[str, int] = field(default_factory=dict)
 
 
 def zoom_pass(
@@ -190,6 +191,7 @@ def zoom_pass(
 
     bytes_scanned = reads_scanned = reads_kept = reads_mapped = 0
     scale: dict[str, float] = {}
+    zoom_bytes_by_run: dict[str, int] = {}
     rna_items = [(run_id, rs) for run_id, rs in streams.items() if not accs[run_id].run.is_wgs]
     tot_sieve_t = max(1, sieve_threads if sieve_threads is not None else getattr(kernel, "threads", 4))
     dset = catalog.decoy_ids
@@ -288,6 +290,7 @@ def zoom_pass(
         for run_id, before, delta, n, k1, k2 in fetched:
             bytes_scanned += delta
             reads_scanned += n
+            zoom_bytes_by_run[run_id] = int(delta)
             if n == 0:
                 scale[run_id] = before / max(1, before + delta) if (before + delta) > 0 else 1.0
                 continue
@@ -307,7 +310,17 @@ def zoom_pass(
             del to_map
             merged_to_map: list[tuple[str, list[Read], list[Read] | None]] = []
             for (_smp, _cnd, paired), items in grouped_map.items():
-                rep_rid = items[0][0]
+                rep_rid = next(
+                    (
+                        cand_rid
+                        for cand_rid, cand_acc in accs.items()
+                        if not cand_acc.run.is_wgs
+                        and cand_acc.run.sample == _smp
+                        and cand_acc.run.condition == _cnd
+                        and (cand_acc.run.layout == "PE") == paired
+                    ),
+                    items[0][0],
+                )
                 if len(items) == 1:
                     merged_to_map.append((rep_rid, items[0][1], items[0][2]))
                     pooled_deltas[rep_rid] = items[0][3]
@@ -350,4 +363,7 @@ def zoom_pass(
 
     log(f"  [zoom:{eff_mode}] {len(borderline_groups)} target genes, filter={n_kmers:,} 31-mers, scanned {reads_scanned:,} reads "
         f"({bytes_scanned / 1e6:.1f} MB), kept {reads_kept:,}, mapped {reads_mapped:,}")
-    return ZoomResult(borderline_groups, bytes_scanned, reads_scanned, reads_kept, reads_mapped, scale, sieve_mode=eff_mode)
+    return ZoomResult(
+        borderline_groups, bytes_scanned, reads_scanned, reads_kept, reads_mapped, scale,
+        sieve_mode=eff_mode, per_run_zoom_bytes=zoom_bytes_by_run,
+    )

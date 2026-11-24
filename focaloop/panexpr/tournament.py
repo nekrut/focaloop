@@ -37,6 +37,38 @@ NEXTERA_R2 = "CTGTCTCTTATACACATCTGACGCTGCCGACGAGCGATCTAGTGTAGATCTCGGTGGTCGCCGTAT
 ADAPTER_KITS = (("truseq", ADAPTER_R1, ADAPTER_R2), ("nextera", NEXTERA_R1, NEXTERA_R2))
 MIN_JUNCTION_ANCHOR = 15
 
+# Deterministic per-kernel throughput priors (reads/sec) so OS scheduling jitter never flips tournament winners.
+KERNEL_SPEED_PRIOR_RPS: dict[str, float] = {
+    "piscem": 45_000.0,
+    "kallisto": 42_000.0,
+    "themisto": 38_000.0,
+    "salmon": 32_000.0,
+    "strobealign_N16": 30_000.0,
+    "chromap": 28_000.0,
+    "bwa_meme_spa": 20_000.0,
+    "bwa_mem2_spa": 18_000.0,
+    "bwa_mem2_naive_pa": 18_000.0,
+    "mappy": 16_000.0,
+    "snap": 15_000.0,
+    "bwa_spa": 12_000.0,
+    "hisat2_k16": 11_000.0,
+    "bowtie2_global_k16": 10_000.0,
+    "subread": 10_000.0,
+    "dragmap": 10_000.0,
+    "bowtie2_local_k16": 9_000.0,
+    "subjunc": 9_000.0,
+    "star": 8_000.0,
+    "vg_giraffe": 6_000.0,
+    "hisat2_genome_k16": 1_800.0,
+    "star_genome_m16": 1_800.0,
+    "gsnap_k16": 1_200.0,
+    "segemehl": 800.0,
+}
+
+
+def _speed_prior_rps(kernel_name: str) -> float:
+    return KERNEL_SPEED_PRIOR_RPS.get(kernel_name, 10_000.0)
+
 
 @dataclass
 class SyntheticCase:
@@ -462,18 +494,19 @@ def evaluate_kernel(
     core = [recall[k] for k in CORE_RECALL_REGIMES if k in recall]
     core4 = sum(core) / len(core) if core else 0.0
     rps = len(batch_r1) / max(wall, 1e-3)
+    prior_rps = _speed_prior_rps(kernel.name)
     sym_eff = 1.0 if math.isnan(symmetry) else symmetry
     tie_term = sym_eff if (conditioning_active and not math.isnan(symmetry)) else min(1.0, tie_ret / 60.0)
-    composite = 0.35 * map_pct / 100.0 + 0.40 * overall / 100.0 + 0.15 * tie_term + 0.10 * min(1.0, math.log10(max(10.0, rps)) / 5.0)
+    composite = 0.35 * map_pct / 100.0 + 0.40 * overall / 100.0 + 0.15 * tie_term + 0.10 * min(1.0, math.log10(max(10.0, prior_rps)) / 5.0)
     gate = True
     score = composite
     if conditioning_active and not math.isnan(symmetry):
         if symmetry < 0.80:
             gate = False
         score = composite * (0.5 + 0.5 * symmetry) if symmetry < 0.95 else composite
-    if len(catalog.gene_targets) >= 25_000 and rps < 2_500.0:
+    if len(catalog.gene_targets) >= 25_000 and prior_rps < 2_500.0:
         # On mammalian-scale catalogs, penalize sub-2.5k r/s SAM projection mappers so they cannot beat 30k+ r/s cDBG mappers
-        score *= min(1.0, (max(rps, 10.0) / 2_500.0) ** 0.35)
+        score *= min(1.0, (max(prior_rps, 10.0) / 2_500.0) ** 0.35)
     return KernelScore(kernel.name, kernel.label, map_pct, purity, tie_ret, recall, overall, sym_eff, rps, wall, gate, composite, score,
                        core4_recall_pct=core4)
 
@@ -538,6 +571,11 @@ def run_tournament(
             conditioning_active = bool(regime.strict_tie_gate)
     if conditioning_active is None:
         conditioning_active = len(catalog.assemblies) > 1 or any(len(v) > 1 for v in catalog.groups.values())
+    if not kernels:
+        if pre_excluded:
+            reasons_txt = ", ".join(f"{k}: {why}" for k, why in sorted(pre_excluded.items()))
+            raise ValueError(f"All selected aligners were excluded by the regime classifier ({reasons_txt})")
+        raise ValueError("No candidate aligners provided to tournament")
     insert = estimate_insert_size(real_r1, real_r2) if layout == "PE" else {"layout": layout, "measurable": False}
     frag_len = default_frag_len(read_len)
     if match_insert and insert.get("measurable"):
@@ -558,9 +596,29 @@ def run_tournament(
         board.append(sc)
         log(f"  [tournament] {k.label:55s} mapped={sc.real_mapped_pct:5.1f}% recall={sc.overall_synthetic_recall_pct:5.1f}% "
             f"tie_sym={sc.mate_tie_symmetry:.3f} gate={'ok' if sc.gate_passed else 'FAIL'} {sc.reads_per_sec:8.0f} r/s score={sc.optimality_score:.4f} {sc.error}")
-    board.sort(key=lambda s: s.optimality_score, reverse=True)
+    if not board:
+        excl_note = (
+            f" (pre-excluded: {', '.join(f'{k}: {w}' for k, w in sorted(pre_excluded.items()))})"
+            if pre_excluded
+            else ""
+        )
+        raise ValueError(f"No available candidate aligners could be evaluated in tournament{excl_note}")
+    if all(bool(s.error) for s in board):
+        err_txt = ", ".join(f"{s.kernel}: {s.error}" for s in board)
+        raise RuntimeError(f"All candidate aligners failed during tournament ({err_txt})")
+    board.sort(
+        key=lambda s: (
+            0 if not s.error else 1,
+            -round(s.optimality_score, 6),
+            -round(s.overall_synthetic_recall_pct, 4),
+            -round(s.real_mapped_pct, 4),
+            -_speed_prior_rps(s.kernel),
+            s.kernel,
+        )
+    )
     passing = [s for s in board if s.gate_passed and not s.error]
-    winner = (passing[0] if passing else board[0]).kernel
+    non_err = [s for s in board if not s.error]
+    winner = (passing[0] if passing else non_err[0]).kernel
     rows = [s.as_dict() for s in board]
     for name, why in pre_excluded.items():
         log(f"  [tournament] {name:55s} pre-excluded by regime classifier: {why}")

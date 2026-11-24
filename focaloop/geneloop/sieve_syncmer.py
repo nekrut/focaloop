@@ -11,10 +11,14 @@ Safety invariant:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import shutil
+import stat
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,45 +174,101 @@ GLCORE_BIN = Path(os.environ.get("GLCORE_BIN", str(Path(__file__).parent / "glco
 
 
 def _glcore_pre_dirs() -> tuple[str | None, ...]:
-    import sys
-
+    which_gl = shutil.which("glcore")
     return (
-        shutil.which("glcore") and str(Path(shutil.which("glcore")).parent),
+        str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
         os.environ.get("FOCALOOP_NATIVE_CACHE"),
         os.environ.get("FOCALOOP_NATIVE_DIR"),
-        str(Path(sys.prefix) / "share" / "focaloop" / "native_cache"),
         "/opt/focaloop/native_cache",
+        str(Path(which_gl).parent) if which_gl else None,
     )
 
 
-def build_glcore(force: bool = False) -> Path:
-    """Compile glcore (OpenMP C core; portable ISA when FOCALOOP_PORTABLE_ISA=1)."""
-    import sys
-    import tempfile
+def _portable_isa_enabled() -> bool:
+    return os.environ.get("FOCALOOP_PORTABLE_ISA", "1").strip() != "0"
 
+
+def _ensure_private_cache_dir(base: Path) -> Path:
+    uid = os.getuid()
+    if base.is_symlink():
+        raise RuntimeError(f"Native cache path must not be a symlink: {base}")
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = os.lstat(base)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"Native cache path is not a regular directory: {base}")
+    if st.st_uid != uid:
+        raise RuntimeError(f"Native cache directory {base} is not owned by uid {uid}")
+    if (st.st_mode & 0o777) != 0o700:
+        os.chmod(base, 0o700)
+        st = os.lstat(base)
+        if (st.st_mode & 0o777) != 0o700:
+            raise RuntimeError(f"Native cache directory {base} has unsafe mode {oct(st.st_mode & 0o777)}")
+    return base
+
+
+def _secure_user_native_cache() -> Path:
+    uid = os.getuid()
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    root = Path(xdg) if xdg else Path(tempfile.gettempdir())
+    return _ensure_private_cache_dir(root / f"focaloop_geneloop_native_{uid}")
+
+
+def _verify_cached_exec(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return False
+    if st.st_uid != os.getuid():
+        return False
+    if st.st_mode & 0o022:
+        return False
+    return os.access(path, os.X_OK)
+
+
+def build_glcore(force: bool = False) -> Path:
+    """Compile glcore into an owner-verified per-user cached binary (portable ISA unless FOCALOOP_PORTABLE_ISA=0)."""
     env_bin = os.environ.get("GLCORE_BIN")
     if env_bin and not force and Path(env_bin).is_file() and os.access(env_bin, os.X_OK):
         return Path(env_bin)
 
-    if not force:
+    portable = _portable_isa_enabled()
+    build_dir_env = os.environ.get("FOCALOOP_BUILD_NATIVE_DIR")
+
+    if not force and not build_dir_env and portable:
         for pre_dir in _glcore_pre_dirs():
             if pre_dir:
                 cand = Path(pre_dir) / "glcore"
                 if cand.is_file() and os.access(cand, os.X_OK):
                     return cand
 
-    build_dir_env = os.environ.get("FOCALOOP_BUILD_NATIVE_DIR")
+    arch = platform.machine().lower()
+    isa_flags: list[str] = []
+    if portable:
+        if arch in ("x86_64", "amd64"):
+            isa_flags = ["-msse4.2", "-mpopcnt"]
+    elif arch in ("x86_64", "amd64"):
+        isa_flags = ["-march=native"]
+
+    src_bytes = GLCORE_SRC.read_bytes()
+    key_blob = src_bytes + b"\0" + " ".join([sys.platform, arch, *isa_flags]).encode("utf-8")
+    digest = hashlib.sha256(key_blob).hexdigest()[:16]
+
     if build_dir_env:
         target = Path(build_dir_env) / "glcore"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cache_hit = not force and target.is_file() and os.access(target, os.X_OK) and target.stat().st_mtime >= GLCORE_SRC.stat().st_mtime
     elif env_bin:
         target = Path(env_bin)
-    elif os.access(GLCORE_BIN.parent, os.W_OK) or (not GLCORE_BIN.parent.exists() and os.access(GLCORE_BIN.parent.parent, os.W_OK)):
-        target = GLCORE_BIN
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cache_hit = not force and target.is_file() and os.access(target, os.X_OK) and target.stat().st_mtime >= GLCORE_SRC.stat().st_mtime
     else:
-        target = Path(tempfile.gettempdir()) / f"focaloop_geneloop_native_{os.getuid()}" / "glcore"
+        cache_dir = _secure_user_native_cache()
+        target = cache_dir / f"glcore_{digest}"
+        cache_hit = not force and _verify_cached_exec(target)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if force or not target.exists() or target.stat().st_mtime < GLCORE_SRC.stat().st_mtime:
+    if not cache_hit:
         cc = os.environ.get("CC") or "gcc"
         use_omp = True
         extra: list[str] = []
@@ -224,22 +284,16 @@ def build_glcore(force: bool = False) -> Path:
             sdk = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True, check=False).stdout.strip()
             if sdk:
                 extra += ["-isysroot", sdk]
-        arch = platform.machine().lower()
-        isa_flags: list[str] = []
-        if os.environ.get("FOCALOOP_PORTABLE_ISA") == "1":
-            if arch in ("x86_64", "amd64") and sys.platform != "darwin":
-                isa_flags = ["-msse4.2", "-mpopcnt"]
-        elif arch in ("x86_64", "amd64"):
-            isa_flags = ["-march=native"]
         base_cmd = [cc, "-O3", *isa_flags, *extra, "-Wall"]
         attempts = [["-fopenmp"], []] if use_omp else [[]]
-        tmp_out = target.parent / f".tmp_glcore_{os.getpid()}"
+        tmp_out = target.parent / f".tmp_glcore_{os.getpid()}_{digest}"
         last_err = ""
         try:
             for omp_f in attempts:
                 cmd = base_cmd + omp_f + ["-o", str(tmp_out), str(GLCORE_SRC), "-lm"]
                 res = subprocess.run(cmd, capture_output=True, text=True)
                 if res.returncode == 0 and tmp_out.exists():
+                    os.chmod(tmp_out, 0o700)
                     os.replace(tmp_out, target)
                     return target
                 last_err = res.stderr

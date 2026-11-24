@@ -42,17 +42,30 @@ def _open_text(path: str | Path):
     return open(path)
 
 
+def _open_bytes(path: str | Path):
+    p = str(path)
+    return gzip.open(p, "rb") if p.endswith(".gz") else open(p, "rb")
+
+
 def load_fasta(path: str | Path) -> dict[str, str]:
-    seqs: dict[str, list[str]] = {}
-    cur = None
-    with _open_text(path) as fh:
-        for line in fh:
-            if line.startswith(">"):
-                cur = line[1:].split()[0]
-                seqs[cur] = []
+    seqs: dict[str, str] = {}
+    cur: str | None = None
+    buf = bytearray()
+    with _open_bytes(path) as fh:
+        for raw in fh:
+            if raw.startswith(b">"):
+                if cur is not None:
+                    seqs[cur] = bytes(buf).upper().decode("latin-1")
+                    buf.clear()
+                hdr = raw[1:].strip()
+                cur = hdr.split(None, 1)[0].decode("latin-1") if hdr else ""
             elif cur is not None:
-                seqs[cur].append(line.strip().upper())
-    return {k: "".join(v) for k, v in seqs.items()}
+                s = raw.strip()
+                if s:
+                    buf.extend(s)
+        if cur is not None:
+            seqs[cur] = bytes(buf).upper().decode("latin-1")
+    return seqs
 
 
 def write_fasta(path: str | Path, records: Iterable[tuple[str, str]], width: int = 0) -> None:
@@ -168,23 +181,69 @@ def _gene_id_from(attrs: dict[str, str], id_attr: tuple[str, ...]) -> str:
 # Prokaryotic mode
 # ---------------------------------------------------------------------------
 
-def build_prokaryotic_targets(spec: AssemblySpec) -> list[Target]:
+_PROK_TARGET_FTYPES = ("CDS", "rRNA", "tRNA", "tmRNA", "ncRNA", "SRP_RNA", "RNase_P_RNA")
+_PROK_NONCODING_FTYPES = ("rRNA", "tRNA", "tmRNA", "ncRNA", "SRP_RNA", "RNase_P_RNA")
+_PROK_PRODUCT_FTYPES = ("CDS", "transcript", "exon", "mRNA", "rRNA", "tRNA", "tmRNA", "ncRNA", "SRP_RNA", "RNase_P_RNA")
+
+
+def build_prokaryotic_targets(spec: AssemblySpec, genome: dict[str, str] | None = None) -> list[Target]:
     """One target per annotated gene (CDS/rRNA/tRNA/...): whole gene body, strand-oriented."""
-    genome = load_fasta(spec.fasta)
+    if genome is None:
+        genome = load_fasta(spec.fasta)
+    feats = list(iter_features(spec.annotation))
     genes: dict[str, Feature] = {}
     products: dict[str, str] = {}
-    for f in iter_features(spec.annotation):
-        gid = _gene_id_from(f.attrs, spec.id_attr)
+    child_ftype: dict[str, str] = {}
+    raw_id_to_gid: dict[str, str] = {}
+    parent_of: dict[str, str] = {}
+
+    for f in feats:
+        fid = f.attrs.get("ID", "")
+        if fid and "Parent" in f.attrs:
+            p0 = f.attrs["Parent"].split(",")[0].strip()
+            if p0:
+                parent_of[fid] = p0
+        if f.ftype == "gene":
+            gid = _gene_id_from(f.attrs, spec.id_attr)
+            if not gid:
+                continue
+            if fid:
+                raw_id_to_gid[fid] = gid
+            raw_id_to_gid[gid] = gid
+            if spec.only_genes is None or gid in spec.only_genes:
+                genes[gid] = f
+
+    def _resolve_prok_gid(feat: Feature) -> str:
+        cur = feat.attrs.get("Parent", "").split(",")[0].strip()
+        seen_p: set[str] = set()
+        while cur and cur not in seen_p:
+            seen_p.add(cur)
+            if cur in raw_id_to_gid:
+                return raw_id_to_gid[cur]
+            stripped = cur.split(":", 1)[1] if cur.startswith("gene:") else cur
+            if stripped in genes:
+                return stripped
+            cur = parent_of.get(cur, "")
+        return _gene_id_from(feat.attrs, spec.id_attr)
+
+    for f in feats:
+        if f.ftype == "gene":
+            continue
+        gid = _resolve_prok_gid(f)
         if not gid:
             continue
         if spec.only_genes is not None and gid not in spec.only_genes:
             continue
-        if f.ftype == "gene":
-            genes[gid] = f
-        elif f.ftype in ("CDS", "transcript", "exon", "mRNA", "rRNA", "tRNA") and "product" in f.attrs and gid not in products:
+        if f.ftype in _PROK_PRODUCT_FTYPES and "product" in f.attrs and gid not in products:
             products[gid] = f.attrs["product"]
-        elif f.ftype in ("CDS",) and gid not in genes:
-            genes[gid] = f  # annotation with CDS but no gene lines
+        if f.ftype in _PROK_NONCODING_FTYPES and gid not in child_ftype:
+            child_ftype[gid] = f.ftype
+        if f.ftype in _PROK_TARGET_FTYPES and gid not in genes:
+            genes[gid] = f
+            if "ID" in f.attrs:
+                raw_id_to_gid[f.attrs["ID"]] = gid
+            raw_id_to_gid[gid] = gid
+
     out: list[Target] = []
     for gid, f in genes.items():
         ctg = genome.get(f.contig)
@@ -194,7 +253,15 @@ def build_prokaryotic_targets(spec: AssemblySpec) -> list[Target]:
         if not raw:
             continue
         seq = revcomp(raw) if f.strand == "-" else raw
-        biotype = f.attrs.get("gene_biotype") or f.attrs.get("biotype") or ("protein_coding" if f.ftype in ("gene", "CDS") else f.ftype)
+        explicit_bt = f.attrs.get("gene_biotype") or f.attrs.get("gene_type") or f.attrs.get("biotype")
+        if explicit_bt:
+            biotype = explicit_bt
+        elif gid in child_ftype:
+            biotype = child_ftype[gid]
+        elif f.ftype in ("gene", "CDS"):
+            biotype = "protein_coding"
+        else:
+            biotype = f.ftype
         sym = spec.symbol_overrides.get(gid) or f.attrs.get("gene") or f.attrs.get("Name") or f.attrs.get("gene_name") or gid
         out.append(Target(
             target_id=f"{spec.assembly_id}|{gid}", assembly_id=spec.assembly_id, gene_id=gid, transcript_id=gid,
@@ -210,9 +277,11 @@ def build_intergenic_decoys(
     min_len: int = 150,
     chunk: int = 1500,
     use_ust_decoys: bool = False,
+    genome: dict[str, str] | None = None,
 ) -> list[Target]:
     """Intergenic windows of the assembly (both strands implicit) as decoy targets."""
-    genome = load_fasta(spec.fasta)
+    if genome is None:
+        genome = load_fasta(spec.fasta)
     by_ctg: dict[str, list[tuple[int, int]]] = {}
     tx_seqs: list[str] = []
     for t in gene_targets:
@@ -272,14 +341,31 @@ def build_intergenic_decoys(
 # Spliced eukaryotic mode
 # ---------------------------------------------------------------------------
 
+def _tx_keys(attrs: dict[str, str]) -> list[str]:
+    if attrs.get("transcript_id"):
+        return [attrs["transcript_id"]]
+    parent = attrs.get("Parent", "")
+    if parent:
+        return [p.strip() for p in parent.split(",") if p.strip()]
+    return []
+
+
 def _tx_key(attrs: dict[str, str]) -> str:
-    return attrs.get("transcript_id") or attrs.get("Parent") or ""
+    ks = _tx_keys(attrs)
+    return ks[0] if ks else ""
 
 
-def build_spliced_transcripts(spec: AssemblySpec, min_exon_total: int = 30) -> list[Target]:
+def build_spliced_transcripts(
+    spec: AssemblySpec,
+    min_exon_total: int = 30,
+    genome: dict[str, str] | None = None,
+) -> list[Target]:
     """Mature spliced cDNA for every transcript (pure-Python exon splicer, +/- strand safe)."""
-    genome = load_fasta(spec.fasta)
-    exons: dict[str, list[Feature]] = {}
+    if genome is None:
+        genome = load_fasta(spec.fasta)
+    exons: dict[str, list[tuple[int, int]]] = {}
+    tx_contig: dict[str, str] = {}
+    tx_strand: dict[str, str] = {}
     tx_gene: dict[str, str] = {}
     tx_biotype: dict[str, str] = {}
     gene_sym: dict[str, str] = {}
@@ -293,31 +379,56 @@ def build_spliced_transcripts(spec: AssemblySpec, min_exon_total: int = 30) -> l
             gid = _gene_id_from(a, spec.id_attr)
             if gid:
                 gene_sym[gid] = spec.symbol_overrides.get(gid) or a.get("gene") or a.get("gene_name") or a.get("Name") or gid
-                gene_biotype[gid] = a.get("gene_biotype") or a.get("biotype") or "protein_coding"
+                gbt = a.get("gene_biotype") or a.get("gene_type") or a.get("biotype")
+                if gbt:
+                    gene_biotype[gid] = gbt
                 if "ID" in a:
                     gff3_gene_ids[a["ID"]] = gid
-        elif f.ftype in ("mRNA", "transcript", "rRNA", "tRNA", "ncRNA", "lnc_RNA", "snoRNA", "snRNA") and "ID" in a and "Parent" in a:
-            mrna_parent[a["ID"]] = a["Parent"]
-            if "product" in a:
-                gene_product.setdefault(a["Parent"], a["product"])
+        elif f.ftype in ("mRNA", "transcript", "rRNA", "tRNA", "ncRNA", "lnc_RNA", "snoRNA", "snRNA", "tmRNA", "SRP_RNA", "RNase_P_RNA") and "ID" in a:
+            tid_raw = a["ID"]
+            parents = [p.strip() for p in a.get("Parent", "").split(",") if p.strip()]
+            if parents:
+                mrna_parent[tid_raw] = parents[0]
+                if "product" in a:
+                    for p in parents:
+                        gene_product.setdefault(gff3_gene_ids.get(p, p), a["product"])
+                        gene_product.setdefault(p, a["product"])
+            tbt = a.get("transcript_biotype") or a.get("transcript_type") or a.get("biotype")
+            if not tbt and f.ftype not in ("mRNA", "transcript"):
+                tbt = f.ftype
+            if tbt:
+                tx_biotype[tid_raw] = tbt
         elif f.ftype == "exon":
-            tk = _tx_key(a)
-            if not tk:
+            tks = _tx_keys(a)
+            if not tks:
                 continue
-            exons.setdefault(tk, []).append(f)
             gid = a.get("gene_id") or ""
+            gbt = a.get("gene_biotype") or a.get("gene_type")
+            tbt = a.get("transcript_biotype") or a.get("transcript_type")
             if gid:
-                tx_gene[tk] = gid
                 if "gene_name" in a and gid not in gene_sym:
                     gene_sym[gid] = spec.symbol_overrides.get(gid) or a["gene_name"]
-            if "transcript_biotype" in a:
-                tx_biotype[tk] = a["transcript_biotype"]
+                if gbt and gid not in gene_biotype:
+                    gene_biotype[gid] = gbt
+            for tk in tks:
+                exons.setdefault(tk, []).append((f.start, f.end))
+                tx_contig.setdefault(tk, f.contig)
+                tx_strand.setdefault(tk, f.strand)
+                if gid:
+                    tx_gene[tk] = gid
+                if tbt:
+                    tx_biotype[tk] = tbt
         elif f.ftype == "CDS" and "product" in a:
-            gid = a.get("gene_id") or mrna_parent.get(a.get("Parent", ""), "")
-            if gid:
-                gene_product.setdefault(gid, a["product"])
+            if a.get("gene_id"):
+                gene_product.setdefault(a["gene_id"], a["product"])
+            else:
+                for p in (x.strip() for x in a.get("Parent", "").split(",") if x.strip()):
+                    gp = mrna_parent.get(p, p)
+                    if gp:
+                        gene_product.setdefault(gff3_gene_ids.get(gp, gp), a["product"])
+                        gene_product.setdefault(gp, a["product"])
     out: list[Target] = []
-    for tk, exs in exons.items():
+    for tk, raw_ivs in exons.items():
         gid = tx_gene.get(tk)
         if not gid:
             parent = mrna_parent.get(tk, "")
@@ -325,11 +436,12 @@ def build_spliced_transcripts(spec: AssemblySpec, min_exon_total: int = 30) -> l
         gid = gid.split(":")[-1] if gid.startswith("gene:") else gid
         if spec.only_genes is not None and gid not in spec.only_genes:
             continue
-        ctg_seq = genome.get(exs[0].contig)
+        ctg_name = tx_contig[tk]
+        ctg_seq = genome.get(ctg_name)
         if not ctg_seq:
             continue
-        strand = exs[0].strand
-        ivs = sorted({(e.start, e.end) for e in exs})
+        strand = tx_strand[tk]
+        ivs = sorted(set(raw_ivs))
         pieces = [ctg_seq[s - 1:e] for s, e in ivs]
         cdna = "".join(pieces)
         if len(cdna) < min_exon_total:
@@ -338,18 +450,28 @@ def build_spliced_transcripts(spec: AssemblySpec, min_exon_total: int = 30) -> l
             cdna = revcomp(cdna)
         tid = tk.split(":")[-1] if tk.startswith(("rna:", "transcript:")) else tk
         safe_tid = tid.replace("|", "_").replace(" ", "_")
+        biotype = tx_biotype.get(tk) or gene_biotype.get(gid) or "protein_coding"
+        prod = gene_product.get(gid) or gene_product.get(mrna_parent.get(tk, ""), "")
         out.append(Target(
             target_id=f"{spec.assembly_id}|{safe_tid}", assembly_id=spec.assembly_id, gene_id=gid, transcript_id=safe_tid,
-            group_id="", symbol=gene_sym.get(gid, gid), biotype=tx_biotype.get(tk) or gene_biotype.get(gid, "protein_coding"),
-            contig=exs[0].contig, start_1b=ivs[0][0], end_1b=ivs[-1][1], strand=strand, seq=cdna,
-            product=gene_product.get(gid, ""), exons=ivs,
+            group_id="", symbol=gene_sym.get(gid, gid), biotype=biotype,
+            contig=ctg_name, start_1b=ivs[0][0], end_1b=ivs[-1][1], strand=strand, seq=cdna,
+            product=prod, exons=ivs,
         ))
     return out
 
 
-def build_intron_decoys(spec: AssemblySpec, transcripts: list[Target], min_len: int = 60, chunk: int = 2000, flank: int = 20) -> list[Target]:
+def build_intron_decoys(
+    spec: AssemblySpec,
+    transcripts: list[Target],
+    min_len: int = 60,
+    chunk: int = 2000,
+    flank: int = 20,
+    genome: dict[str, str] | None = None,
+) -> list[Target]:
     """Intron (retention) decoys: each intron with ``flank`` bp of adjoining exon on either side."""
-    genome = load_fasta(spec.fasta)
+    if genome is None:
+        genome = load_fasta(spec.fasta)
     seen: set[tuple[str, int, int]] = set()
     out: list[Target] = []
     for t in transcripts:
@@ -426,6 +548,7 @@ def build_merged_intron_decoys(
     flank: int = 20,
     spacer_len: int = 64,
     use_ust_decoys: bool = False,
+    genome: dict[str, str] | None = None,
 ) -> list[Target]:
     """v2.1 compact exon-subtracted intronic super-decoys.
 
@@ -439,7 +562,8 @@ def build_merged_intron_decoys(
     exonic 31-mers) and compacts surviving intronic/flank 31-mers into minimal bidirected
     Rahman-Medvedev UST simplitigs before packing into N-spacer super-targets.
     """
-    genome = load_fasta(spec.fasta)
+    if genome is None:
+        genome = load_fasta(spec.fasta)
     raw_introns: dict[str, list[tuple[int, int]]] = {}
     raw_exons: dict[str, list[tuple[int, int]]] = {}
     tx_seqs: list[str] = []
@@ -542,8 +666,12 @@ def build_merged_intron_decoys(
     return out
 
 
-def build_window_targets(windows: list[ExtraWindow], fasta_by_assembly: dict[str, str | Path]) -> list[Target]:
-    genomes: dict[str, dict[str, str]] = {}
+def build_window_targets(
+    windows: list[ExtraWindow],
+    fasta_by_assembly: dict[str, str | Path],
+    preloaded_genomes: dict[str, dict[str, str]] | None = None,
+) -> list[Target]:
+    genomes: dict[str, dict[str, str]] = dict(preloaded_genomes or {})
     out: list[Target] = []
     for w in windows:
         if w.assembly_id not in genomes:
@@ -695,11 +823,9 @@ def restore_exons_from_annotation(catalog: "Catalog", annotation: str | Path, as
     for f in iter_features(annotation):
         if f.ftype != "exon":
             continue
-        tk = _tx_key(f.attrs)
-        if not tk:
-            continue
-        tid = tk.split(":")[-1] if tk.startswith(("rna:", "transcript:")) else tk
-        ex.setdefault(tid.replace("|", "_").replace(" ", "_"), set()).add((f.start, f.end))
+        for tk in _tx_keys(f.attrs):
+            tid = tk.split(":")[-1] if tk.startswith(("rna:", "transcript:")) else tk
+            ex.setdefault(tid.replace("|", "_").replace(" ", "_"), set()).add((f.start, f.end))
     n = 0
     for t in catalog.gene_targets:
         if assembly_id is not None and t.assembly_id != assembly_id:
@@ -884,22 +1010,34 @@ def build_catalog(
         raise ValueError(f"unknown decoys={decoys!r}")
     primary_assembly = primary_assembly or assemblies[0].assembly_id
     targets: list[Target] = []
+    preloaded_genomes: dict[str, dict[str, str]] = {}
     for spec in assemblies:
+        asm_genome = load_fasta(spec.fasta)
+        if extra_windows:
+            preloaded_genomes[spec.assembly_id] = asm_genome
         if mode == "prokaryotic":
-            genes = build_prokaryotic_targets(spec)
+            genes = build_prokaryotic_targets(spec, genome=asm_genome)
             targets.extend(genes)
             if decoys in ("auto", "intergenic") and spec.assembly_id == primary_assembly:
-                targets.extend(build_intergenic_decoys(spec, genes, use_ust_decoys=use_ust_decoys))
+                targets.extend(build_intergenic_decoys(spec, genes, use_ust_decoys=use_ust_decoys, genome=asm_genome))
         else:
-            txs = build_spliced_transcripts(spec)
+            txs = build_spliced_transcripts(spec, genome=asm_genome)
             targets.extend(txs)
             if spec.assembly_id == primary_assembly and decoys != "none":
                 if use_ust_decoys or decoys == "merged_intron" or (decoys == "auto" and len(txs) >= 25_000):
-                    targets.extend(build_merged_intron_decoys(spec, txs, use_ust_decoys=use_ust_decoys))
+                    targets.extend(build_merged_intron_decoys(spec, txs, use_ust_decoys=use_ust_decoys, genome=asm_genome))
                 elif decoys in ("auto", "intron"):
-                    targets.extend(build_intron_decoys(spec, txs))
+                    targets.extend(build_intron_decoys(spec, txs, genome=asm_genome))
+        del asm_genome
     if extra_windows:
-        targets.extend(build_window_targets(extra_windows, {s.assembly_id: s.fasta for s in assemblies}))
+        targets.extend(build_window_targets(extra_windows, {s.assembly_id: s.fasta for s in assemblies}, preloaded_genomes=preloaded_genomes))
+        preloaded_genomes.clear()
+    prim_non_decoy = [t for t in targets if t.assembly_id == primary_assembly and not t.is_decoy]
+    if not prim_non_decoy:
+        raise ValueError(
+            f"Catalog build produced 0 non-decoy targets for primary assembly {primary_assembly!r} in {mode} mode "
+            "(verify that FASTA contig names match annotation seqids and that the annotation contains gene/CDS/exon features)."
+        )
     cat = Catalog(targets, primary_assembly, mode)
     cat.link_stats = link_orthologs(targets, primary_assembly, tmp_dir, provided_ortholog_map)
     cat.invalidate_caches()
@@ -942,11 +1080,7 @@ def tximport_gene_level(
     tx_idx = tx_counts.index
     cols = tx_counts.columns
     cnt_mat = tx_counts.to_numpy(dtype=np.float64, copy=False)
-    len_mat = np.clip(tx_lengths.reindex(tx_idx).to_numpy(dtype=np.float64, copy=False), 1.0, None)
-    rate_mat = cnt_mat / len_mat
-    rate_sum = rate_mat.sum(axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        tpm_mat = np.where(rate_sum[None, :] > 0.0, rate_mat / np.where(rate_sum[None, :] > 0.0, rate_sum[None, :], 1.0) * 1e6, 0.0)
+    len_raw_mat = tx_lengths.reindex(tx_idx).to_numpy(dtype=np.float64, copy=False)
     genes = t2g.reindex(tx_idx).fillna("NA")
     g_codes, g_uniques = pd.factorize(genes, sort=True)
     n_g = len(g_uniques)
@@ -956,12 +1090,17 @@ def tximport_gene_level(
     w_len_mat = np.zeros((n_g, n_s), dtype=np.float64)
     mean_len_mat = np.zeros((n_g, n_s), dtype=np.float64)
     tx_per_g = np.maximum(1, np.bincount(g_codes, minlength=n_g)).astype(np.float64)
-    w_tx_mat = tpm_mat * len_mat
     for j in range(n_s):
-        g_cnt_mat[:, j] = np.bincount(g_codes, weights=cnt_mat[:, j], minlength=n_g)
-        g_ab_mat[:, j] = np.bincount(g_codes, weights=tpm_mat[:, j], minlength=n_g)
-        w_len_mat[:, j] = np.bincount(g_codes, weights=w_tx_mat[:, j], minlength=n_g)
-        mean_len_mat[:, j] = np.bincount(g_codes, weights=len_mat[:, j], minlength=n_g) / tx_per_g
+        cnt_j = cnt_mat[:, j]
+        len_j = np.clip(len_raw_mat[:, j], 1.0, None)
+        rate_j = cnt_j / len_j
+        rsum = float(rate_j.sum())
+        tpm_j = (rate_j * (1e6 / rsum)) if rsum > 0.0 else np.zeros_like(rate_j)
+        w_tx_j = tpm_j * len_j
+        g_cnt_mat[:, j] = np.bincount(g_codes, weights=cnt_j, minlength=n_g)
+        g_ab_mat[:, j] = np.bincount(g_codes, weights=tpm_j, minlength=n_g)
+        w_len_mat[:, j] = np.bincount(g_codes, weights=w_tx_j, minlength=n_g)
+        mean_len_mat[:, j] = np.bincount(g_codes, weights=len_j, minlength=n_g) / tx_per_g
     with np.errstate(divide="ignore", invalid="ignore"):
         g_len_mat = np.where(g_ab_mat > 0.0, w_len_mat / np.where(g_ab_mat > 0.0, g_ab_mat, 1.0), mean_len_mat)
     log_l = np.log(np.clip(g_len_mat, 1.0, None))

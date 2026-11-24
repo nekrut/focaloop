@@ -318,22 +318,40 @@ def from_fasta(fasta, bed=None, cache=None, need_core=True):
     names, seqs = read_fasta(fasta)
     lengths = np.array([len(s) for s in seqs], dtype=np.int64)
     offsets = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
-    seq = CODE[np.frombuffer(b"".join(seqs), dtype=np.uint8)]
+    seq = np.empty(int(offsets[-1]), dtype=np.uint8)
+    for i, s in enumerate(seqs):
+        if len(s):
+            seq[offsets[i]:offsets[i + 1]] = CODE[np.frombuffer(s, dtype=np.uint8)]
+        seqs[i] = b""
+    del seqs
     has_bed = bed_p is not None and bed_p.exists()
     if has_bed:
         core = np.zeros(int(offsets[-1]), bool)
         cidx = {n: i for i, n in enumerate(names)}
-        with open(bed_p) as f:
+        n_bed_rows = 0
+        n_matched_rows = 0
+        bed_examples = []
+        with open(bed_p, encoding="utf-8-sig") as f:
             for line in f:
-                if not line or line.startswith(("#", "track", "browser")):
+                if not line.strip() or line.startswith(("#", "track", "browser")):
                     continue
                 t = line.split()
-                if len(t) >= 3 and t[0] in cidx:
-                    ci = cidx[t[0]]
-                    s0 = max(0, int(t[1]))
-                    e0 = min(int(lengths[ci]), int(t[2]))
-                    if e0 > s0:
-                        core[offsets[ci] + s0: offsets[ci] + e0] = True
+                if len(t) >= 3:
+                    n_bed_rows += 1
+                    if len(bed_examples) < 5 and t[0] not in bed_examples:
+                        bed_examples.append(t[0])
+                    if t[0] in cidx:
+                        ci = cidx[t[0]]
+                        s0 = max(0, int(t[1]))
+                        e0 = min(int(lengths[ci]), int(t[2]))
+                        if e0 > s0:
+                            core[offsets[ci] + s0: offsets[ci] + e0] = True
+                            n_matched_rows += 1
+        if n_bed_rows > 0 and n_matched_rows == 0:
+            raise ValueError(
+                f"Target BED {bed_p.name} matched 0 intervals in reference {fasta.name} "
+                f"(BED contigs: {bed_examples[:5]}, reference contigs: {list(names[:5])})"
+            )
     elif need_core:
         core = seq < 4
     else:

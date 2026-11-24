@@ -62,13 +62,15 @@ static int build_index(const char *fasta_path, const char *out_path) {
     if (!fp) { perror("fopen fasta"); return 1; }
     uint8_t *bits = calloc(1, BITSET_BYTES);
     if (!bits) { fprintf(stderr, "OOM bitset\n"); fclose(fp); return 1; }
-    static char line[1 << 16];
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t nread;
     uint32_t fwd = 0, rc = 0;
     int valid = 0;
     long long n_kmers = 0, n_unique = 0;
-    while (fgets(line, sizeof(line), fp)) {
+    while ((nread = getline(&line, &line_cap, fp)) > 0) {
         if (line[0] == '>') { valid = 0; fwd = 0; rc = 0; continue; }
-        for (size_t i = 0; line[i]; i++) {
+        for (ssize_t i = 0; i < nread; i++) {
             uint8_t b = ENC[(uint8_t)line[i]];
             if (b > 3) {
                 if (line[i] != '\n' && line[i] != '\r' && line[i] != ' ') {
@@ -90,6 +92,7 @@ static int build_index(const char *fasta_path, const char *out_path) {
             }
         }
     }
+    free(line);
     fclose(fp);
     int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror("open out"); free(bits); return 1; }
@@ -128,7 +131,7 @@ static inline int k15_pass(const uint8_t *bits, const char *seq, size_t slen, in
 typedef struct {
     long long uid;
     double ka;
-    uint32_t slen;
+    size_t slen;
     size_t seq_off;
 } CalRec;
 
@@ -160,8 +163,15 @@ int main(int argc, char **argv) {
         bits = (const uint8_t *)p;
     }
 
-    static char line[1 << 20];
-    static char seq[1 << 20];
+    char *line = NULL;
+    size_t line_cap = 0;
+    size_t seq_cap = 1U << 20;
+    char *seq = (char *)malloc(seq_cap);
+    if (!seq) {
+        fprintf(stderr, "OOM allocating initial unitig sequence buffer\n");
+        return 1;
+    }
+    seq[0] = '\0';
     setvbuf(stdin, NULL, _IOFBF, 4 << 20);
     setvbuf(stdout, NULL, _IOFBF, 4 << 20);
 
@@ -226,12 +236,14 @@ int main(int argc, char **argv) {
                 if (!calibrated) { \
                     if (cal_seq_len + slen > cal_seq_cap) { \
                         while (cal_seq_len + slen > cal_seq_cap) cal_seq_cap *= 2; \
-                        cal_seqs = realloc(cal_seqs, cal_seq_cap); \
+                        char *_grown_cs = realloc(cal_seqs, cal_seq_cap); \
+                        if (!_grown_cs) { fprintf(stderr, "OOM growing cal_seqs\n"); return 1; } \
+                        cal_seqs = _grown_cs; \
                     } \
                     memcpy(cal_seqs + cal_seq_len, seq, slen); \
                     cal_recs[cal_n].uid = n_u - 1; \
                     cal_recs[cal_n].ka = ka; \
-                    cal_recs[cal_n].slen = (uint32_t)slen; \
+                    cal_recs[cal_n].slen = slen; \
                     cal_recs[cal_n].seq_off = cal_seq_len; \
                     cal_seq_len += slen; \
                     cal_n++; \
@@ -249,32 +261,46 @@ int main(int argc, char **argv) {
         } \
     } while (0)
 
-    while (fgets(line, sizeof(line), stdin)) {
+    ssize_t nread;
+    while ((nread = getline(&line, &line_cap, stdin)) > 0) {
         if (line[0] == '>') {
             if (have) HANDLE_REC();
-            have = 1; slen = 0; ka = 1.0;
+            have = 1; slen = 0; seq[0] = '\0'; ka = 1.0;
             char *p = strstr(line, "ka:f:");
             if (p) ka = strtod(p + 5, NULL);
-        } else {
-            size_t l = strlen(line);
+        } else if (have) {
+            size_t l = (size_t)nread;
             while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) l--;
-            if (slen + l < sizeof(seq) - 1) {
-                memcpy(seq + slen, line, l);
-                slen += l;
-                seq[slen] = '\0';
+            if (slen + l + 1U > seq_cap) {
+                while (slen + l + 1U > seq_cap) seq_cap *= 2U;
+                char *grown = (char *)realloc(seq, seq_cap);
+                if (!grown) {
+                    fprintf(stderr, "OOM growing unitig sequence buffer to %zu bytes\n", seq_cap);
+                    free(line);
+                    free(seq);
+                    return 1;
+                }
+                seq = grown;
             }
+            memcpy(seq + slen, line, l);
+            slen += l;
+            seq[slen] = '\0';
         }
     }
     if (have) HANDLE_REC();
     FLUSH_CAL();
 
+    fflush(stdout);
+    int out_err = ferror(stdout);
     fprintf(stderr,
             "{\"n_unitigs\": %lld, \"total_bp\": %lld, \"kept_unitigs\": %lld, \"kept_bp\": %lld, "
             "\"drop_ka\": %lld, \"drop_host\": %lld, \"weighted_bp\": %.2f, "
             "\"adaptive\": %d, \"med_len80_ka\": %.2f, \"eff_min_ka\": %.2f}\n",
             n_u, tot_bp, kept_u, kept_bp, drop_ka, drop_host, w_bp, adaptive, med_len80, eff_min_ka);
 
+    free(line);
+    free(seq);
     if (bits) munmap((void *)bits, BITSET_BYTES);
     if (fd >= 0) close(fd);
-    return 0;
+    return out_err ? 1 : 0;
 }

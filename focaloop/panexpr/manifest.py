@@ -16,7 +16,7 @@ import socket
 ENA_FILEREPORT = "https://www.ebi.ac.uk/ena/portal/api/filereport"
 ENA_FIELDS = (
     "run_accession,sample_alias,sample_title,library_layout,library_strategy,"
-    "read_count,fastq_bytes,fastq_ftp,fastq_md5"
+    "read_count,base_count,fastq_bytes,fastq_ftp,fastq_md5"
 )
 
 
@@ -69,6 +69,13 @@ class StudyManifest:
     study_id: str
     accession: str
     runs: list[Run]
+
+    def __post_init__(self) -> None:
+        seen: set[str] = set()
+        for r in self.runs:
+            if r.run_id in seen:
+                raise ValueError(f"Duplicate run_id {r.run_id!r} in StudyManifest")
+            seen.add(r.run_id)
 
     @property
     def total_archive_bytes(self) -> int:
@@ -161,6 +168,21 @@ def parse_ena_filereport(
             cond = condition_of.get(acc) or condition_of.get(sample) or "NA"
         else:
             cond = "NA"
+        rc_val = int(row.get("read_count") or 0)
+        bc_val = int(row.get("base_count") or 0)
+        extra_meta: dict = {}
+        if rc_val > 0 and bc_val > 0:
+            mates = 2 if layout == "PE" else 1
+            rlen = bc_val / (rc_val * mates)
+            extra_meta["_ena_meta"] = {
+                "read_count": rc_val,
+                "base_count": bc_val,
+                "fastq_bytes": sum(sizes),
+                "layout": layout,
+                "mates": mates,
+                "read_len": round(rlen, 2),
+                "kmers_per_frag": round(max(2.0, mates * max(1.0, rlen - 30.0)), 2),
+            }
         runs.append(
             Run(
                 run_id=acc,
@@ -168,8 +190,9 @@ def parse_ena_filereport(
                 condition=cond,
                 layout=layout,
                 strategy=row.get("library_strategy") or "RNA-Seq",
-                read_count=int(row.get("read_count") or 0),
+                read_count=rc_val,
                 files=files,
+                extra=extra_meta,
             )
         )
     runs.sort(key=lambda r: r.run_id)

@@ -336,14 +336,15 @@ void dothash_knn_1_vs_n_jaccard(
     float         *top_jaccard_out,
     int            n_threads
 ) {
-    if (k_top <= 0 || n_rows == 0) return;
+    if (k_top <= 0) return;
+    for (int c = 0; c < k_top; ++c) {
+        top_jaccard_out[c] = -1e30f;
+        top_idx_out[c] = -1;
+    }
+    if (n_rows == 0) return;
     const float inv_d = 1.0f / (float)DOTHASH_DIM;
 
     if (n_threads == 1 || n_rows < 1024) {
-        for (int c = 0; c < k_top; ++c) {
-            top_jaccard_out[c] = -1e30f;
-            top_idx_out[c] = -1;
-        }
         for (size_t i = 0; i < n_rows; ++i) {
             int64_t dot = dot_i16_2048_fast(query, mat + i * DOTHASH_DIM);
             float inter = (float)dot * inv_d;
@@ -365,30 +366,32 @@ void dothash_knn_1_vs_n_jaccard(
         local_scores[t] = -1e30f;
         local_idx[t] = -1;
     }
+    int team_T = 1;
 
     #pragma omp parallel num_threads(n_threads)
     {
         int tid = omp_get_thread_num();
-        float   *my_s = local_scores + tid * k_top;
-        int32_t *my_i = local_idx + tid * k_top;
-        #pragma omp for schedule(static)
-        for (size_t i = 0; i < n_rows; ++i) {
-            int64_t dot = dot_i16_2048_fast(query, mat + i * DOTHASH_DIM);
-            float inter = (float)dot * inv_d;
-            if (inter < 0.0f) inter = 0.0f;
-            float max_inter = (query_card < row_cards[i]) ? query_card : row_cards[i];
-            if (inter > max_inter) inter = max_inter;
-            float denom = query_card + row_cards[i] - inter;
-            float jacc = (denom > 1e-6f) ? (inter / denom) : 0.0f;
-            topk_insert(k_top, jacc, (int32_t)i, my_s, my_i);
+        int actual_T = omp_get_num_threads();
+        if (tid == 0) team_T = actual_T;
+        if (tid < n_threads) {
+            float   *my_s = local_scores + tid * k_top;
+            int32_t *my_i = local_idx + tid * k_top;
+            #pragma omp for schedule(static)
+            for (size_t i = 0; i < n_rows; ++i) {
+                int64_t dot = dot_i16_2048_fast(query, mat + i * DOTHASH_DIM);
+                float inter = (float)dot * inv_d;
+                if (inter < 0.0f) inter = 0.0f;
+                float max_inter = (query_card < row_cards[i]) ? query_card : row_cards[i];
+                if (inter > max_inter) inter = max_inter;
+                float denom = query_card + row_cards[i] - inter;
+                float jacc = (denom > 1e-6f) ? (inter / denom) : 0.0f;
+                topk_insert(k_top, jacc, (int32_t)i, my_s, my_i);
+            }
         }
     }
+    if (team_T > n_threads) team_T = n_threads;
 
-    for (int c = 0; c < k_top; ++c) {
-        top_jaccard_out[c] = -1e30f;
-        top_idx_out[c] = -1;
-    }
-    for (int t = 0; t < n_threads; ++t) {
+    for (int t = 0; t < team_T; ++t) {
         for (int c = 0; c < k_top; ++c) {
             if (local_idx[t * k_top + c] >= 0) {
                 topk_insert(k_top, local_scores[t * k_top + c], local_idx[t * k_top + c],
@@ -419,16 +422,18 @@ void dothash_knn_q_vs_n_jaccard(
     float         *top_jaccard_out,
     int            n_threads
 ) {
-    if (k_top <= 0 || n_rows == 0 || n_queries == 0) return;
-    const float inv_d = 1.0f / (float)DOTHASH_DIM;
-
+    if (k_top <= 0 || n_queries == 0) return;
     for (size_t q = 0; q < n_queries * (size_t)k_top; ++q) {
         top_jaccard_out[q] = -1e30f;
         top_idx_out[q] = -1;
     }
+    if (n_rows == 0) return;
+    const float inv_d = 1.0f / (float)DOTHASH_DIM;
 
 #ifdef _OPENMP
     if (n_threads <= 0) n_threads = omp_get_max_threads();
+#else
+    n_threads = 1;
 #endif
 
     const size_t TILE_Q = 8;
@@ -490,30 +495,50 @@ void dothash_knn_q_vs_n_jaccard(
                 loc_s[u] = -1e30f;
                 loc_i[u] = -1;
             }
+            int team_T = 1;
 
             #pragma omp parallel num_threads(n_threads)
             {
                 int tid = omp_get_thread_num();
-                float   *my_s = loc_s + (size_t)tid * qt * (size_t)k_top;
-                int32_t *my_i = loc_i + (size_t)tid * qt * (size_t)k_top;
-                #pragma omp for schedule(static)
-                for (size_t i = 0; i < n_rows; ++i) {
-                    const int16_t *row = mat + i * DOTHASH_DIM;
-                    float rc = row_cards[i];
-                    size_t dq = 0;
+                int actual_T = omp_get_num_threads();
+                if (tid == 0) team_T = actual_T;
+                if (tid < n_threads) {
+                    float   *my_s = loc_s + (size_t)tid * qt * (size_t)k_top;
+                    int32_t *my_i = loc_i + (size_t)tid * qt * (size_t)k_top;
+                    #pragma omp for schedule(static)
+                    for (size_t i = 0; i < n_rows; ++i) {
+                        const int16_t *row = mat + i * DOTHASH_DIM;
+                        float rc = row_cards[i];
+                        size_t dq = 0;
 #if HAVE_NEON
-                    for (; dq + 4 <= qt; dq += 4) {
-                        int64_t dots[4];
-                        dot4_i16_2048_fast(
-                            queries + (q0 + dq + 0) * DOTHASH_DIM,
-                            queries + (q0 + dq + 1) * DOTHASH_DIM,
-                            queries + (q0 + dq + 2) * DOTHASH_DIM,
-                            queries + (q0 + dq + 3) * DOTHASH_DIM,
-                            row, dots
-                        );
-                        for (size_t u = 0; u < 4; ++u) {
-                            size_t q = q0 + dq + u;
-                            float inter = (float)dots[u] * inv_d;
+                        for (; dq + 4 <= qt; dq += 4) {
+                            int64_t dots[4];
+                            dot4_i16_2048_fast(
+                                queries + (q0 + dq + 0) * DOTHASH_DIM,
+                                queries + (q0 + dq + 1) * DOTHASH_DIM,
+                                queries + (q0 + dq + 2) * DOTHASH_DIM,
+                                queries + (q0 + dq + 3) * DOTHASH_DIM,
+                                row, dots
+                            );
+                            for (size_t u = 0; u < 4; ++u) {
+                                size_t q = q0 + dq + u;
+                                float inter = (float)dots[u] * inv_d;
+                                if (inter < 0.0f) inter = 0.0f;
+                                float qc = query_cards[q];
+                                float max_inter = (qc < rc) ? qc : rc;
+                                if (inter > max_inter) inter = max_inter;
+                                float denom = qc + rc - inter;
+                                float jacc = (denom > 1e-6f) ? (inter / denom) : 0.0f;
+                                topk_insert(k_top, jacc, (int32_t)i,
+                                            my_s + (dq + u) * (size_t)k_top,
+                                            my_i + (dq + u) * (size_t)k_top);
+                            }
+                        }
+#endif
+                        for (; dq < qt; ++dq) {
+                            size_t q = q0 + dq;
+                            int64_t dot = dot_i16_2048_fast(queries + q * DOTHASH_DIM, row);
+                            float inter = (float)dot * inv_d;
                             if (inter < 0.0f) inter = 0.0f;
                             float qc = query_cards[q];
                             float max_inter = (qc < rc) ? qc : rc;
@@ -521,29 +546,15 @@ void dothash_knn_q_vs_n_jaccard(
                             float denom = qc + rc - inter;
                             float jacc = (denom > 1e-6f) ? (inter / denom) : 0.0f;
                             topk_insert(k_top, jacc, (int32_t)i,
-                                        my_s + (dq + u) * (size_t)k_top,
-                                        my_i + (dq + u) * (size_t)k_top);
+                                        my_s + dq * (size_t)k_top,
+                                        my_i + dq * (size_t)k_top);
                         }
-                    }
-#endif
-                    for (; dq < qt; ++dq) {
-                        size_t q = q0 + dq;
-                        int64_t dot = dot_i16_2048_fast(queries + q * DOTHASH_DIM, row);
-                        float inter = (float)dot * inv_d;
-                        if (inter < 0.0f) inter = 0.0f;
-                        float qc = query_cards[q];
-                        float max_inter = (qc < rc) ? qc : rc;
-                        if (inter > max_inter) inter = max_inter;
-                        float denom = qc + rc - inter;
-                        float jacc = (denom > 1e-6f) ? (inter / denom) : 0.0f;
-                        topk_insert(k_top, jacc, (int32_t)i,
-                                    my_s + dq * (size_t)k_top,
-                                    my_i + dq * (size_t)k_top);
                     }
                 }
             }
+            if (team_T > n_threads) team_T = n_threads;
 
-            for (int t = 0; t < n_threads; ++t) {
+            for (int t = 0; t < team_T; ++t) {
                 for (size_t dq = 0; dq < qt; ++dq) {
                     size_t q = q0 + dq;
                     const float   *src_s = loc_s + ((size_t)t * qt + dq) * (size_t)k_top;

@@ -12,6 +12,10 @@
     <expand macro="requirements"/>
     <version_command>focaloop --version</version_command>
     <command detect_errors="aggressive"><![CDATA[
+#if str($rna_source.source_type) == "history_bams" and not $rna_source.short_bams and not $rna_source.long_bams
+echo "Select at least one pre-aligned short-read or long-read BAM dataset." >&2 && exit 1
+#end if
+export GENELOOP_LONG_STRANDED='$refinement_options.long_stranded' &&
 focaloop geneloop
     #if str($genome_source.source) == "cached"
         --genome '$genome_source.cached_fasta.fields.path'
@@ -67,7 +71,7 @@ focaloop geneloop
         #end for
         --short-read-ids
         #for $pair in $rna_source.paired_reads
-            '${str($pair.element_identifier).replace("'", "_")}'
+            '${str($pair.element_identifier).replace("'", "_").strip().lstrip("-") or "sample"}'
         #end for
         #if $rna_source.long_reads
             --long-reads
@@ -76,7 +80,7 @@ focaloop geneloop
             #end for
             --long-read-ids
             #for $lr in $rna_source.long_reads
-                '${str($lr.element_identifier).replace("'", "_")}'
+                '${str($lr.element_identifier).replace("'", "_").strip().lstrip("-") or "sample"}'
             #end for
         #end if
         --logan-mode 'off'
@@ -87,13 +91,10 @@ focaloop geneloop
         #end for
         --long-read-ids
         #for $lr in $rna_source.long_reads
-            '${str($lr.element_identifier).replace("'", "_")}'
+            '${str($lr.element_identifier).replace("'", "_").strip().lstrip("-") or "sample"}'
         #end for
         --logan-mode 'off'
     #elif str($rna_source.source_type) == "history_bams"
-        #if not $rna_source.short_bams and not $rna_source.long_bams
-            echo "Select at least one pre-aligned short-read or long-read BAM dataset." >&2 && exit 1 &&
-        #end if
         #if $rna_source.short_bams
             --short-bams
             #for $sb in $rna_source.short_bams
@@ -101,7 +102,7 @@ focaloop geneloop
             #end for
             --short-bam-ids
             #for $sb in $rna_source.short_bams
-                '${str($sb.element_identifier).replace("'", "_")}'
+                '${str($sb.element_identifier).replace("'", "_").strip().lstrip("-") or "sample"}'
             #end for
         #end if
         #if $rna_source.long_bams
@@ -111,7 +112,7 @@ focaloop geneloop
             #end for
             --long-bam-ids
             #for $lb in $rna_source.long_bams
-                '${str($lb.element_identifier).replace("'", "_")}'
+                '${str($lb.element_identifier).replace("'", "_").strip().lstrip("-") or "sample"}'
             #end for
         #end if
         --logan-mode 'off'
@@ -294,6 +295,7 @@ focaloop geneloop
                 <option value="off">Off (protein-coding genes and lncRNAs only)</option>
             </param>
             <param argument="--zoom" type="boolean" truevalue="--zoom" falsevalue="--no-zoom" checked="true" label="Rescue short micro-exons (3-27 bp) and filter processed retrocopies" help="Scans splice gaps for short coding micro-exons missed by standard aligners and separates intact functional single-exon genes from intronless retrocopy pseudogenes."/>
+            <param name="long_stranded" type="boolean" truevalue="1" falsevalue="0" checked="false" label="Long-read RNA-seq inputs are strand-oriented (direct-RNA)" help="Leave off for unoriented Nanopore cDNA or PacBio Iso-Seq reads so splice junctions are searched on both strands. Enable only for strand-oriented Nanopore direct-RNA libraries."/>
         </section>
 
         <section name="streaming_options" title="Adaptive RNA-seq streaming options (FASTQ and SRA/ENA inputs)" expanded="false">

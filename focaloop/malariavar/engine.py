@@ -129,8 +129,11 @@ def run_sample(row, cohort, cfg):
     panel = P.load_panel()
     use_pla_sieve = bool(cfg.get("use_pla_sieve", False))
     kset = P.load_pla_sieve(cfg.get("pla_sieve_path")) if use_pla_sieve else P.load_kset()
+    dedup_cfg = cfg.get("dedup", True)
+    dedup_on = (str(dedup_cfg).strip().lower() != "off") if isinstance(dedup_cfg, str) else bool(dedup_cfg)
     cp = C.CallParams(min_bq=cfg.get("min_bq", 13), min_mapq=cfg.get("min_mapq", 20),
                       max_mm_frac=cfg.get("max_mm_frac", C.CallParams().max_mm_frac),
+                      dedup=dedup_on,
                       use_omnitig_zoom=bool(cfg.get("use_omnitig_zoom", False)))
     gp = SG.GateParams(slice_spots=cfg.get("slice_spots", 250_000), min_depth=cfg.get("min_depth", 22.0),
                        min_depth_poly=cfg.get("min_depth_poly", 32.0),
@@ -139,8 +142,8 @@ def run_sample(row, cohort, cfg):
     gate = SG.StopGate(g, panel, gp)
     src = ST.make_source(row, xsra_threads=cfg.get("xsra_threads", 2), log=log, prefer=cfg.get("prefer"),
                          stage_dir=STAGE, decode_sem=_DECODE_SLOTS, prefetch_dir=cfg.get("prefetch_dir"))
-    if src.kind != "aws_odp_xsra":
-        # staged ODP objects are already on the wire; CRAM / ENA FASTQ are coordinate-sorted and need the whole file
+    if src.kind != "aws_odp_xsra" or row.get("order_hint") == "sorted":
+        # staged ODP objects are already on the wire; coordinate-sorted streams need the whole genome
         gate.p.max_wire_bytes = float("inf")
     srf = bool(row.get("order_hint") == "flowcell")
     sieve = ST.Sieve(kset, paired=src.paired, need=int(cfg.get("depletion_need", 2)), use_pla_sieve=use_pla_sieve)
@@ -164,6 +167,7 @@ def run_sample(row, cohort, cfg):
     slice_cv = threading.Condition(lock)
     k_done_ref = [-1]
     bytes_ahead = [0]
+    first_sam_seen = threading.Event()
     qc = {}
     err = []
     wave0_buf = bytearray()
@@ -211,8 +215,11 @@ def run_sample(row, cohort, cfg):
                     with slice_cv:
                         k_idx = len(bounds)
                         bounds.append((k_idx, int(sieve.stats[8]), float(sieve.p)))
-                        while (not stop.is_set() and k_idx - k_done_ref[0] > 1
-                               and bytes_ahead[0] >= (4 << 20) and mapper.poll() is None):
+                        wait_deadline = time.monotonic() + 2.0
+                        while (not stop.is_set() and first_sam_seen.is_set()
+                               and k_idx - k_done_ref[0] > 1
+                               and bytes_ahead[0] >= (4 << 20) and mapper.poll() is None
+                               and time.monotonic() < wait_deadline):
                             slice_cv.wait(timeout=0.05)
                     k_next += gp.slice_spots
                     if stop.is_set() or not sieve.carry:
@@ -273,6 +280,10 @@ def run_sample(row, cohort, cfg):
             data = mapper.stdout.read(CHUNK)
             if not data:
                 break
+            if not first_sam_seen.is_set():
+                first_sam_seen.set()
+                with slice_cv:
+                    slice_cv.notify_all()
             if "sam" in tees:
                 tees["sam"].stdin.write(data)
             buf = carry + data
@@ -289,6 +300,9 @@ def run_sample(row, cohort, cfg):
                 bin_p[newly] = slice_p
                 if order_mode is None:
                     order_mode = detect_order_mode(acc.ccount, g.lengths, acc.binbases)
+                    if order_mode == "sorted" and src.kind == "aws_odp_xsra":
+                        # Coordinate-sorted archive detected mid-stream: lift wire byte cap (#35)
+                        gate.p.max_wire_bytes = float("inf")
                     if (order_mode == "flowcell" and src.kind == "aws_odp_xsra" and sieve.p < 1.0
                             and not cfg.get("p_fixed")):
                         with lock:
@@ -355,6 +369,15 @@ def run_sample(row, cohort, cfg):
     # ---------------------------------------------------------------- Stage 3 + 5 finalisation
     t1 = time.time()
     m_final = gate.metrics(acc, cnv_loci=False)
+    if stop_reason == "byte_cap" and m_final["bins_covered"] < gp.min_bin_cover:
+        if src.kind == "aws_odp_xsra" and not cfg.get("_no_fallback"):
+            log.close()
+            return run_sample(row, cohort, dict(cfg, prefer="odp_stage", _no_fallback=True))
+        err.append(
+            f"wire byte cap reached with incomplete genome coverage "
+            f"(bins_covered={m_final['bins_covered']:.3f} < {gp.min_bin_cover:.2f})"
+        )
+        stop_reason = "error"
     med = m_final["median_depth"]
     w, d = C.wsaf_at(acc, panel)
     fws, n_fws = C.fws(w, d, panel["af"])

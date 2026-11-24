@@ -256,12 +256,18 @@ static void fdr_free(fd_reader_t *r) {
     r->buf = NULL;
 }
 
-static int fdr_fill(fd_reader_t *r) {
+static int fdr_fill(fd_reader_t *r, int force_more) {
     if (r->pos > 0) {
         size_t rem = r->len - r->pos;
         if (rem > 0) memmove(r->buf, r->buf + r->pos, rem);
         r->len = rem;
         r->pos = 0;
+    }
+    if (force_more && r->len == r->cap && !r->eof) {
+        if (r->cap >= (128U << 20)) return -1;
+        size_t new_cap = r->cap * 2U;
+        r->buf = (uint8_t *)xrealloc(r->buf, new_cap);
+        r->cap = new_cap;
     }
     while (!r->eof && r->len < r->cap) {
         ssize_t n = read(r->fd, r->buf + r->len, r->cap - r->len);
@@ -274,7 +280,7 @@ static int fdr_fill(fd_reader_t *r) {
             break;
         }
         r->len += (size_t)n;
-        if (r->len >= (r->cap >> 1)) break;
+        if (!force_more && r->len >= (r->cap >> 1)) break;
     }
     return 0;
 }
@@ -287,7 +293,7 @@ typedef struct {
 
 /* Returns: 1 = got record, 0 = clean EOF, -1 = framing error */
 static int fdr_next_fq(fd_reader_t *r, fq_rec_t *out) {
-    for (int attempt = 0; attempt < 2; attempt++) {
+    for (int attempt = 0; attempt < 32; attempt++) {
         size_t i = r->pos, n = r->len;
         if (i == n && r->eof) return 0;
         const uint8_t *b = r->buf;
@@ -308,11 +314,8 @@ static int fdr_next_fq(fd_reader_t *r, fq_rec_t *out) {
                     return -1;
                 }
             } else {
-                if (attempt == 0) {
-                    if (fdr_fill(r) < 0) return -1;
-                    continue;
-                }
-                return -1;
+                if (fdr_fill(r, attempt > 0) < 0) return -1;
+                continue;
             }
         }
         size_t h1 = (e1 > i && b[e1 - 1] == '\r') ? e1 - 1 : e1;
@@ -412,9 +415,12 @@ int vl_fastq_sieve_paired(
     if (fdr_init(&r1, fd1, BUF_CAP) < 0) return -2;
     if (fdr_init(&r2, fd2, BUF_CAP) < 0) { fdr_free(&r1); return -2; }
 
-    uint8_t *ob_int = fd_out_interleaved >= 0 ? (uint8_t *)xmalloc(OUT_CAP + 65536) : NULL;
-    uint8_t *ob_1   = fd_out1 >= 0 ? (uint8_t *)xmalloc(OUT_CAP + 65536) : NULL;
-    uint8_t *ob_2   = fd_out2 >= 0 ? (uint8_t *)xmalloc(OUT_CAP + 65536) : NULL;
+    size_t cap_int = OUT_CAP + 65536U;
+    size_t cap_1   = OUT_CAP + 65536U;
+    size_t cap_2   = OUT_CAP + 65536U;
+    uint8_t *ob_int = fd_out_interleaved >= 0 ? (uint8_t *)xmalloc(cap_int) : NULL;
+    uint8_t *ob_1   = fd_out1 >= 0 ? (uint8_t *)xmalloc(cap_1) : NULL;
+    uint8_t *ob_2   = fd_out2 >= 0 ? (uint8_t *)xmalloc(cap_2) : NULL;
     size_t oi = 0, o1 = 0, o2 = 0;
 
     uint64_t kmask = (tab && tab_len > 0) ? (tab_len - 1ULL) : 0ULL;
@@ -476,6 +482,16 @@ int vl_fastq_sieve_paired(
             stats[2]++;
             stats[4] += ln1 + ln2;
             if (ob_int) {
+                size_t need_int = 64U + 2U * (size_t)ln1 + 2U * (size_t)ln2;
+                if (oi > 0 && oi + need_int > cap_int) {
+                    if (write_all(fd_out_interleaved, ob_int, oi) < 0) { rc = -5; break; }
+                    oi = 0;
+                }
+                if (need_int > cap_int) {
+                    if (need_int > (256U << 20)) { rc = -6; break; }
+                    cap_int = need_int + 65536U;
+                    ob_int = (uint8_t *)xrealloc(ob_int, cap_int);
+                }
                 oi += append_renamed_fq(ob_int + oi, spot, 0, a.ss, a.qs, ln1);
                 oi += append_renamed_fq(ob_int + oi, spot, 0, b.ss, b.qs, ln2);
                 if (oi >= OUT_CAP) {
@@ -484,6 +500,26 @@ int vl_fastq_sieve_paired(
                 }
             }
             if (ob_1 && ob_2) {
+                size_t need_1 = 32U + 2U * (size_t)ln1;
+                size_t need_2 = 32U + 2U * (size_t)ln2;
+                if (o1 > 0 && o1 + need_1 > cap_1) {
+                    if (write_all(fd_out1, ob_1, o1) < 0) { rc = -5; break; }
+                    o1 = 0;
+                }
+                if (need_1 > cap_1) {
+                    if (need_1 > (256U << 20)) { rc = -6; break; }
+                    cap_1 = need_1 + 65536U;
+                    ob_1 = (uint8_t *)xrealloc(ob_1, cap_1);
+                }
+                if (o2 > 0 && o2 + need_2 > cap_2) {
+                    if (write_all(fd_out2, ob_2, o2) < 0) { rc = -5; break; }
+                    o2 = 0;
+                }
+                if (need_2 > cap_2) {
+                    if (need_2 > (256U << 20)) { rc = -6; break; }
+                    cap_2 = need_2 + 65536U;
+                    ob_2 = (uint8_t *)xrealloc(ob_2, cap_2);
+                }
                 o1 += append_renamed_fq(ob_1 + o1, spot, 1, a.ss, a.qs, ln1);
                 o2 += append_renamed_fq(ob_2 + o2, spot, 2, b.ss, b.qs, ln2);
                 if (o1 >= OUT_CAP) {
@@ -989,18 +1025,21 @@ static void shard_process_line(vl_shard_t *sh, const uint8_t *line, size_t len,
     int32_t pos0 = pos1 - 1;
     int32_t mapq = (int32_t)parse_i64(f_s[4], f_e[4]);
 
-    /* Strict SAM SEQ/QUAL/CIGAR validation: reject '*', unequal SEQ/QUAL lengths, or out-of-bounds CIGAR */
+    /* Strict SAM SEQ/QUAL/CIGAR validation: reject '*', unequal SEQ/QUAL lengths (except QUAL == '*'), or bad CIGAR */
+    static const uint8_t DEFAULT_Q30[65536] = { [0 ... 65535] = '?' };
     int64_t raw_qlen = (int64_t)(f_e[9] - f_s[9]);
     int64_t raw_quallen = (int64_t)(f_e[10] - f_s[10]);
-    if (raw_qlen <= 0 || raw_qlen > 65535 || raw_quallen != raw_qlen ||
-        (raw_qlen == 1 && (f_s[9][0] == '*' || f_s[10][0] == '*')) ||
+    int qual_is_star = (raw_quallen == 1 && f_s[10][0] == '*');
+    if (raw_qlen <= 0 || raw_qlen > 65535 ||
+        (raw_qlen == 1 && f_s[9][0] == '*') ||
+        (!qual_is_star && raw_quallen != raw_qlen) ||
         (f_e[5] <= f_s[5]) || (f_e[5] - f_s[5] == 1 && f_s[5][0] == '*')) {
         sh->stats[11]++;
         return;
     }
     int32_t qlen = (int32_t)raw_qlen;
     const uint8_t *seq_s = f_s[9];
-    const uint8_t *qual_s = f_s[10];
+    const uint8_t *qual_s = qual_is_star ? DEFAULT_Q30 : f_s[10];
 
     /* Walk CIGAR once with overflow guard (< 2^26 per op) and verify query sum == len(SEQ) */
     int32_t rspan = 0, indel = 0, num = 0, q_cur = 0, lead_clip = 0, trail_clip = 0;
@@ -1058,7 +1097,28 @@ static void shard_process_line(vl_shard_t *sh, const uint8_t *line, size_t len,
         if (!any_ok) return;
     }
 
-    /* 1 kb depth bins (MAPQ >= bin_mapq) */
+    int paired = (flag & 1) != 0;
+    int same_spot = (sh->prev_spot == spot);
+    int same_chr = ((f_e[6] - f_s[6] == 1) && f_s[6][0] == '=');
+    int32_t pn1 = same_chr ? (int32_t)parse_i64(f_s[7], f_e[7]) : 0;
+    int32_t tlen = (int32_t)parse_i64(f_s[8], f_e[8]);
+
+    /* Full 64-bit collision-free streaming template PCR/optical duplicate check (>4,096 contigs & arbitrary TLEN) */
+    if (sh->dedup_tab != NULL && paired && same_chr && tlen != 0 && mapq >= acc->min_mapq && (flag & 2) != 0) {
+        uint64_t left_p = (uint64_t)(uint32_t)(tlen > 0 ? pos1 : pn1);
+        uint64_t span_u = (uint64_t)(uint32_t)(tlen < 0 ? -(int64_t)tlen : (int64_t)tlen);
+        uint64_t side_u = (tlen > 0) ? 0x9e3779b97f4a7c15ULL : 0xbf58476d1ce4e5b9ULL;
+        uint64_t dk = mix64(mix64((uint64_t)(uint32_t)c ^ side_u) ^ mix64((left_p << 32) | span_u)) | 1ULL;
+        uint64_t ds = mix64(dk) & sh->dedup_mask;
+        if (sh->dedup_tab[ds] == dk) {
+            sh->stats[10]++;
+            if (same_spot) { sh->prev_spot = -1; sh->prev_ctg = -1; sh->prev_s = 0; sh->prev_e = 0; }
+            return;
+        }
+        sh->dedup_tab[ds] = dk;
+    }
+
+    /* 1 kb depth bins (MAPQ >= bin_mapq, accumulated after PCR duplicate removal when enabled) */
     if (mapq >= acc->bin_mapq && end0 > pos0) {
         int32_t a = pos0;
         while (a < end0) {
@@ -1068,31 +1128,6 @@ static void shard_process_line(vl_shard_t *sh, const uint8_t *line, size_t len,
             acc->binbases[bi] += (nxt - a);
             a = nxt;
         }
-    }
-
-    int paired = (flag & 1) != 0;
-    int same_spot = (sh->prev_spot == spot);
-    int same_chr = ((f_e[6] - f_s[6] == 1) && f_s[6][0] == '=');
-    int32_t pn1 = same_chr ? (int32_t)parse_i64(f_s[7], f_e[7]) : 0;
-    int32_t tlen = (int32_t)parse_i64(f_s[8], f_e[8]);
-
-    /* Exact 62-bit streaming template PCR/optical duplicate check (run before zoom capture too) */
-    if (sh->dedup_tab != NULL && paired && same_chr && tlen != 0 && mapq >= acc->min_mapq && (flag & 2) != 0) {
-        uint32_t left_p = (uint32_t)(tlen > 0 ? pos1 : pn1);
-        uint32_t span_u = (uint32_t)(tlen < 0 ? -tlen : tlen);
-        if (span_u > 0x1FFFFU) span_u = 0x1FFFFU;
-        uint64_t side_u = (tlen > 0) ? 0ULL : 1ULL;
-        uint64_t dk = (((uint64_t)(c & 0xFFF) << 50) |
-                       ((uint64_t)left_p << 18) |
-                       ((uint64_t)span_u << 1) |
-                       side_u) + 1ULL;
-        uint64_t ds = mix64(dk) & sh->dedup_mask;
-        if (sh->dedup_tab[ds] == dk) {
-            sh->stats[10]++;
-            sh->prev_spot = spot; sh->prev_ctg = c; sh->prev_s = pos0; sh->prev_e = end0;
-            return;
-        }
-        sh->dedup_tab[ds] = dk;
     }
 
     int captured = 0;
@@ -1106,7 +1141,7 @@ static void shard_process_line(vl_shard_t *sh, const uint8_t *line, size_t len,
     }
 
     if (mapq < acc->min_mapq || (paired && (flag & 2) == 0)) {
-        sh->prev_spot = spot; sh->prev_ctg = c; sh->prev_s = pos0; sh->prev_e = end0;
+        if (same_spot) { sh->prev_spot = -1; sh->prev_ctg = -1; sh->prev_s = 0; sh->prev_e = 0; }
         return;
     }
 
@@ -1127,7 +1162,7 @@ static void shard_process_line(vl_shard_t *sh, const uint8_t *line, size_t len,
     }
     if (nm >= 0 && rspan > 0 && (double)(nm - indel) > acc->max_mm_frac * (double)rspan) {
         sh->stats[5]++;
-        sh->prev_spot = spot; sh->prev_ctg = c; sh->prev_s = pos0; sh->prev_e = end0;
+        if (same_spot) { sh->prev_spot = -1; sh->prev_ctg = -1; sh->prev_s = 0; sh->prev_e = 0; }
         return;
     }
 
@@ -2160,4 +2195,65 @@ void vl_score_reads_haplotypes(
     free(M_row);
     free(I_row);
     free(D_row);
+}
+
+int64_t vl_acc_extract_callable_runs(
+    const vl_acc_t *acc,
+    int32_t ctg_id,
+    int32_t min_dp,
+    int32_t *out_s0,
+    int32_t *out_e0,
+    int64_t max_runs
+) {
+    if (!acc || ctg_id < 0 || ctg_id >= acc->n_contigs) return 0;
+    const vl_contig_t *ctg = &acc->contigs[ctg_id];
+    if (min_dp < 1) min_dp = 1;
+    int64_t n_runs = 0;
+    int in_run = 0;
+    int32_t run_s = 0;
+    for (int32_t pidx = 0; pidx < ctg->n_pages; pidx++) {
+        const vl_page_t *pg = ctg->pages[pidx];
+        int32_t page_base = pidx << VL_PAGE_BITS;
+        if (pg == NULL) {
+            if (in_run) {
+                if (out_s0 && out_e0 && n_runs < max_runs) {
+                    out_s0[n_runs] = run_s;
+                    out_e0[n_runs] = page_base;
+                }
+                n_runs++;
+                in_run = 0;
+            }
+            continue;
+        }
+        int32_t lim = VL_PAGE_BP;
+        if ((int64_t)page_base + lim > ctg->length) {
+            lim = (int32_t)(ctg->length - page_base);
+        }
+        for (int32_t off = 0; off < lim; off++) {
+            int32_t dp = (int32_t)pg->counts[off][0] + (int32_t)pg->counts[off][1] +
+                         (int32_t)pg->counts[off][2] + (int32_t)pg->counts[off][3] +
+                         (int32_t)pg->delc[off];
+            if (dp >= min_dp) {
+                if (!in_run) {
+                    run_s = page_base + off;
+                    in_run = 1;
+                }
+            } else if (in_run) {
+                if (out_s0 && out_e0 && n_runs < max_runs) {
+                    out_s0[n_runs] = run_s;
+                    out_e0[n_runs] = page_base + off;
+                }
+                n_runs++;
+                in_run = 0;
+            }
+        }
+    }
+    if (in_run) {
+        if (out_s0 && out_e0 && n_runs < max_runs) {
+            out_s0[n_runs] = run_s;
+            out_e0[n_runs] = (int32_t)ctg->length;
+        }
+        n_runs++;
+    }
+    return n_runs;
 }

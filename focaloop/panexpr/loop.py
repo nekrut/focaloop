@@ -29,7 +29,7 @@ from .kernels import Kernel, RunAccumulator, map_pooled
 from .manifest import Run, StudyManifest
 from .solver import (assembly_assignment_summary, combine_zoom_gene_tables, de_with_uncertainty, fast_nb_mom_de,
                      gene_level_tables, infer_dna_presence, infer_strandedness, quantify_cohort,
-                     refit_genes_with_depth_offsets, transcript_level_table)
+                     refit_genes_with_depth_offsets, transcript_level_table, validate_additive_design)
 from .state import (DOTHASH_SKETCH_SCHEMA, GENE_DE_SCHEMA, ITERATION_TELEMETRY_SCHEMA,
                     TARGET_COUNTS_SCHEMA, TRANSCRIPT_ABUNDANCE_SCHEMA, StateStore)
 from .streamer import RunStream, open_run_stream
@@ -100,11 +100,33 @@ class LoopReport:
     zoom: ZoomResult | None
     followups: dict[str, dict]
     paths: dict[str, str]
+    malformed_skipped: dict[str, int] = field(default_factory=dict)
+    skipped_unpaired_mates: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def zoom_ran(self) -> bool:
+        return "target_counts_zoom" in self.paths
 
 
 class Focaloop:
     def __init__(self, catalog: Catalog, manifest: StudyManifest, kernel: Kernel, config: LoopConfig,
                  state_dir: str | Path, log=print) -> None:
+        seen_rids: set[str] = set()
+        for r in manifest.runs:
+            if r.run_id in seen_rids:
+                raise ValueError(f"Duplicate run_id {r.run_id!r} in StudyManifest")
+            seen_rids.add(r.run_id)
+        design_cols = set(validate_additive_design(config.design))
+        if len(config.contrast) != 3:
+            raise ValueError(f"Invalid primary contrast {config.contrast!r}: expected [factor, test, reference]")
+        for fc in config.followup_contrasts:
+            if len(fc) != 3:
+                raise ValueError(f"Invalid follow-up contrast {fc!r}: expected [factor, test, reference]")
+            if fc[0] not in design_cols:
+                raise ValueError(
+                    f"Follow-up contrast factor {fc[0]!r} is not included in design {config.design!r} "
+                    f"(design terms: {sorted(design_cols)})"
+                )
         self.catalog = catalog
         self.manifest = manifest
         self.kernel = kernel
@@ -152,6 +174,14 @@ class Focaloop:
                 conds.add(str(fc[2]))
         return conds
 
+    def _global_bytes_cap_pct(self) -> float:
+        """Reserve zoom headroom inside max_bytes_pct so global + zoom never exceeds max_bytes_pct (L5)."""
+        if self.cfg.max_bytes_pct >= 100.0:
+            return float(self.cfg.max_bytes_pct)
+        if not self.cfg.zoom or self.cfg.zoom_extra_fraction <= 0:
+            return float(self.cfg.max_bytes_pct)
+        reserve = min(self.cfg.max_bytes_pct * 0.20, self.cfg.zoom_extra_fraction * 100.0)
+        return max(0.0, float(self.cfg.max_bytes_pct) - reserve)
     def _focal(self, r: Run) -> bool:
         ac = self._active_conditions()
         return ac is None or r.condition in ac
@@ -353,7 +383,8 @@ class Focaloop:
         self._last_alloc_cap_clipped = False
         if self.cfg.max_bytes_pct < 100.0:
             cum = sum(a.bytes_consumed for a in self.accs.values())
-            remaining = self.cfg.max_bytes_pct / 100.0 * self.manifest.total_archive_bytes - cum
+            eff_cap_pct = self._global_bytes_cap_pct()
+            remaining = eff_cap_pct / 100.0 * self.manifest.total_archive_bytes - cum
             planned = sum(alloc.values())
             min_sliver = max(int(0.001 * self.manifest.total_archive_bytes), int(0.10 * planned))
             if remaining <= 0 or (iteration > self.cfg.min_iterations and remaining < min_sliver):
@@ -584,8 +615,10 @@ class Focaloop:
                 continue
             d = per_sample.setdefault(r.sample, {})
             for k, v in r.extra.items():
+                if str(k).startswith("_"):
+                    continue
                 if k == "covariates" and isinstance(v, dict):
-                    d.update(v)
+                    d.update({ck: cv for ck, cv in v.items() if not str(ck).startswith("_")})
                 elif not isinstance(v, (dict, list, tuple, set)):
                     d[k] = v
         if self.cfg.sample_metadata is not None:
@@ -612,7 +645,25 @@ class Focaloop:
         else:
             dna_prob, dna_counts = {}, {}
             asm_prior = {a: 1.0 / len(self.catalog.assemblies) for a in self.catalog.assemblies}
-        strand = {a.run.run_id: (0.5 if a.run.is_wgs else infer_strandedness(a, self.catalog)) for a in self.accs.values()}
+        strand: dict[str, float] = {}
+        rna_by_scl: dict[tuple[str, str, str], list[RunAccumulator]] = {}
+        for a in self.accs.values():
+            if a.run.is_wgs:
+                strand[a.run.run_id] = 0.5
+            else:
+                rna_by_scl.setdefault((a.run.sample, a.run.condition, a.run.layout), []).append(a)
+        targets_map = self.catalog.targets
+        for grp_accs in rna_by_scl.values():
+            a_sum, b_sum = 1.0, 1.0
+            for ga in grp_accs:
+                for tid, (c0, c1) in ga.unique_counts.items():
+                    t_obj = targets_map.get(tid)
+                    if t_obj is not None and not t_obj.is_decoy:
+                        a_sum += c0
+                        b_sum += c1
+            p_grp = a_sum / (a_sum + b_sum)
+            for ga in grp_accs:
+                strand[ga.run.run_id] = p_grp
         table, post = quantify_cohort(
             self.accs, self.catalog, dna_prob, dna_counts, strand, two_way=two_way,
             em_iters=self.cfg.em_iters, include_posteriors=False, include_decoys=False,
@@ -633,8 +684,16 @@ class Focaloop:
         }
         return de, table, extra
 
+    def close_streams(self) -> None:
+        for st in self.streams.values():
+            if hasattr(st, "close"):
+                try:
+                    st.close()
+                except Exception:
+                    pass
+
     # ---------------- main ----------------
-    def run(self) -> LoopReport:
+    def run(self, close_streams: bool = True) -> LoopReport:
         cfg = self.cfg
         t_start = time.time()
         total_archive = self.manifest.total_archive_bytes
@@ -749,8 +808,8 @@ class Focaloop:
             if converged:
                 reason = "converged_tech_var_below_bio_var"
             elif cfg.max_bytes_pct < 100.0 and (
-                pct >= cfg.max_bytes_pct - 1e-6
-                or (self._last_alloc_cap_clipped and it >= cfg.min_iterations and pct >= cfg.max_bytes_pct * 0.98)
+                pct >= self._global_bytes_cap_pct() - 1e-6
+                or (self._last_alloc_cap_clipped and it >= cfg.min_iterations and pct >= self._global_bytes_cap_pct() * 0.98)
             ):
                 reason = "max_bytes_pct_cap"
             elif exhausted:
@@ -805,7 +864,17 @@ class Focaloop:
             and (self.streams[r.run_id].total_bytes - self.streams[r.run_id].consumed_bytes) > 0
             for r in self.manifest.rna_runs
         )
-        if cfg.zoom and any_stream_left:
+        max_total_allowed_bytes = (
+            int(cfg.max_bytes_pct / 100.0 * total_archive)
+            if cfg.max_bytes_pct < 100.0
+            else None
+        )
+        rem_cap_bytes = (
+            max(0, max_total_allowed_bytes - bytes_global)
+            if max_total_allowed_bytes is not None
+            else None
+        )
+        if cfg.zoom and any_stream_left and (rem_cap_bytes is None or rem_cap_bytes > 0):
             use_v24_sieve = cfg.abundant_sieve and (
                 (len(self.catalog.groups) >= 500 and cfg.zoom_extra_fraction <= 0.02)
                 or cfg.abundant_sieve_force
@@ -842,11 +911,11 @@ class Focaloop:
                     zoom_frac = max(cfg.zoom_extra_fraction, min(rem_slice, needed_frac))
                 else:
                     zoom_frac = max(cfg.zoom_extra_fraction, rem_slice)
-                if cfg.max_bytes_pct < 100.0:
-                    zoom_frac = min(zoom_frac, max(cfg.zoom_extra_fraction, cfg.max_bytes_pct / 100.0 - global_frac))
             else:
                 groups = select_borderline(de_pre, cfg.zoom_padj[0], cfg.zoom_padj[1], cfg.zoom_reads[0], cfg.zoom_reads[1])
                 zoom_frac = cfg.zoom_extra_fraction
+            if rem_cap_bytes is not None:
+                zoom_frac = min(zoom_frac, rem_cap_bytes / max(1, total_archive))
             if groups and zoom_frac > 0:
                 t_z = time.time()
                 rna_streams = {k: v for k, v in self.streams.items() if not v.run.is_wgs}
@@ -854,31 +923,49 @@ class Focaloop:
                 by_smp_z: dict[str, list[Run]] = {}
                 for r in self.manifest.rna_runs:
                     by_smp_z.setdefault(r.sample, []).append(r)
-                if any(len(rs_z) > 1 for rs_z in by_smp_z.values()):
+                if rem_cap_bytes is not None or any(len(rs_z) > 1 for rs_z in by_smp_z.values()):
                     z_lane_alloc = {}
                     for s_z, rs_z in by_smp_z.items():
                         s_tot_z = sum(self.streams[r.run_id].total_bytes for r in rs_z)
                         s_rem_z = sum(max(0, self.streams[r.run_id].total_bytes - self.streams[r.run_id].consumed_bytes) for r in rs_z)
-                        want_z = min(s_rem_z, max(cfg.min_bytes_per_file * 2, int(s_tot_z * zoom_frac)))
-                        z_lane_alloc.update(self._distribute_sample_budget(s_z, rs_z, want_z, it + 1))
-                zoom_res = zoom_pass(
-                    self.kernel, self.catalog, self.accs, rna_streams, groups,
-                    zoom_frac, log=self.log, fetch_workers=cfg.fetch_workers, pool_samples=cfg.pool_samples,
-                    abundant_groups=abundant_groups,
-                    sieve_mode=(cfg.sieve_mode if use_v24_sieve else "include"),
-                    sieve_threads=getattr(self.kernel, "threads", 4),
-                    sample_lane_alloc=z_lane_alloc,
-                    close_streams=True,
-                )
-                de_post, table = self._post_zoom_de(it, groups, zoom_res, extra, de_global=de_pre, global_table=table)
-                telemetry.append({
-                    "iteration": it, "stage": "zoom", "cum_bytes": int(bytes_global + zoom_res.bytes_scanned),
-                    "pct_archive": 100.0 * (bytes_global + zoom_res.bytes_scanned) / max(1, total_archive),
-                    "total_reads": int(zoom_res.reads_scanned), "mapped_reads": int(zoom_res.reads_mapped), "n_expressed_genes": int(len(groups)),
-                    "median_abs_delta_lfc": float("nan"), "p90_abs_delta_lfc": float("nan"), "p95_abs_delta_lfc": float("nan"),
-                    "median_tech_var_fraction": float("nan"), "n_deg_fdr05": int((de_post["padj"] < 0.05).sum()),
-                    "wall_seconds": time.time() - t_z, "stop_reason": "zoom_complete",
-                })
+                        base_want = int(round(s_tot_z * zoom_frac))
+                        if len(rs_z) > 1 and rem_cap_bytes is None:
+                            base_want = max(cfg.min_bytes_per_file * 2, base_want)
+                        want_z = min(s_rem_z, base_want)
+                        if len(rs_z) == 1:
+                            z_lane_alloc[rs_z[0].run_id] = max(0, int(want_z))
+                        else:
+                            z_lane_alloc.update(self._distribute_sample_budget(s_z, rs_z, want_z, it + 1))
+                            for r_chk in rs_z:
+                                rs_chk = self.streams[r_chk.run_id]
+                                rem_chk = max(0, rs_chk.total_bytes - rs_chk.consumed_bytes)
+                                z_lane_alloc[r_chk.run_id] = min(z_lane_alloc.get(r_chk.run_id, 0), rem_chk)
+                    if rem_cap_bytes is not None:
+                        tot_z_planned = sum(z_lane_alloc.values())
+                        if tot_z_planned > rem_cap_bytes > 0:
+                            scale_z = rem_cap_bytes / tot_z_planned
+                            z_lane_alloc = {k: int(v * scale_z) for k, v in z_lane_alloc.items()}
+                        elif rem_cap_bytes <= 0:
+                            z_lane_alloc = {k: 0 for k in z_lane_alloc}
+                if z_lane_alloc is None or sum(z_lane_alloc.values()) > 0:
+                    zoom_res = zoom_pass(
+                        self.kernel, self.catalog, self.accs, rna_streams, groups,
+                        zoom_frac, log=self.log, fetch_workers=cfg.fetch_workers, pool_samples=cfg.pool_samples,
+                        abundant_groups=abundant_groups,
+                        sieve_mode=(cfg.sieve_mode if use_v24_sieve else "include"),
+                        sieve_threads=getattr(self.kernel, "threads", 4),
+                        sample_lane_alloc=z_lane_alloc,
+                        close_streams=False,
+                    )
+                    de_post, table = self._post_zoom_de(it, groups, zoom_res, extra, de_global=de_pre, global_table=table)
+                    telemetry.append({
+                        "iteration": it, "stage": "zoom", "cum_bytes": int(bytes_global + zoom_res.bytes_scanned),
+                        "pct_archive": 100.0 * (bytes_global + zoom_res.bytes_scanned) / max(1, total_archive),
+                        "total_reads": int(zoom_res.reads_scanned), "mapped_reads": int(zoom_res.reads_mapped), "n_expressed_genes": int(len(groups)),
+                        "median_abs_delta_lfc": float("nan"), "p90_abs_delta_lfc": float("nan"), "p95_abs_delta_lfc": float("nan"),
+                        "median_tech_var_fraction": float("nan"), "n_deg_fdr05": int((de_post["padj"] < 0.05).sum()),
+                        "wall_seconds": time.time() - t_z, "stop_reason": "zoom_complete",
+                    })
         bytes_zoom = zoom_res.bytes_scanned if zoom_res else 0
         # Warm follow-ups (0 new bytes): fitted on pure global counts, then refit zoomed genes with depth_scale offsets
         followups: dict[str, dict] = {}
@@ -888,6 +975,7 @@ class Focaloop:
         zctx = self._last_zoom_ctx
         for fc in cfg.followup_contrasts:
             t_f = time.time()
+            name = f"{fc[1]}_vs_{fc[2]}"
             try:
                 fde, f_disp, f_sf = de_with_uncertainty(
                     counts, gl["avar"], gl["meta"], fc, cfg.design, gl["dna_prob"],
@@ -899,17 +987,30 @@ class Focaloop:
                         zctx["combined"], zctx["depth_scale"], zctx["avar_comb"], design=cfg.design,
                         disp=f_disp, sf=f_sf,
                     )
-                name = f"{fc[1]}_vs_{fc[2]}"
                 p = self.state.write(f"gene_de_followup_{name}", pa.Table.from_pandas(fde, preserve_index=False), GENE_DE_SCHEMA)
                 followups[name] = {"wall_seconds": time.time() - t_f, "new_fastq_bytes": 0, "n_deg_fdr05": int((fde["padj"] < 0.05).sum()), "parquet": str(p)}
             except Exception as exc:
-                followups[f"{fc[1]}_vs_{fc[2]}"] = {"error": f"{type(exc).__name__}: {exc}", "wall_seconds": time.time() - t_f, "new_fastq_bytes": 0}
-        for st in self.streams.values():
-            if hasattr(st, "close"):
-                try:
-                    st.close()
-                except Exception:
-                    pass
+                self.log(f"  [followup {name}] failed ({type(exc).__name__} - {exc})")
+                followups[name] = {"error": f"{type(exc).__name__}: {exc}", "wall_seconds": time.time() - t_f, "new_fastq_bytes": 0}
+                if close_streams:
+                    self.close_streams()
+                raise ValueError(f"Follow-up contrast {fc!r} failed: {exc}") from exc
+        malformed_by_run = {
+            rid: int(getattr(st, "malformed_skipped", 0))
+            for rid, st in self.streams.items()
+            if int(getattr(st, "malformed_skipped", 0)) > 0
+        }
+        unpaired_by_run = {
+            rid: int(getattr(st, "skipped_unpaired_mates", 0))
+            for rid, st in self.streams.items()
+            if int(getattr(st, "skipped_unpaired_mates", 0)) > 0
+        }
+        if malformed_by_run:
+            self.log(f"  [stream-qc] skipped malformed FASTQ lines in runs: {malformed_by_run}")
+        if unpaired_by_run:
+            self.log(f"  [stream-qc] skipped unpaired PE mates in runs: {unpaired_by_run}")
+        if close_streams:
+            self.close_streams()
         tx_table = transcript_level_table(
             table,
             self.catalog,
@@ -926,6 +1027,16 @@ class Focaloop:
         }
         if self._last_zoom_table is not None:
             paths["target_counts_zoom"] = str(self.state.write("target_counts_zoom", self._last_zoom_table, TARGET_COUNTS_SCHEMA))
+            if self._last_zoom_ctx is not None:
+                zoom_ctx_path = self.state.dir / "zoom_context.json"
+                zoom_ctx_payload = {
+                    "zoomed_groups": [str(g) for g in self._last_zoom_ctx.get("groups", [])],
+                    "sample_depth_scale": {
+                        str(k): float(v) for k, v in self._last_zoom_ctx["depth_scale"].items()
+                    },
+                }
+                zoom_ctx_path.write_text(json.dumps(zoom_ctx_payload, indent=2))
+                paths["zoom_context"] = str(zoom_ctx_path)
         (self.state.dir / "schedule.json").write_text(json.dumps(schedule))
         paths["schedule"] = str(self.state.dir / "schedule.json")
         bp_rows = [{"run_id": rid, "condition": a.run.condition, "target_a": k[0], "target_b": k[1], "pairs": int(c)}
@@ -956,27 +1067,43 @@ class Focaloop:
                     self.state.write("dothash_sketches", pa.Table.from_pylist(dh_rows), DOTHASH_SKETCH_SCHEMA)
                 )
         wall = time.time() - t_start
-        return LoopReport(it, stop_reason, bytes_global, bytes_zoom, 100.0 * (bytes_global + bytes_zoom) / max(1, total_archive),
-                          wall, io_tot, map_tot, solve_tot, telemetry, schedule, p1_asm, p2_asm, extra["assembly_prior"], extra["strand"],
-                          de_pre, de_post, zoom_res, followups, paths)
+        return LoopReport(
+            it, stop_reason, bytes_global, bytes_zoom, 100.0 * (bytes_global + bytes_zoom) / max(1, total_archive),
+            wall, io_tot, map_tot, solve_tot, telemetry, schedule, p1_asm, p2_asm, extra["assembly_prior"], extra["strand"],
+            de_pre, de_post, zoom_res, followups, paths,
+            malformed_skipped=malformed_by_run,
+            skipped_unpaired_mates=unpaired_by_run,
+        )
 
     def _sample_depth_scale(self, samples: list[str], zoom_res: ZoomResult) -> pd.Series:
         """Per-sample global/(global+zoom) byte fraction, aggregating multi-run samples accurately."""
         glob_b: dict[str, float] = {}
         tot_b: dict[str, float] = {}
-        for rid, sc in zoom_res.per_run_scale.items():
+        has_explicit_zb = bool(zoom_res.per_run_zoom_bytes)
+        rids = (
+            [r.run_id for r in self.manifest.rna_runs]
+            if has_explicit_zb
+            else list(dict.fromkeys(list(zoom_res.per_run_scale.keys()) + [r.run_id for r in self.manifest.rna_runs]))
+        )
+        for rid in rids:
             if rid not in self.accs:
                 continue
             acc = self.accs[rid]
+            if acc.run.is_wgs:
+                continue
             s = acc.run.sample
             gb = float(acc.bytes_consumed)
-            if gb > 0 and sc > 0:
-                tb = gb / float(sc)
+            if has_explicit_zb:
+                zb = float(zoom_res.per_run_zoom_bytes.get(rid, 0))
+            elif rid in self.streams and self.streams[rid].consumed_bytes > acc.bytes_consumed:
+                zb = float(self.streams[rid].consumed_bytes - acc.bytes_consumed)
+            elif rid in zoom_res.per_run_scale and gb > 0 and zoom_res.per_run_scale[rid] > 0:
+                zb = max(0.0, gb / float(zoom_res.per_run_scale[rid]) - gb)
             else:
                 z_acc = getattr(acc, "zoom", None)
-                tb = gb + float(z_acc.bytes_consumed if z_acc is not None else 0.0)
+                zb = float(z_acc.bytes_consumed if z_acc is not None else 0.0)
             glob_b[s] = glob_b.get(s, 0.0) + gb
-            tot_b[s] = tot_b.get(s, 0.0) + tb
+            tot_b[s] = tot_b.get(s, 0.0) + gb + zb
         out: dict[str, float] = {}
         for s in samples:
             if s in tot_b and tot_b[s] > 0:

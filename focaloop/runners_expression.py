@@ -6,6 +6,8 @@ import csv
 from dataclasses import asdict
 import gzip
 import io
+import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,19 +20,18 @@ from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .archive import pack_state
 from .engine import STATE_META, write_json
 from .hooks import HypothesisLedger
 from .reports import render_panexpr_report
-from .state import FocaloopStateStore
+from .state import FocaloopStateStore, HYPOTHESIS_LEDGER_SCHEMA
 
 _INSDC_RUN_RE = re.compile(r"^[SED]RR\d+$", re.IGNORECASE)
 _READ_EXT_RE = re.compile(r"(\.f(ast)?qsanger(\.gz|\.bz2)?|\.f(ast)?q(\.gz|\.bz2)?|\.gz|\.bz2)+$", re.IGNORECASE)
-_MATE_SUFFIX_RE = re.compile(r"(_R?[12]|_[12])$", re.IGNORECASE)
-
-
+_EXPLICIT_R_MATE_RE = re.compile(r"^(.+?)(?:[._])R([12])$", re.IGNORECASE)
 _AGGRESSIVE_ERR_RE = re.compile(r"(error|exception)\s*:", re.IGNORECASE)
 
 
@@ -38,6 +39,14 @@ def _log(msg: str) -> None:
     # Avoid tripping Galaxy detect_errors="aggressive" on non-fatal tournament probe messages.
     safe_msg = _AGGRESSIVE_ERR_RE.sub(r"\1 -", str(msg))
     print(f"[focaloop-expressionloop] {safe_msg}", file=sys.stderr, flush=True)
+
+
+def _sanitize_leading_dash(val: str) -> str:
+    """Normalize leading '-' on sample/read IDs so CLI parsers and aligners never see option flags (L94)."""
+    s = str(val or "").strip()
+    if s.startswith("-"):
+        return "_" + s[1:]
+    return s
 
 
 def _sniff_annotation_ext(path: Path) -> str:
@@ -98,8 +107,11 @@ def _detect_organism_mode(gtf_path: Path, requested: str) -> str:
             break
         if feat.ftype == "exon":
             n_exon += 1
-            tx = feat.attrs.get("transcript_id") or feat.attrs.get("Parent") or ""
-            if tx:
+            if feat.attrs.get("transcript_id"):
+                txs = [feat.attrs["transcript_id"]]
+            else:
+                txs = [p.strip() for p in (feat.attrs.get("Parent") or "").split(",") if p.strip()]
+            for tx in txs:
                 exon_by_tx[tx] = exon_by_tx.get(tx, 0) + 1
         elif feat.ftype == "CDS":
             n_cds += 1
@@ -113,14 +125,41 @@ def _detect_organism_mode(gtf_path: Path, requested: str) -> str:
     return "prokaryotic" if n_cds > 0 else "eukaryotic"
 
 
+_SAMPLE_COL_CANDS = ("sample_id", "sample", "sample_alias", "Sample")
+_COND_COL_CANDS = ("condition", "group", "Condition")
+
+
 def _read_manifest_table(manifest_path: str | Path) -> list[dict[str, str]]:
-    text = Path(manifest_path).read_text(encoding="utf-8")
+    text = Path(manifest_path).read_text(encoding="utf-8-sig")
     lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     if not lines:
         raise ValueError(f"{manifest_path}: manifest is empty")
     delim = "\t" if "\t" in lines[0] else ","
     reader = csv.DictReader(io.StringIO("\n".join(lines)), delimiter=delim)
-    rows = [{(k or "").strip(): (v or "").strip() for k, v in row.items()} for row in reader]
+    fieldnames = [(fn or "").strip() for fn in (reader.fieldnames or []) if (fn or "").strip()]
+    lower_fields = {fn.lower() for fn in fieldnames}
+    if not any(c.lower() in lower_fields for c in _SAMPLE_COL_CANDS):
+        raise ValueError(
+            f"{manifest_path}: manifest header is missing a sample identifier column "
+            f"(expected one of {list(_SAMPLE_COL_CANDS)}, got {fieldnames})"
+        )
+    if not any(c.lower() in lower_fields for c in _COND_COL_CANDS):
+        raise ValueError(
+            f"{manifest_path}: manifest header is missing a condition/group column "
+            f"(expected one of {list(_COND_COL_CANDS)}, got {fieldnames})"
+        )
+    rows: list[dict[str, str]] = []
+    for row_num, raw_row in enumerate(reader, start=1):
+        clean_row = {(k or "").strip(): (v or "").strip() for k, v in raw_row.items() if (k or "").strip()}
+        if not any(clean_row.values()):
+            continue
+        sid = _pick_col(clean_row, _SAMPLE_COL_CANDS, "")
+        cnd = _pick_col(clean_row, _COND_COL_CANDS, "")
+        if not sid:
+            raise ValueError(f"{manifest_path}: row {row_num} has an empty sample_id cell")
+        if not cnd:
+            raise ValueError(f"{manifest_path}: row {row_num} ({sid!r}) has an empty condition/group cell")
+        rows.append(clean_row)
     if not rows:
         raise ValueError(f"{manifest_path}: manifest has header but zero sample rows")
     return rows
@@ -150,7 +189,7 @@ def parse_expression_contrast(contrast: str, default_factor: str = "condition") 
     if "_vs_" in text:
         a, b = text.split("_vs_", 1)
         return [default_factor, a.strip(), b.strip()]
-    raise ValueError(f"Invalid contrast {contrast!r}; expected 'condition:treated:control' or 'treated:control'")
+    raise ValueError(f"Invalid contrast {contrast!r} - expected 'condition:treated:control' or 'treated:control'")
 
 
 def _parse_followup_contrasts(raw: Sequence[str] | str | None) -> list[list[str]]:
@@ -179,31 +218,85 @@ def _ipv4_session():
     return s
 
 
-def _head_content_length(url: str, timeout: float = 45.0) -> int:
+def _head_content_length(url: str, timeout: float = 45.0, retries: int = 3) -> int:
+    """Resolve remote archive byte length strictly from HTTP 200 Content-Length or HTTP 206 Content-Range (L11)."""
     s = _ipv4_session()
-    try:
-        r = s.head(url, allow_redirects=True, timeout=timeout)
-        if r.status_code < 400 and r.headers.get("Content-Length"):
-            return int(r.headers["Content-Length"])
-    except Exception:
-        pass
-    r = s.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=timeout)
-    try:
-        cr = r.headers.get("Content-Range", "")
-        if "/" in cr:
-            tot = cr.rsplit("/", 1)[-1]
-            if tot.isdigit():
-                return int(tot)
-        if r.headers.get("Content-Length"):
-            return int(r.headers["Content-Length"])
-    finally:
-        r.close()
+    retry_base = float(os.environ.get("FOCALOOP_HEAD_RETRY_BASE_S", "1.0"))
+    last_err: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            r_head = s.head(url, allow_redirects=True, timeout=timeout)
+            if r_head.status_code in (401, 403, 404, 410):
+                r_head.raise_for_status()
+            if r_head.status_code == 200:
+                cl = (r_head.headers.get("Content-Length") or "").strip()
+                if cl.isdigit() and int(cl) > 0:
+                    return int(cl)
+            elif r_head.status_code in (429, 500, 502, 503, 504):
+                r_head.raise_for_status()
+
+            r_get = s.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=timeout)
+            try:
+                if r_get.status_code >= 400:
+                    r_get.raise_for_status()
+                if r_get.status_code == 206:
+                    cr = (r_get.headers.get("Content-Range") or "").strip()
+                    if "/" in cr:
+                        tot = cr.rsplit("/", 1)[-1].strip()
+                        if tot.isdigit() and int(tot) > 0:
+                            return int(tot)
+                    raise RuntimeError(
+                        f"HTTP 206 response for {url} lacked a valid total size in Content-Range ({cr!r})"
+                    )
+                if r_get.status_code == 200:
+                    cl_get = (r_get.headers.get("Content-Length") or "").strip()
+                    if cl_get.isdigit() and int(cl_get) > 0:
+                        return int(cl_get)
+                raise RuntimeError(
+                    f"Unexpected HTTP {r_get.status_code} without usable byte length for {url}"
+                )
+            finally:
+                r_get.close()
+        except Exception as exc:
+            last_err = exc
+            resp = getattr(exc, "response", None)
+            code = getattr(resp, "status_code", None)
+            if code in (401, 403, 404, 410):
+                raise
+            if attempt + 1 < max(1, retries):
+                if retry_base > 0:
+                    time.sleep(retry_base * (attempt + 1))
+                continue
+    if last_err is not None:
+        raise RuntimeError(f"Could not determine remote byte length for {url}: {last_err}") from last_err
     raise RuntimeError(f"Could not determine remote byte length for {url}")
 
 
-def _strip_read_key(raw_id: str) -> str:
-    base = _READ_EXT_RE.sub("", raw_id.strip())
-    return _MATE_SUFFIX_RE.sub("", base)
+def _strip_ext_only(raw_id: str) -> str:
+    return _READ_EXT_RE.sub("", _sanitize_leading_dash(raw_id))
+
+
+def _ena_row_to_meta(erow: dict[str, str], files_len: int, files_bytes: int, read_count: int) -> dict[str, Any]:
+    layout_raw = str(erow.get("library_layout") or "").strip().upper()
+    is_pe = ("PAIRED" in layout_raw) or (layout_raw == "PE") or (files_len == 2)
+    mates = 2 if is_pe else 1
+    bc_raw = str(erow.get("base_count") or "0").strip()
+    base_count = int(bc_raw) if bc_raw.isdigit() else 0
+    if read_count > 0 and base_count > 0:
+        rlen = max(31.0, float(base_count) / float(read_count * mates))
+        kpf = max(2.0, float(mates) * max(1.0, rlen - 30.0))
+    else:
+        rlen = 100.0
+        kpf = float(mates * 70.0)
+    return {
+        "read_count": int(read_count),
+        "base_count": int(base_count),
+        "fastq_bytes": int(files_bytes),
+        "layout": "PE" if is_pe else "SE",
+        "mates": mates,
+        "read_len": round(rlen, 2),
+        "kmers_per_frag": round(kpf, 2),
+    }
 
 
 def resolve_expression_manifest(
@@ -222,44 +315,77 @@ def resolve_expression_manifest(
     if reads_r1 or reads_r2:
         if not (reads_r1 and reads_r2) or len(reads_r1) != len(reads_r2):
             raise ValueError("Paired History inputs require equal-length --reads-r1 and --reads-r2 lists")
+        if read_ids is not None and len(read_ids) != len(reads_r1):
+            raise ValueError(
+                f"Length mismatch between --read-ids ({len(read_ids)}) and --reads-r1 ({len(reads_r1)})"
+            )
         ids = (
-            list(read_ids)
-            if read_ids and len(read_ids) == len(reads_r1)
-            else [_strip_read_key(Path(p).name) for p in reads_r1]
+            [_sanitize_leading_dash(x) for x in read_ids]
+            if read_ids is not None
+            else [_strip_ext_only(Path(p).name) for p in reads_r1]
         )
         for rid, p1_raw, p2_raw in zip(ids, reads_r1, reads_r2):
             p1 = Path(p1_raw).resolve()
             p2 = Path(p2_raw).resolve()
             paired_map[rid] = (p1, p2)
-            clean_id = _strip_read_key(rid)
-            if clean_id and clean_id not in paired_map:
-                paired_map[clean_id] = (p1, p2)
+            no_ext = _strip_ext_only(rid)
+            if no_ext and no_ext not in paired_map:
+                paired_map[no_ext] = (p1, p2)
 
+    # Single-end / flat History dataset map: exact or extension-stripped keys ONLY (never strip _1/_2! #3)
     local_map: dict[str, list[Path]] = {}
+    explicit_r_mates: dict[str, dict[str, Path]] = {}
     if reads:
-        ids = list(read_ids) if read_ids and len(read_ids) == len(reads) else [Path(r).name for r in reads]
+        if read_ids is not None and len(read_ids) != len(reads):
+            raise ValueError(
+                f"Length mismatch between --read-ids ({len(read_ids)}) and --reads ({len(reads)})"
+            )
+        ids = (
+            [_sanitize_leading_dash(x) for x in read_ids]
+            if read_ids is not None
+            else [_sanitize_leading_dash(Path(r).name) for r in reads]
+        )
         for rid, rpath in zip(ids, reads):
             resolved = Path(rpath).resolve()
             local_map.setdefault(rid, []).append(resolved)
-            no_ext = _READ_EXT_RE.sub("", rid)
+            no_ext = _strip_ext_only(rid)
             if no_ext and no_ext != rid:
                 local_map.setdefault(no_ext, []).append(resolved)
-            clean_id = _strip_read_key(rid)
-            if clean_id and clean_id not in (rid, no_ext):
-                local_map.setdefault(clean_id, []).append(resolved)
+            m_rmate = _EXPLICIT_R_MATE_RE.match(no_ext)
+            if m_rmate:
+                stem, mate_num = m_rmate.group(1), m_rmate.group(2)
+                explicit_r_mates.setdefault(stem, {})[mate_num] = resolved
+        # Only register <stem> when BOTH explicit _R1 and _R2 files were supplied
+        for stem, mdict in explicit_r_mates.items():
+            if "1" in mdict and "2" in mdict and stem not in local_map:
+                local_map[stem] = [mdict["1"], mdict["2"]]
+
+    def _lookup_paired(key: str) -> tuple[Path, Path] | None:
+        if not key:
+            return None
+        k_norm = _sanitize_leading_dash(key)
+        k_noext = _strip_ext_only(k_norm)
+        return paired_map.get(k_norm) or paired_map.get(k_noext)
+
+    def _lookup_local(key: str) -> list[Path] | None:
+        if not key:
+            return None
+        k_norm = _sanitize_leading_dash(key)
+        k_noext = _strip_ext_only(k_norm)
+        return local_map.get(k_norm) or local_map.get(k_noext)
 
     # Batch-resolve any INSDC run accessions via ENA filereport when not backed by History FASTQs
     ena_cache: dict[str, dict[str, str]] = {}
     accs_needed = []
     for row in rows:
-        sample_id = _pick_col(row, ("sample_id", "sample", "sample_alias", "Sample"))
+        sample_id = _sanitize_leading_dash(_pick_col(row, _SAMPLE_COL_CANDS))
         src = _pick_col(row, ("run_or_url", "run_accession", "accession", "source", "fastq_1", "url"))
         if (
             _INSDC_RUN_RE.match(src)
-            and src not in paired_map
-            and src not in local_map
-            and sample_id not in paired_map
-            and sample_id not in local_map
+            and _lookup_paired(src) is None
+            and _lookup_local(src) is None
+            and _lookup_paired(sample_id) is None
+            and _lookup_local(sample_id) is None
             and not row.get("fastq_ftp")
         ):
             accs_needed.append(src.upper())
@@ -307,70 +433,123 @@ def resolve_expression_manifest(
                 "library_layout": layout_guess,
                 "library_strategy": "RNA-Seq",
                 "read_count": str(max(1, odp_sz // 100)),
+                "base_count": "0",
                 "fastq_ftp": f"{odp_url};{odp_url}" if layout_guess == "PE" else odp_url,
                 "fastq_bytes": f"{odp_sz // 2};{odp_sz - odp_sz // 2}" if layout_guess == "PE" else str(odp_sz),
                 "fastq_md5": "",
             }
 
+    # Pre-count rows per biological sample_id so multi-lane sheets auto-disambiguate run_id (#1)
+    sample_row_totals: dict[str, int] = {}
+    seen_explicit_rids: set[str] = set()
+    for row in rows:
+        sid_pre = _sanitize_leading_dash(_pick_col(row, _SAMPLE_COL_CANDS))
+        sample_row_totals[sid_pre] = sample_row_totals.get(sid_pre, 0) + 1
+        exp_rid = _sanitize_leading_dash(_pick_col(row, ("run_id",), ""))
+        if exp_rid:
+            if exp_rid in seen_explicit_rids:
+                raise ValueError(f"{manifest_path}: duplicate explicit run_id {exp_rid!r} in manifest")
+            seen_explicit_rids.add(exp_rid)
+
+    sample_lane_seq: dict[str, int] = {}
+    used_run_ids: set[str] = set()
+    claimed_local_files: dict[Path, str] = {}
+
     runs: list[Run] = []
-    meta_records: list[dict[str, str]] = []
+    meta_records: list[dict[str, Any]] = []
     all_local = True
 
+    def _claim_files(paths: Sequence[Path], row_label: str) -> None:
+        for lp in paths:
+            prev_owner = claimed_local_files.get(lp)
+            if prev_owner is not None:
+                raise ValueError(
+                    f"History FASTQ file {lp.name!r} was matched by multiple manifest rows "
+                    f"({prev_owner!r} and {row_label!r}). Check sample_id / run_or_url names."
+                )
+            claimed_local_files[lp] = row_label
+
     for idx_r, row in enumerate(rows):
-        sample_id = _pick_col(row, ("sample_id", "sample", "sample_alias", "Sample"), f"sample_{idx_r + 1}")
-        cond = _pick_col(row, ("condition", "group", "Condition"), "group1")
+        sample_id = _sanitize_leading_dash(_pick_col(row, _SAMPLE_COL_CANDS, f"sample_{idx_r + 1}"))
+        cond = _pick_col(row, _COND_COL_CANDS)
         src = _pick_col(row, ("run_or_url", "run_accession", "accession", "source", "fastq_1", "url"))
         mate2 = _pick_col(row, ("mate2_url", "fastq_2", "mate2"))
         strategy = _pick_col(row, ("strategy", "library_strategy"), "RNA-Seq")
         read_count_raw = _pick_col(row, ("read_count", "spots", "n_reads"), "0")
         read_count = int(read_count_raw) if read_count_raw.isdigit() else 0
+        explicit_run_id = _sanitize_leading_dash(_pick_col(row, ("run_id",), ""))
 
-        if not src and (sample_id in paired_map or sample_id in local_map):
+        sample_lane_seq[sample_id] = sample_lane_seq.get(sample_id, 0) + 1
+        lane_num = sample_lane_seq[sample_id]
+        is_multi_lane = sample_row_totals.get(sample_id, 1) > 1
+
+        if not src and (_lookup_paired(sample_id) is not None or _lookup_local(sample_id) is not None):
             src = sample_id
 
         files: list[FastqFile] = []
-        run_id = _pick_col(row, ("run_id",), "") or sample_id
+        source_kind = "unknown"
+        ena_meta_entry: dict[str, Any] | None = None
 
-        # Case 1a: Explicit paired-end Galaxy History collection
-        cand_pair = (
-            paired_map.get(src)
-            or paired_map.get(_strip_read_key(src))
-            or paired_map.get(sample_id)
-            or paired_map.get(_strip_read_key(sample_id))
-        )
-        # Case 1b: Single-end or filename-matched Galaxy History dataset(s)
-        cand_local = (
-            local_map.get(src)
-            or local_map.get(_READ_EXT_RE.sub("", src))
-            or local_map.get(_strip_read_key(src))
-            or local_map.get(sample_id)
-            or local_map.get(_strip_read_key(sample_id))
-        )
+        cand_pair = _lookup_paired(src) if src else None
+        if cand_pair is None and not src:
+            cand_pair = _lookup_paired(sample_id)
+        elif cand_pair is None and src == sample_id:
+            cand_pair = _lookup_paired(sample_id)
+        elif cand_pair is None and reads_r1 and not _INSDC_RUN_RE.match(src) and not src.startswith(("http://", "https://", "ftp://")) and not (src and Path(src).exists()):
+            # Only fall back from missing/empty src to sample_id when src wasn't a distinct unmatched token
+            pass
 
-        if cand_pair:
+        cand_local = _lookup_local(src) if src else None
+        if cand_local is None and src == sample_id:
+            cand_local = _lookup_local(sample_id)
+
+        # Allow sample_id lookup in History mode when manifest has no run_or_url column (src == "")
+        if not src:
+            cand_pair = cand_pair or _lookup_paired(sample_id)
+            cand_local = cand_local or _lookup_local(sample_id)
+
+        default_local_rid = (
+            explicit_run_id
+            or (_sanitize_leading_dash(src) if (src and _INSDC_RUN_RE.match(src) and not is_multi_lane) else "")
+            or (f"{sample_id}_L{lane_num}" if is_multi_lane else sample_id)
+        )
+        row_tag = f"{sample_id} (lane {lane_num})" if is_multi_lane else sample_id
+
+        if cand_pair is not None:
+            _claim_files(cand_pair, row_tag)
             for lp in cand_pair:
                 files.append(FastqFile(url=str(lp), bytes=lp.stat().st_size, local_path=str(lp)))
-            run_id = src if _INSDC_RUN_RE.match(src) else sample_id
-        elif cand_local:
-            ordered = sorted(dict.fromkeys(cand_local), key=lambda p: p.name)[:2]
+            run_id = explicit_run_id or default_local_rid
+            source_kind = "history_paired"
+        elif cand_local is not None:
+            ordered = list(dict.fromkeys(cand_local))[:2]
+            _claim_files(ordered, row_tag)
             for lp in ordered:
                 files.append(FastqFile(url=str(lp), bytes=lp.stat().st_size, local_path=str(lp)))
-            run_id = src if _INSDC_RUN_RE.match(src) else sample_id
+            run_id = explicit_run_id or default_local_rid
+            source_kind = "history_single"
         elif src and Path(src).exists():
             p1 = Path(src).resolve()
-            files.append(FastqFile(url=str(p1), bytes=p1.stat().st_size, local_path=str(p1)))
-            if mate2 and Path(mate2).exists():
-                p2 = Path(mate2).resolve()
-                files.append(FastqFile(url=str(p2), bytes=p2.stat().st_size, local_path=str(p2)))
-        elif _INSDC_RUN_RE.match(src) or row.get("fastq_ftp"):
+            local_ps = [p1]
+            if mate2:
+                p2_cand = Path(mate2)
+                if not p2_cand.exists():
+                    raise ValueError(f"Row {row_tag!r}: mate2_url file {mate2!r} does not exist")
+                local_ps.append(p2_cand.resolve())
+            for lp in local_ps:
+                files.append(FastqFile(url=str(lp), bytes=lp.stat().st_size, local_path=str(lp)))
+            run_id = explicit_run_id or default_local_rid
+            source_kind = "local_path"
+        elif (_INSDC_RUN_RE.match(src) or row.get("fastq_ftp")) and not src.startswith(("http://", "https://", "ftp://")):
             all_local = False
             erow = row if row.get("fastq_ftp") else ena_cache[src.upper()]
-            run_id = erow.get("run_accession") or src.upper()
+            acc_id = (erow.get("run_accession") or src).strip().upper()
+            run_id = explicit_run_id or acc_id
             rc_ena = erow.get("read_count") or "0"
             if str(rc_ena).isdigit() and int(rc_ena) > 0:
                 read_count = int(rc_ena)
             raw_urls = [u for u in (erow.get("fastq_ftp") or "").split(";") if u]
-            raw_sizes = [int(x) for x in (erow.get("fastq_bytes") or "").split(";") if x]
+            raw_sizes = [int(x) for x in (erow.get("fastq_bytes") or "").split(";") if x and str(x).isdigit()]
             raw_md5 = [m for m in (erow.get("fastq_md5") or "").split(";") if m]
             while len(raw_md5) < len(raw_urls):
                 raw_md5.append("")
@@ -386,10 +565,17 @@ def resolve_expression_manifest(
                     sz = raw_sizes[i] if i < len(raw_sizes) else _head_content_length(u)
                     files.append(FastqFile(url=u, bytes=sz, md5=raw_md5[i]))
             else:
-                odp_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{run_id}/{run_id}"
+                odp_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc_id}/{acc_id}"
                 odp_sz = _head_content_length(odp_url)
                 files.append(FastqFile(url=odp_url, bytes=odp_sz))
             strategy = erow.get("library_strategy") or strategy
+            source_kind = "insdc" if _INSDC_RUN_RE.match(acc_id) else "url"
+            ena_meta_entry = _ena_row_to_meta(
+                erow,
+                files_len=len(files),
+                files_bytes=sum(f.bytes for f in files),
+                read_count=read_count,
+            )
         elif src.startswith(("http://", "https://", "ftp://")):
             all_local = False
             url_list = [u.strip() for u in src.split(";") if u.strip()]
@@ -400,19 +586,31 @@ def resolve_expression_manifest(
                     u = "https://" + u[len("ftp://"):]
                 sz = _head_content_length(u)
                 files.append(FastqFile(url=u, bytes=sz))
+            run_id = explicit_run_id or (f"{sample_id}_L{lane_num}" if is_multi_lane else sample_id)
+            source_kind = "url"
         else:
             raise ValueError(
                 f"Row {sample_id!r}: could not resolve run_or_url={src!r} as INSDC accession, URL, or History FASTQ"
             )
 
+        if run_id in used_run_ids:
+            raise ValueError(
+                f"Duplicate run_id {run_id!r} resolved from manifest (each sequencing run row must have a distinct run_id or accession)"
+            )
+        used_run_ids.add(run_id)
+
         if read_count <= 0 and files:
             read_count = max(1, sum(f.bytes for f in files) // 100)
 
         layout = "PE" if len(files) == 2 else "SE"
+        # Retain 'group' even when 'condition' is absent so '--design ~group' and '--contrast group:A:B' work (L10)
         skip_cols = {"sample_id", "sample", "condition", "run_or_url", "fastq_ftp", "fastq_bytes", "fastq_md5", "mate2_url", "run_id"}
-        if "condition" not in row:
-            skip_cols.add("group")
-        cov_extra = {k: v for k, v in row.items() if k not in skip_cols and v}
+        cov_extra: dict[str, Any] = {k: v for k, v in row.items() if k not in skip_cols and v != ""}
+        run_extra: dict[str, Any] = dict(cov_extra)
+        run_extra["_source_kind"] = source_kind
+        if ena_meta_entry is not None:
+            run_extra["_ena_meta"] = ena_meta_entry
+
         runs.append(
             Run(
                 run_id=run_id,
@@ -422,16 +620,149 @@ def resolve_expression_manifest(
                 strategy=strategy,
                 read_count=read_count,
                 files=tuple(files),
-                extra=cov_extra,
+                extra=run_extra,
             )
         )
-        cov_row = {"run_id": run_id, "sample": sample_id, "condition": cond}
+        cov_row: dict[str, Any] = {"run_id": run_id, "sample": sample_id, "condition": cond}
         cov_row.update(cov_extra)
         meta_records.append(cov_row)
 
     manifest = StudyManifest(study_id=Path(manifest_path).stem, accession="galaxy_cohort", runs=runs)
     meta_df = pd.DataFrame(meta_records).fillna("")
     return manifest, meta_df, all_local
+
+
+def _prepare_and_validate_design_metadata(
+    sample_meta_df: pd.DataFrame,
+    manifest: Any,
+    design: str,
+    contrast_list: list[str],
+    followups: list[list[str]],
+) -> pd.DataFrame:
+    """Validate additive design, blank covariate cells, numeric casting, and full rank up front (L1, L3, L12, L13)."""
+    from .panexpr.solver import parse_design_terms
+
+    parsed_terms = parse_design_terms(design)
+    design_cols = [c for c, _ in parsed_terms]
+    explicit_cats = {c for c, is_cat in parsed_terms if is_cat}
+
+    fac, lvl_a, lvl_b = contrast_list
+    if fac not in sample_meta_df.columns:
+        raise ValueError(
+            f"Primary contrast factor {fac!r} is missing from manifest columns: {list(sample_meta_df.columns)}"
+        )
+    if fac not in design_cols:
+        raise ValueError(
+            f"Primary contrast factor {fac!r} must appear in design formula {design!r} (design columns: {design_cols})"
+        )
+
+    followup_factors = {fc[0] for fc in followups}
+    for fc in followups:
+        f_fac, f_a, f_b = fc
+        if f_fac not in sample_meta_df.columns:
+            raise ValueError(
+                f"Follow-up contrast factor {f_fac!r} is missing from manifest columns: {list(sample_meta_df.columns)}"
+            )
+        if f_fac not in design_cols:
+            raise ValueError(
+                f"Follow-up contrast factor {f_fac!r} must appear in design formula {design!r} (design columns: {design_cols})"
+            )
+        f_lvls = set(sample_meta_df[f_fac].astype(str))
+        for lvl in (f_a, f_b):
+            if lvl not in f_lvls:
+                raise ValueError(f"Follow-up contrast level {lvl!r} not present in column {f_fac!r}: {sorted(f_lvls)}")
+
+    for col in design_cols:
+        if col not in sample_meta_df.columns:
+            raise ValueError(
+                f"Design covariate {col!r} in {design!r} is missing from manifest columns: {list(sample_meta_df.columns)}"
+            )
+        vals = sample_meta_df[col]
+        blank_mask = vals.isna() | (vals.astype(str).str.strip() == "")
+        if bool(blank_mask.any()):
+            bad_samples = list(sample_meta_df.loc[blank_mask, "sample"].astype(str).unique()[:5])
+            raise ValueError(
+                f"Design column {col!r} contains empty/missing values for sample(s): {', '.join(bad_samples)}"
+            )
+
+    present_lvls = set(sample_meta_df[fac].astype(str))
+    for lvl in (lvl_a, lvl_b):
+        if lvl not in present_lvls:
+            raise ValueError(f"Contrast level {lvl!r} not present in manifest column {fac!r}: {sorted(present_lvls)}")
+    if lvl_a == lvl_b:
+        raise ValueError(f"Contrast test and reference levels must differ (both were {lvl_a!r})")
+
+    rna_sample_ids = {r.sample for r in manifest.rna_runs}
+    out_df = sample_meta_df.copy()
+
+    # Cast non-contrast covariates whose values all parse as finite numbers to float64 unless wrapped in C(...) (L13)
+    factor_cols = {fac} | followup_factors | explicit_cats
+    for col in design_cols:
+        if col in factor_cols:
+            out_df[col] = out_df[col].astype(str)
+            continue
+        raw_strs = [str(v).strip() for v in out_df[col].tolist()]
+        all_num = True
+        parsed_floats: list[float] = []
+        for sv in raw_strs:
+            try:
+                fv = float(sv)
+                if not math.isfinite(fv):
+                    all_num = False
+                    break
+                parsed_floats.append(fv)
+            except ValueError:
+                all_num = False
+                break
+        if all_num and parsed_floats:
+            out_df[col] = np.asarray(parsed_floats, dtype=np.float64)
+            # Propagate numeric covariate into Run.extra so Focaloop._enrich_meta sees float64 too
+            val_by_s = dict(zip(out_df["sample"].astype(str), parsed_floats))
+            for r in manifest.rna_runs:
+                if r.sample in val_by_s and r.extra is not None:
+                    r.extra[col] = float(val_by_s[r.sample])
+
+    # Check biological sample design matrix rank, collinearity, and residual degrees of freedom up front
+    bio_df = out_df[out_df["sample"].isin(rna_sample_ids)].drop_duplicates("sample").set_index("sample")
+    if len(bio_df) < 2:
+        raise ValueError(f"Differential expression requires at least 2 biological RNA samples (got {len(bio_df)})")
+
+    if len(design_cols) == 1 and design_cols[0] == fac:
+        sub_ab = bio_df[bio_df[fac].astype(str).isin([str(lvl_a), str(lvl_b)])]
+        if len(sub_ab) <= 2:
+            raise ValueError(
+                f"Insufficient biological replicates ({len(sub_ab)} samples across {lvl_a!r} vs {lvl_b!r}) "
+                "to estimate dispersion with positive residual degrees of freedom."
+            )
+    else:
+        n_b = len(bio_df)
+        cols_x = [np.ones(n_b, dtype=float)]
+        for col in design_cols:
+            s_col = bio_df[col]
+            if col not in factor_cols and pd.api.types.is_numeric_dtype(s_col):
+                v_num = s_col.to_numpy(dtype=float)
+                if float(np.std(v_num)) <= 0.0:
+                    raise ValueError(f"Numeric design covariate {col!r} is constant across all samples")
+                cols_x.append(v_num)
+            else:
+                lvls = sorted(set(s_col.astype(str).tolist()))
+                if len(lvls) < 2:
+                    raise ValueError(f"Categorical design factor {col!r} has fewer than 2 levels ({lvls})")
+                for lv in lvls[1:]:
+                    cols_x.append((s_col.astype(str) == lv).to_numpy(dtype=float))
+        X_full = np.column_stack(cols_x)
+        rk = int(np.linalg.matrix_rank(X_full))
+        if rk < X_full.shape[1]:
+            raise ValueError(
+                f"Design matrix for {design!r} is rank-deficient (rank {rk} < {X_full.shape[1]} columns) - "
+                "one or more covariates are collinear or confounded with the experimental group."
+            )
+        if n_b <= X_full.shape[1]:
+            raise ValueError(
+                f"Design {design!r} uses {X_full.shape[1]} parameters across {n_b} biological samples "
+                "(0 residual degrees of freedom). Remove over-parameterized covariates or wrap categorical codes carefully."
+            )
+    return out_df
 
 
 def _build_ortholog_bridge_map(catalog: Any) -> dict[str, str]:
@@ -493,6 +824,17 @@ def _format_de_table(raw_de: pd.DataFrame, bridge_map: dict[str, str]) -> pd.Dat
     return out.sort_values(["padj", "pvalue", "gene_id"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
 
 
+def _init_empty_ledger(store: FocaloopStateStore, alpha_budget: float = 0.05) -> HypothesisLedger:
+    """Initialize unspent alpha-investing ledger without pre-seeding holdout==discovery wealth (#61)."""
+    if not store.exists("hypothesis_ledger"):
+        store.write(
+            "hypothesis_ledger",
+            pa.Table.from_pylist([], schema=HYPOTHESIS_LEDGER_SCHEMA),
+            schema=HYPOTHESIS_LEDGER_SCHEMA,
+        )
+    return HypothesisLedger.from_store(store, alpha_budget=alpha_budget)
+
+
 def run_expressionloop_galaxy(
     *,
     manifest_path: str | Path,
@@ -541,7 +883,7 @@ def run_expressionloop_galaxy(
     from .panexpr.catalog import AssemblySpec, build_catalog
     from .panexpr.kernels import Kernel, RunAccumulator, StarKernel, default_kernels, map_pooled
     from .panexpr.loop import Focaloop, LoopConfig
-    from .panexpr.regime import AssemblyInput, classify
+    from .panexpr.regime import AssemblyInput, available_ram_bytes, classify
     from .panexpr.solver import quantify_cohort, strand_mode
     from .panexpr.sra_odp import XsraRunStream, xsra_runnable
     from .panexpr.state import TARGET_COUNTS_SCHEMA, StateStore as PanStateStore
@@ -563,18 +905,10 @@ def run_expressionloop_galaxy(
         )
         contrast_list = parse_expression_contrast(contrast)
         fac, lvl_a, lvl_b = contrast_list
-        present_lvls = set(sample_meta_df.get(fac, sample_meta_df["condition"]).astype(str))
-        for lvl in (lvl_a, lvl_b):
-            if lvl not in present_lvls:
-                raise ValueError(f"Contrast level {lvl!r} not present in manifest column {fac!r}: {sorted(present_lvls)}")
-
         followups = _parse_followup_contrasts(followup_contrasts)
-        for f_c in followups:
-            f_fac, f_a, f_b = f_c
-            f_lvls = set(sample_meta_df.get(f_fac, sample_meta_df["condition"]).astype(str))
-            for lvl in (f_a, f_b):
-                if lvl not in f_lvls:
-                    raise ValueError(f"Follow-up contrast level {lvl!r} not present in column {f_fac!r}: {sorted(f_lvls)}")
+        sample_meta_df = _prepare_and_validate_design_metadata(
+            sample_meta_df, manifest, design, contrast_list, followups,
+        )
 
         if source_mode == "sra_odp" and not xsra_runnable():
             raise RuntimeError(
@@ -589,6 +923,9 @@ def run_expressionloop_galaxy(
 
         refs_dir = work_dir / "refs"
         primary_cvmfs_meta: dict[str, Any] = {}
+        primary_label = _sanitize_leading_dash(primary_label) or "primary"
+        secondary_label = _sanitize_leading_dash(secondary_label) or "secondary"
+
         if ncbi_accession and str(ncbi_accession).strip():
             from .ncbi_ref import fetch_ncbi_assembly
 
@@ -614,7 +951,7 @@ def run_expressionloop_galaxy(
             )
             ref_gtf = primary_cvmfs_meta["gtf_path"]
             if primary_label == "primary" and (ref_value or ref_dbkey):
-                primary_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(ref_value or ref_dbkey).strip()).strip("._") or "primary"
+                primary_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(ref_value or ref_dbkey).strip()).strip("._-") or "primary"
 
         if not ref_fasta or not ref_gtf:
             raise ValueError(
@@ -635,7 +972,7 @@ def run_expressionloop_galaxy(
             used_ncbi_accs.append(str(primary_cvmfs_meta["ncbi_accession"]).strip().upper())
 
         def _unique_label(raw: str, fallback: str) -> str:
-            base = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(raw or "").strip()).strip("._") or fallback
+            base = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(raw or "").strip()).strip("._-") or fallback
             cand = base
             idx_u = 2
             while cand in used_labels:
@@ -653,7 +990,6 @@ def run_expressionloop_galaxy(
             s_gtf = _gunzip_if_needed(secondary_gtf, refs_dir, f"{sec_lbl}{s_ext}")
             specs.append(AssemblySpec(sec_lbl, s_fna, s_gtf))
 
-        # Explicit repeatable additional reference genomes (CVMFS, History, or NCBI accession)
         for idx_e, eref in enumerate(extra_references or [], 1):
             e_acc = str(eref.get("ncbi_accession") or "").strip()
             e_fa = str(eref.get("fasta") or "").strip()
@@ -701,7 +1037,6 @@ def run_expressionloop_galaxy(
             egtf_p = _gunzip_if_needed(e_gtf, refs_dir, f"{e_lbl}{eext}")
             specs.append(AssemblySpec(e_lbl, efna_p, egtf_p))
 
-        # Optional automatic pan-transcriptome expansion with distinct RefSeq strains from NCBI
         auto_expanded_info: list[dict[str, Any]] = []
         n_expand = int(auto_expand_strains or 0)
         if n_expand > 0:
@@ -754,7 +1089,7 @@ def run_expressionloop_galaxy(
                 exclude_strains=excl_strains,
             )
             if not cands:
-                _log(f"Auto-expand found no additional annotated RefSeq assemblies for {taxon_q!r}; continuing with {len(specs)} reference(s).")
+                _log(f"Auto-expand found no additional annotated RefSeq assemblies for {taxon_q!r} - continuing with {len(specs)} reference(s).")
             else:
                 added = 0
                 for cand in cands:
@@ -785,17 +1120,21 @@ def run_expressionloop_galaxy(
         catalog.save(cat_dir)
         write_json(cat_dir / "link_stats.json", catalog.link_stats)
 
-        # 0.4.0 Logan unitig streaming branch for public SRA/ENA cohorts
+        # 0.4.0 Logan unitig streaming branch for genuine public INSDC SRA/ENA cohorts (L14)
         eff_logan_mode = str(logan_mode or "auto").strip().lower()
         if eff_logan_mode not in ("auto", "logan_only", "off"):
-            raise ValueError(f"Unsupported logan_mode {logan_mode!r}; expected 'auto', 'logan_only', or 'off'")
+            raise ValueError(f"Unsupported logan_mode {logan_mode!r} - expected 'auto', 'logan_only', or 'off'")
 
         if eff_logan_mode in ("auto", "logan_only") and not all_local:
             from .logan import is_insdc_run, probe_logan_runs
-            from .panexpr.logan_expr import run_logan_expression_cohort
+            from .panexpr.logan_expr import LoganZeroMappingError, run_logan_expression_cohort
 
-            rna_run_ids = [r.run_id for r in manifest.rna_runs]
-            all_insdc = bool(rna_run_ids) and all(is_insdc_run(rid) for rid in rna_run_ids)
+            rna_runs = manifest.rna_runs
+            rna_run_ids = [r.run_id for r in rna_runs]
+            all_insdc = bool(rna_runs) and all(
+                (r.extra or {}).get("_source_kind") == "insdc" and is_insdc_run(r.run_id)
+                for r in rna_runs
+            )
             if not all_insdc:
                 if eff_logan_mode == "logan_only":
                     raise ValueError(
@@ -812,120 +1151,119 @@ def run_expressionloop_galaxy(
                         f"({probe['total_logan_bytes'] / 1e6:.1f} MB total compressed unitigs)"
                     )
                     pan_state_dir = state_root / "panexpr_state"
-                    logan_res = run_logan_expression_cohort(
-                        catalog=catalog,
-                        manifest=manifest,
-                        sample_meta_df=sample_meta_df,
-                        contrast_list=contrast_list,
-                        design=design,
-                        gtf_path=p_gtf,
-                        work_dir=work_dir,
-                        pan_state_dir=pan_state_dir,
-                        threads=threads,
-                        min_ka=float(logan_min_ka),
-                        write_transcript_table=bool(out_transcripts) or (len(sample_meta_df) <= 100),
-                        log=_log,
-                    )
-                    bridge_map = _build_ortholog_bridge_map(catalog)
-                    de_df = _format_de_table(logan_res["de_raw"], bridge_map)
-                    Path(out_de).parent.mkdir(parents=True, exist_ok=True)
-                    de_df.to_csv(out_de, sep="\t", index=False, float_format="%.6g")
-                    if out_transcripts:
-                        tx_pq = pan_state_dir / "transcript_abundances.parquet"
-                        tx_df = pq.read_table(tx_pq).to_pandas() if tx_pq.exists() else pd.DataFrame()
-                        Path(out_transcripts).parent.mkdir(parents=True, exist_ok=True)
-                        tx_df.to_csv(out_transcripts, sep="\t", index=False, float_format="%.6g")
-
-                    cat_summary = {
-                        "primary_assembly": catalog.primary_assembly,
-                        "assemblies": [s.assembly_id for s in specs],
-                        "n_targets": len(catalog),
-                        "n_groups": len(catalog.groups),
-                        "link_stats": catalog.link_stats,
-                    }
-                    loop_summary = {
-                        "source_mode": "logan_unitigs",
-                        "logan_mode": eff_logan_mode,
-                        "strand_mode": "unstranded (Logan k=31 unitigs)",
-                        "tournament_reads": 0,
-                        "tournament_seconds": 0.0,
-                        "winner": logan_res["aligner"],
-                        "iterations": 1,
-                        "stop_reason": f"LOGAN_UNITIGS_COMPLETE ({logan_res['wire_reduction_x']:.1f}x wire reduction)",
-                        "total_archive_bytes": logan_res["total_archive_bytes"],
-                        "bytes_streamed_global": logan_res["logan_wire_bytes"],
-                        "bytes_streamed_zoom": 0,
-                        "bytes_streamed_total": logan_res["logan_wire_bytes"],
-                        "pct_archive_streamed": logan_res["pct_archive"],
-                        "wire_reduction_x": logan_res["wire_reduction_x"],
-                        "wall_seconds": round(time.time() - t_start, 2),
-                        "v_tech_target": v_tech_target,
-                        "delta_lfc_stop": delta_lfc_stop,
-                        "assembly_prior": {catalog.primary_assembly: 1.0},
-                        "telemetry": [],
-                        "zoom": {
-                            "n_antisense_genes": logan_res["n_antisense_genes"],
-                            "n_zoom_candidates": logan_res["n_zoom_candidates"],
-                        },
-                        "holdout_saved": False,
-                        "logan_runs": logan_res["run_stats"],
-                    }
-                    contrast_pretty = f"{fac}: {lvl_a} vs {lvl_b}"
-                    render_panexpr_report(
-                        out_report,
-                        contrast_str=contrast_pretty,
-                        winner=logan_res["aligner"],
-                        scoreboard=[],
-                        per_sample_rows=logan_res["per_sample_rows"],
-                        catalog_summary=cat_summary,
-                        loop_summary=loop_summary,
-                        de_df=de_df,
-                    )
-                    sample_meta_df.to_parquet(state_root / "sample_metadata.parquet", index=False)
-                    store = FocaloopStateStore(state_root)
-                    ledger = HypothesisLedger.from_store(store, alpha_budget=0.05)
-                    if not de_df.empty:
-                        top = de_df.iloc[0]
-                        top_lfc = float(top["log2FoldChange"]) if pd.notna(top["log2FoldChange"]) else 0.0
-                        top_p = float(top["pvalue"]) if pd.notna(top["pvalue"]) else 1.0
-                        ledger.evaluate_query(
-                            "q0001",
-                            "focaloop-expressionloop",
-                            f"{fac}:{lvl_a}_vs_{lvl_b}:logan_primary",
-                            top_lfc,
-                            top_p,
-                            top_lfc,
-                            min(top_p, 0.01) if top_p <= 0.005 else top_p,
-                            store=store,
+                    logan_res: dict[str, Any] | None = None
+                    try:
+                        logan_res = run_logan_expression_cohort(
+                            catalog=catalog,
+                            manifest=manifest,
+                            sample_meta_df=sample_meta_df,
+                            contrast_list=contrast_list,
+                            design=design,
+                            gtf_path=p_gtf,
+                            work_dir=work_dir,
+                            pan_state_dir=pan_state_dir,
+                            threads=threads,
+                            min_ka=float(logan_min_ka),
+                            write_transcript_table=False,
+                            out_gene_abundances_tsv=(Path(out_transcripts) if out_transcripts else None),
+                            log=_log,
                         )
-                    state_meta = {
-                        "engine": "panexpr",
-                        "version": "0.4.0",
-                        "blueprint_id": "panexpr",
-                        "primary_contrast": contrast_list,
-                        "design": design,
-                        "organism_mode": org_mode,
-                        "length_offsets": False,
-                        "catalog_summary": cat_summary,
-                        "loop_summary": loop_summary,
-                        "samples": sample_meta_df.to_dict(orient="records"),
-                    }
-                    write_json(state_root / STATE_META, state_meta)
-                    if state_archive:
-                        pack_state(state_root, state_archive)
-                    return state_meta
-                if eff_logan_mode == "logan_only":
+                    except LoganZeroMappingError as z_exc:
+                        if eff_logan_mode == "logan_only":
+                            raise
+                        _log(
+                            f"Logan unitig fallback triggered ({z_exc}) - "
+                            "switching cohort uniformly to raw-read streaming"
+                        )
+                        shutil.rmtree(pan_state_dir, ignore_errors=True)
+                        logan_res = None
+
+                    if logan_res is not None:
+                        bridge_map = _build_ortholog_bridge_map(catalog)
+                        de_df = _format_de_table(logan_res["de_raw"], bridge_map)
+                        Path(out_de).parent.mkdir(parents=True, exist_ok=True)
+                        de_df.to_csv(out_de, sep="\t", index=False, float_format="%.6g")
+
+                        cat_summary = {
+                            "primary_assembly": catalog.primary_assembly,
+                            "assemblies": [s.assembly_id for s in specs],
+                            "n_targets": len(catalog),
+                            "n_groups": len(catalog.groups),
+                            "link_stats": catalog.link_stats,
+                        }
+                        loop_summary = {
+                            "source_mode": "logan_unitigs",
+                            "logan_mode": eff_logan_mode,
+                            "strand_mode": "unstranded (Logan k=31 unitigs)",
+                            "tournament_reads": 0,
+                            "tournament_seconds": 0.0,
+                            "winner": logan_res["aligner"],
+                            "iterations": 1,
+                            "stop_reason": f"LOGAN_UNITIGS_COMPLETE ({logan_res['wire_reduction_x']:.1f}x wire reduction)",
+                            "total_archive_bytes": logan_res["total_archive_bytes"],
+                            "bytes_streamed_global": logan_res["logan_wire_bytes"],
+                            "bytes_streamed_zoom": 0,
+                            "bytes_streamed_total": logan_res["logan_wire_bytes"],
+                            "pct_archive_streamed": logan_res["pct_archive"],
+                            "wire_reduction_x": logan_res["wire_reduction_x"],
+                            "wall_seconds": round(time.time() - t_start, 2),
+                            "v_tech_target": v_tech_target,
+                            "delta_lfc_stop": delta_lfc_stop,
+                            "assembly_prior": {catalog.primary_assembly: 1.0},
+                            "telemetry": [],
+                            "zoom": {
+                                "n_antisense_genes": logan_res["n_antisense_genes"],
+                                "n_zoom_candidates": logan_res["n_zoom_candidates"],
+                            },
+                            "zoom_ran": False,
+                            "holdout_saved": False,
+                            "kpf_fallback_runs": logan_res.get("kpf_fallback_runs", []),
+                            "logan_runs": logan_res["run_stats"],
+                        }
+                        contrast_pretty = f"{fac}: {lvl_a} vs {lvl_b}"
+                        render_panexpr_report(
+                            out_report,
+                            contrast_str=contrast_pretty,
+                            winner=logan_res["aligner"],
+                            scoreboard=[],
+                            per_sample_rows=logan_res["per_sample_rows"],
+                            catalog_summary=cat_summary,
+                            loop_summary=loop_summary,
+                            de_df=de_df,
+                        )
+                        sample_meta_df.to_parquet(state_root / "sample_metadata.parquet", index=False)
+                        store = FocaloopStateStore(state_root)
+                        _init_empty_ledger(store, alpha_budget=0.05)
+                        state_meta = {
+                            "engine": "panexpr",
+                            "version": "0.4.0",
+                            "blueprint_id": "panexpr",
+                            "primary_contrast": contrast_list,
+                            "design": design,
+                            "organism_mode": org_mode,
+                            "length_offsets": False,
+                            "holdout_saved": False,
+                            "catalog_summary": cat_summary,
+                            "loop_summary": loop_summary,
+                            "samples": sample_meta_df.to_dict(orient="records"),
+                        }
+                        write_json(state_root / STATE_META, state_meta)
+                        if state_archive:
+                            pack_state(state_root, state_archive)
+                        return state_meta
+                elif eff_logan_mode == "logan_only":
                     missing = ", ".join(probe["fallback_runs"])
                     stub_note = f" (empty <=100 B stubs: {', '.join(stub_runs)})" if stub_runs else ""
                     raise ValueError(
                         f"Logan unitigs are not available for all requested accessions (missing: {missing}){stub_note}. "
                         "Remove stub/missing accessions or switch Logan mode to Automatic to fall back to raw SRA/ENA streaming."
                     )
-                stub_note = f" ({len(stub_runs)} empty <=100 B stub(s): {', '.join(stub_runs[:5])})" if stub_runs else ""
-                _log(
-                    f"Logan probe: {n_avail}/{n_total} runs usable{stub_note}; falling back to uniform raw-read streaming "
-                    "to keep quantification consistent across all samples."
-                )
+                else:
+                    stub_note = f" ({len(stub_runs)} empty <=100 B stub(s): {', '.join(stub_runs[:5])})" if stub_runs else ""
+                    _log(
+                        f"Logan probe: {n_avail}/{n_total} runs usable{stub_note} - falling back to uniform raw-read streaming "
+                        "to keep quantification consistent across all samples."
+                    )
         elif eff_logan_mode == "logan_only" and all_local:
             raise ValueError(
                 "Logan-only mode applies to public SRA/ENA run accessions, not local Galaxy History FASTQ files."
@@ -942,11 +1280,15 @@ def run_expressionloop_galaxy(
 
         fna_targets = catalog.write_fasta(work_dir / "targets.fna")
         idx_dir = work_dir / "kernel_idx"
+        idx_dir.mkdir(parents=True, exist_ok=True)
         (work_dir / "tmp").mkdir(parents=True, exist_ok=True)
         cands = default_kernels(threads, tmp_dir=work_dir / "tmp", include_star=False)
-        if kernel_names:
-            allow = set(kernel_names)
+        explicit_kernels = bool(kernel_names)
+        if explicit_kernels:
+            allow = set(kernel_names or [])
             cands = [k for k in cands if k.name in allow]
+            if not cands:
+                raise ValueError(f"Unknown --kernels selection: {list(kernel_names or [])}")
 
         ai = [AssemblyInput(a.assembly_id, a.fasta, a.annotation) for a in specs]
         regime_dec = classify(
@@ -955,20 +1297,36 @@ def run_expressionloop_galaxy(
             [s for s, _ in r2] if r2 else None,
             kernels=[k.name for k in cands],
             use_island_pc_router=True,
-            ipc_index_dir=work_dir / "ipc_cache",
+            ipc_index_dir=None,
+            transcript_fasta=(fna_targets if org_mode == "eukaryotic" else None),
+            persist_ipc_cache=False,
         )
         if not kernel_names and regime_dec.excluded:
             pruned = [k for k in cands if k.name not in regime_dec.excluded]
-            if pruned:
-                cands = pruned
-                _log(
-                    f"Regime classifier selected {[k.name for k in cands]} "
-                    f"(RAM budget {regime_dec.ram_budget_bytes / (1 << 30):.1f} GiB)"
+            if not pruned:
+                reasons_str = ", ".join(f"{kn}: {why}" for kn, why in regime_dec.excluded.items())
+                raise ValueError(
+                    f"All candidate aligners {[k.name for k in cands]} were excluded by pre-tournament regime checks ({reasons_str})"
                 )
+            cands = pruned
+            _log(
+                f"Regime classifier selected {[k.name for k in cands]} "
+                f"(RAM budget {regime_dec.ram_budget_bytes / (1 << 30):.1f} GiB)"
+            )
+        elif kernel_names and regime_dec.excluded:
+            pruned = [k for k in cands if k.name not in regime_dec.excluded]
+            if not pruned:
+                reasons_str = ", ".join(f"{kn}: {why}" for kn, why in regime_dec.excluded.items())
+                raise ValueError(
+                    f"Explicitly requested aligners {[k.name for k in cands]} were excluded by regime checks ({reasons_str})"
+                )
+            cands = pruned
 
         live: list[Kernel] = []
         for k in cands:
             if not k.available():
+                if explicit_kernels and len(cands) == 1:
+                    raise RuntimeError(f"Requested aligner kernel {k.name!r} is not installed on PATH")
                 continue
             try:
                 if isinstance(k, StarKernel):
@@ -977,10 +1335,12 @@ def run_expressionloop_galaxy(
                     k.ensure_index(fna_targets, idx_dir)
                 live.append(k)
             except Exception as exc:
-                _log(f"Kernel {k.name} index skipped: {type(exc).__name__}: {exc}")
+                if explicit_kernels:
+                    raise RuntimeError(f"Explicitly requested aligner {k.name!r} failed index build: {exc}") from exc
+                _log(f"Kernel {k.name} index skipped ({type(exc).__name__} - {exc})")
 
         if not live:
-            raise RuntimeError("No mapping kernels available in environment")
+            raise RuntimeError(f"No mapping kernels available from candidates {[k.name for k in cands]}")
 
         n_synth = min(600, max(120, len(catalog.gene_targets) // 4))
         t_tour0 = time.time()
@@ -1023,41 +1383,118 @@ def run_expressionloop_galaxy(
 
         pan_state_dir = state_root / "panexpr_state"
         loop = Focaloop(catalog, manifest, win_kernel, loop_cfg, pan_state_dir, log=_log)
-        rep = loop.run()
-
-        # Collect a lightweight independent holdout slice from unstreamed bytes for local/HTTP range runs
         holdout_saved = False
-        bytes_by_run: dict[str, int] = {rid: int(acc.bytes_consumed) for rid, acc in loop.accs.items()}
+        bytes_by_run: dict[str, int] = {}
         try:
-            hold_accs: dict[str, RunAccumulator] = {}
-            hold_batches: list[tuple[str, list, list | None, Any]] = []
+            rep = loop.run(close_streams=False)
+            for rid, acc in loop.accs.items():
+                st_obj = loop.streams.get(rid)
+                bytes_by_run[rid] = int(st_obj.consumed_bytes) if st_obj is not None else int(acc.bytes_consumed)
+
+            # Collect a bounded independent holdout slice directly from the open streams past discovery+zoom (#16, #61)
+            max_hold_wave_bytes = min(16 << 20, max(262_144, available_ram_bytes() // 64))
             decoy_set = catalog.decoy_ids
+            hold_accs: dict[str, RunAccumulator] = {}
+            pending_wave: list[tuple[str, list, list | None, Any]] = []
+            pending_wave_bytes = 0
+
+            def _flush_holdout_wave() -> None:
+                nonlocal pending_wave_bytes
+                if not pending_wave:
+                    return
+                for paired_flag in (True, False):
+                    sub_w = [b for b in pending_wave if (b[2] is not None) == paired_flag]
+                    if sub_w:
+                        mapped_w = map_pooled(win_kernel, sub_w)
+                        for rid_w, mres_w in mapped_w.items():
+                            hold_accs[rid_w].add(mres_w)
+                pending_wave.clear()
+                pending_wave_bytes = 0
+
             for r in manifest.rna_runs:
-                used_b = bytes_by_run.get(r.run_id, 0)
-                if used_b + 131_072 < r.total_bytes:
-                    rs = open_run_stream(r, eff_source_mode, stream_cache)
-                    try:
+                rs = loop.streams.get(r.run_id)
+                owned_rs = False
+                try:
+                    if rs is None:
+                        used_b = bytes_by_run.get(r.run_id, 0)
+                        if used_b + 131_072 >= r.total_bytes:
+                            continue
+                        rs = open_run_stream(r, eff_source_mode, stream_cache)
+                        owned_rs = True
                         if isinstance(rs, XsraRunStream):
                             continue
-                        rs.advance_bytes(used_b)
-                        hb_target = max(131_072, min(int(r.total_bytes * 0.005), r.total_bytes - used_b))
-                        hr1, hr2 = rs.advance_bytes(hb_target)
-                        if hr1:
-                            acc_h = RunAccumulator(run=r, decoy_ids=decoy_set)
-                            hold_accs[r.run_id] = acc_h
-                            hold_batches.append((r.run_id, hr1, hr2, acc_h.calibrator))
-                    finally:
-                        if hasattr(rs, "close"):
-                            rs.close()
-            if len(hold_batches) >= 2:
-                mapped_h = map_pooled(win_kernel, hold_batches)
-                for rid, mres in mapped_h.items():
-                    hold_accs[rid].add(mres)
-                tc_hold, _, _ = quantify_cohort(hold_accs, catalog, dna_prob=None, strand_prior=rep.strand_priors, em_iters=4)
+                        rs.skip_bytes(used_b)
+                    elif isinstance(rs, XsraRunStream):
+                        continue
+
+                    rem_after = rs.total_bytes - rs.consumed_bytes
+                    if rs.exhausted or rem_after <= 131_072:
+                        continue
+                    hb_target = max(131_072, min(int(r.total_bytes * 0.005), 8 << 20, rem_after))
+                    hr1: list = []
+                    hr2: list | None = None
+                    rem_h = hb_target
+                    while rem_h > 0 and not rs.exhausted:
+                        step_h = min(rem_h, max_hold_wave_bytes)
+                        prev_h = rs.consumed_bytes
+                        c1_h, c2_h = rs.advance_bytes(step_h)
+                        delta_h = rs.consumed_bytes - prev_h
+                        if not c1_h and delta_h <= 0:
+                            break
+                        rem_h -= max(step_h, delta_h)
+                        if c1_h:
+                            hr1.extend(c1_h)
+                            if c2_h is not None:
+                                if hr2 is None:
+                                    hr2 = []
+                                hr2.extend(c2_h)
+                except (OSError, RuntimeError) as io_exc:
+                    _log(f"Holdout stream read skipped for {r.run_id} ({type(io_exc).__name__} - {io_exc})")
+                    continue
+                finally:
+                    if owned_rs and rs is not None and hasattr(rs, "close"):
+                        rs.close()
+
+                if hr1:
+                    acc_h = RunAccumulator(run=r, decoy_ids=decoy_set)
+                    hold_accs[r.run_id] = acc_h
+                    est_batch_b = sum(len(s) * 2 for s, _ in hr1) * (2 if hr2 is not None else 1)
+                    if pending_wave and (pending_wave_bytes + est_batch_b > max_hold_wave_bytes):
+                        _flush_holdout_wave()
+                    pending_wave.append((r.run_id, hr1, hr2, acc_h.calibrator))
+                    pending_wave_bytes += est_batch_b
+
+            _flush_holdout_wave()
+            if len(hold_accs) >= 2:
+                tc_hold, _ = quantify_cohort(
+                    hold_accs,
+                    catalog,
+                    dna_prob={},
+                    dna_counts={},
+                    strand_priors=rep.strand_priors,
+                    em_iters=4,
+                    include_posteriors=False,
+                    include_decoys=False,
+                )
                 PanStateStore(pan_state_dir).write("target_counts_holdout", tc_hold, TARGET_COUNTS_SCHEMA)
                 holdout_saved = True
-        except Exception as exc:
-            _log(f"Holdout slice skipped ({type(exc).__name__}: {exc})")
+        finally:
+            loop.close_streams()
+
+        # Ensure zoom_context.json contract is persisted whenever target_counts_zoom.parquet was written (#66)
+        zoom_pq = pan_state_dir / "target_counts_zoom.parquet"
+        zoom_ctx_file = pan_state_dir / "zoom_context.json"
+        if zoom_pq.is_file() and not zoom_ctx_file.is_file():
+            zctx = getattr(loop, "_last_zoom_ctx", None) or {}
+            ds_obj = zctx.get("depth_scale")
+            ds_dict = {str(k): float(v) for k, v in ds_obj.items()} if ds_obj is not None else {}
+            write_json(
+                zoom_ctx_file,
+                {
+                    "zoomed_groups": [str(g) for g in zctx.get("groups", [])],
+                    "sample_depth_scale": ds_dict,
+                },
+            )
 
         bridge_map = _build_ortholog_bridge_map(catalog)
         de_raw = rep.de_postzoom if (rep.de_postzoom is not None and not rep.de_postzoom.empty) else rep.de_prezoom
@@ -1071,8 +1508,18 @@ def run_expressionloop_galaxy(
             Path(out_transcripts).parent.mkdir(parents=True, exist_ok=True)
             tx_df.to_csv(out_transcripts, sep="\t", index=False, float_format="%.6g")
 
-        tc_df = pq.read_table(pan_state_dir / "target_counts.parquet").to_pandas()
-        mapped_by_run = tc_df.groupby("run_id")["effective_count"].sum().to_dict() if not tc_df.empty else {}
+        # Column-projected Arrow aggregation without loading 50M-row DataFrame into pandas (#18)
+        tc_proj = pq.read_table(pan_state_dir / "target_counts.parquet", columns=["run_id", "effective_count"])
+        if tc_proj.num_rows > 0:
+            tc_agg = tc_proj.group_by("run_id").aggregate([("effective_count", "sum")])
+            mapped_by_run = {
+                str(rid): float(val or 0.0)
+                for rid, val in zip(tc_agg.column("run_id").to_pylist(), tc_agg.column("effective_count_sum").to_pylist())
+            }
+        else:
+            mapped_by_run = {}
+        del tc_proj
+
         per_sample_rows = []
         for r in manifest.runs:
             sb = bytes_by_run.get(r.run_id, 0)
@@ -1090,18 +1537,16 @@ def run_expressionloop_galaxy(
                 }
             )
 
+        # Require >0 mapped reads across EVERY RNA sample in the cohort, not only primary contrast levels (L9)
         mapped_by_sample: dict[str, float] = {}
-        cond_by_sample: dict[str, str] = {}
         for r in manifest.rna_runs:
-            mapped_by_sample[r.sample] = mapped_by_sample.get(r.sample, 0.0) + float(loop.accs[r.run_id].n_mapped)
-            cond_by_sample.setdefault(r.sample, str(r.condition))
-        empty_focal = [
-            s for s, m in mapped_by_sample.items()
-            if m <= 0 and (fac != "condition" or cond_by_sample.get(s) in (str(lvl_a), str(lvl_b)))
-        ]
-        if empty_focal:
+            z_acc = getattr(loop.accs[r.run_id], "zoom", None)
+            z_mapped = float(z_acc.n_mapped) if z_acc is not None else 0.0
+            mapped_by_sample[r.sample] = mapped_by_sample.get(r.sample, 0.0) + float(loop.accs[r.run_id].n_mapped) + z_mapped
+        empty_samples = [s for s, m in mapped_by_sample.items() if m <= 0]
+        if empty_samples:
             raise RuntimeError(
-                f"Zero mapped reads in active sample(s): {', '.join(sorted(empty_focal))}. "
+                f"Zero mapped reads in RNA sample(s): {', '.join(sorted(empty_samples))}. "
                 "Verify FASTQ inputs, reference assembly match, or remote archive availability."
             )
 
@@ -1136,7 +1581,11 @@ def run_expressionloop_galaxy(
             "assembly_prior": {k: round(float(v), 4) for k, v in (rep.assembly_prior or {}).items()},
             "telemetry": rep.telemetry,
             "zoom": zoom_dict,
-            "holdout_saved": holdout_saved,
+            "zoom_ran": bool(rep.zoom_ran),
+            "followups": rep.followups,
+            "malformed_skipped": rep.malformed_skipped,
+            "skipped_unpaired_mates": rep.skipped_unpaired_mates,
+            "holdout_saved": bool(holdout_saved),
         }
         contrast_pretty = f"{fac}: {lvl_a} vs {lvl_b}"
         render_panexpr_report(
@@ -1152,21 +1601,7 @@ def run_expressionloop_galaxy(
 
         sample_meta_df.to_parquet(state_root / "sample_metadata.parquet", index=False)
         store = FocaloopStateStore(state_root)
-        ledger = HypothesisLedger.from_store(store, alpha_budget=0.05)
-        if not de_df.empty:
-            top = de_df.iloc[0]
-            top_lfc = float(top["log2FoldChange"]) if pd.notna(top["log2FoldChange"]) else 0.0
-            top_p = float(top["pvalue"]) if pd.notna(top["pvalue"]) else 1.0
-            ledger.evaluate_query(
-                "q0001",
-                "focaloop-expressionloop",
-                f"{fac}:{lvl_a}_vs_{lvl_b}:primary_discovery",
-                top_lfc,
-                top_p,
-                top_lfc,
-                min(top_p, 0.01) if top_p <= 0.005 else top_p,
-                store=store,
-            )
+        _init_empty_ledger(store, alpha_budget=0.05)
         state_meta = {
             "engine": "panexpr",
             "version": "0.4.0",
@@ -1175,6 +1610,7 @@ def run_expressionloop_galaxy(
             "design": design,
             "organism_mode": org_mode,
             "length_offsets": (org_mode == "eukaryotic"),
+            "holdout_saved": bool(holdout_saved),
             "catalog_summary": cat_summary,
             "loop_summary": loop_summary,
             "samples": sample_meta_df.to_dict(orient="records"),

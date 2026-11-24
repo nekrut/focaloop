@@ -234,82 +234,100 @@ def test_runner_manifest_mode_and_discover_weights(tmp_path: Path, monkeypatch: 
     assert discover_tiberius_weights("vertebrates", explicit_weights=wdir) == wdir.resolve()
 
 
-def test_run_geneloop_galaxy_fixture_outputs_and_no_sieve_wording(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Ensure portable native compilation works in tmp_path
-    monkeypatch.setenv("FOCALOOP_BUILD_NATIVE_DIR", str(tmp_path / "native"))
-    monkeypatch.delenv("GLCORE_BIN", raising=False)
-    monkeypatch.delenv("ORF_SCOUT_LIB", raising=False)
+def _assert_geneloop_outputs_valid(
+    res: dict,
+    out_gff3: Path,
+    out_prot: Path,
+    out_gtf: Path,
+    out_sum: Path,
+    out_rep: Path,
+    state_arc: Path,
+) -> None:
+    assert res["effective_mode"] == "fast_evidence"
+    for p in (out_gff3, out_prot, out_gtf, out_sum, out_rep, state_arc):
+        assert p.is_file() and p.stat().st_size > 0
+    assert "##gff-version 3" in out_gff3.read_text()
+    assert "coding_genes" in out_sum.read_text()
+    html_text = out_rep.read_text()
+    assert "GeneLoop" in html_text
+    assert "sieve" not in html_text.lower()
+    assert "sieve" not in out_sum.read_text().lower()
 
-    # Lightweight GateRun stub when bioinformatics binaries (miniprot/hisat2/samtools) aren't installed locally
-    have_bins = all(shutil_which(b) for b in ("miniprot", "hisat2", "samtools"))
-    if not have_bins:
-        import focaloop.runners_geneloop as rg
-        from focaloop.geneloop.gffio import Transcript, write_gff3, write_gtf
 
-        class _StubGateRun:
-            def __init__(self, gate_id, *, root=None, loop=None, synth=None, gate=None):
-                self.c_tag = "C1"
-                self.dir = (Path(root) if root else tmp_path) / gate_id
-                self.dir.mkdir(parents=True, exist_ok=True)
-                self.genome = Genome(gate["fasta_path"])
-                self.meta = {"n_contigs": len(self.genome.lengths), "genome_bp": sum(self.genome.lengths.values()), "organelle_contigs": []}
-                self._local_streams = {}
-                self._local_bams = []
-                self._skip_tiberius = False
-                self._enable_zoom = True
+def test_run_geneloop_galaxy_stub_outputs_and_no_sieve_wording(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit stubbed runner test verifying output serialization, report rendering, and zero 'sieve' wording."""
+    import focaloop.runners_geneloop as rg
+    from focaloop.geneloop.gffio import Transcript, write_gff3
 
-            def seed(self, run_tiberius=False):
-                return {"n_loci": 2, "LOCKED_HIGH_CONF": 1, "UNSETTLED_LOCI": 1}
+    class _StubGateRun:
+        def __init__(self, gate_id, *, root=None, loop=None, synth=None, gate=None):
+            self.c_tag = "C1"
+            self.dir = (Path(root) if root else tmp_path) / gate_id
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.genome = Genome(gate["fasta_path"])
+            self.meta = {
+                "n_contigs": len(self.genome.lengths),
+                "genome_bp": sum(self.genome.lengths.values()),
+                "organelle_contigs": [],
+            }
+            self._local_streams = {}
+            self._local_bams = []
+            self._skip_tiberius = False
+            self._enable_zoom = True
+            self.lp = loop
 
-            def close(self):
-                return None
+        def seed(self, run_tiberius=False):
+            return {"n_loci": 2, "LOCKED_HIGH_CONF": 1, "UNSETTLED_LOCI": 1}
 
-            def arm_c(self, seed_summary=None):
-                ex1 = [(100, 300), (600, 900), (1100, 1300)]
-                txs = [
-                    Transcript(
-                        tid="g1.t1",
-                        contig="chr1",
-                        strand="+",
-                        exons=ex1,
-                        cds=ex1,
-                        gid="g1",
-                        source="GeneLoop",
-                        biotype="protein_coding",
-                    ),
-                    Transcript(
-                        tid="g2.t1",
-                        contig="chr2",
-                        strand="-",
-                        exons=[(120, 320), (520, 720)],
-                        cds=[],
-                        gid="g2",
-                        source="GeneLoop",
-                        biotype="lncRNA",
-                    ),
-                ]
-                arm_dir = self.dir / f"arm{self.c_tag}"
-                arm_dir.mkdir(parents=True, exist_ok=True)
-                gff = arm_dir / f"arm{self.c_tag}.gff3"
-                write_gff3(txs, gff, source="GeneLoop")
-                return {
-                    "final_gff": str(gff),
-                    "waves": 1,
-                    "stop_reason": "P0_CONVERGED",
-                    "spots_streamed_all": 12,
-                    "total_spots_all": 12,
-                    "pct_archive_streamed": 100.0,
-                    "sieve": {"pairs_in": 12, "pairs_dropped_locus": 4, "pairs_dropped_bait": 0, "bypass_pct": 33.3},
-                    "judge_final": {"global_unsettled_p0": 0.0},
-                    "synth_stats": {
-                        "n_structural_ncrna_genes": 0,
-                        "n_microexon_models": 0,
-                        "n_single_exon_genes": 0,
-                        "retro_rejected": 0,
-                    },
-                }
+        def close(self):
+            return None
 
-        monkeypatch.setattr(rg, "GateRun", _StubGateRun)
+        def arm_c(self, seed_summary=None):
+            ex1 = [(100, 300), (600, 900), (1100, 1300)]
+            txs = [
+                Transcript(
+                    tid="g1.t1",
+                    contig="chr1",
+                    strand="+",
+                    exons=ex1,
+                    cds=ex1,
+                    gid="g1",
+                    source="GeneLoop",
+                    biotype="protein_coding",
+                ),
+                Transcript(
+                    tid="g2.t1",
+                    contig="chr2",
+                    strand="-",
+                    exons=[(120, 320), (520, 720)],
+                    cds=[],
+                    gid="g2",
+                    source="GeneLoop",
+                    biotype="lncRNA",
+                ),
+            ]
+            arm_dir = self.dir / f"arm{self.c_tag}"
+            arm_dir.mkdir(parents=True, exist_ok=True)
+            gff = arm_dir / f"arm{self.c_tag}.gff3"
+            write_gff3(txs, gff, source="GeneLoop")
+            return {
+                "final_gff": str(gff),
+                "waves": 1,
+                "stop_reason": "P0_CONVERGED",
+                "spots_streamed_all": 12,
+                "total_spots_all": 12,
+                "pct_archive_streamed": 100.0,
+                "sieve": {"pairs_in": 12, "pairs_dropped_locus": 4, "pairs_dropped_bait": 0, "bypass_pct": 33.3},
+                "judge_final": {"global_unsettled_p0": 0.0},
+                "synth_stats": {
+                    "n_structural_ncrna_genes": 0,
+                    "n_microexon_models": 0,
+                    "n_single_exon_genes": 0,
+                    "retro_rejected": 0,
+                },
+            }
+
+    monkeypatch.setattr(rg, "GateRun", _StubGateRun)
 
     out_gff3 = tmp_path / "annotation.gff3"
     out_prot = tmp_path / "proteins.faa"
@@ -319,8 +337,13 @@ def test_run_geneloop_galaxy_fixture_outputs_and_no_sieve_wording(tmp_path: Path
     state_dir = tmp_path / "state_dir"
     state_arc = tmp_path / "state.focaloop.tar.zst"
 
+    import shutil as _shutil
+
+    tmp_genome = tmp_path / "input_genome.fa"
+    _shutil.copy2(TEST_DATA / "genome.fa", tmp_genome)
+
     res = run_geneloop_galaxy(
-        genome_fasta=TEST_DATA / "genome.fa",
+        genome_fasta=tmp_genome,
         out_gff3=out_gff3,
         out_proteins=out_prot,
         out_gtf=out_gtf,
@@ -337,21 +360,56 @@ def test_run_geneloop_galaxy_fixture_outputs_and_no_sieve_wording(tmp_path: Path
         structural_ncrna="off",
         threads=2,
     )
-
-    assert res["effective_mode"] == "fast_evidence"
-    for p in (out_gff3, out_prot, out_gtf, out_sum, out_rep, state_arc):
-        assert p.is_file() and p.stat().st_size > 0
-    assert "##gff-version 3" in out_gff3.read_text()
-    assert "coding_genes" in out_sum.read_text()
-    html_text = out_rep.read_text()
-    assert "GeneLoop" in html_text
-    assert "sieve" not in html_text.lower()
-    assert "sieve" not in out_sum.read_text().lower()
+    _assert_geneloop_outputs_valid(res, out_gff3, out_prot, out_gtf, out_sum, out_rep, state_arc)
 
 
 def shutil_which(cmd: str) -> str | None:
     import shutil
     return shutil.which(cmd)
+
+
+@pytest.mark.skipif(
+    not all(shutil_which(b) for b in ("miniprot", "hisat2", "hisat2-build", "samtools", "stringtie", "diamond")),
+    reason="Real end-to-end GeneLoop test requires miniprot, hisat2, samtools, stringtie, and diamond on PATH",
+)
+def test_run_geneloop_galaxy_real_tools_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real unstubbed end-to-end GeneLoop execution skipped explicitly when external aligners are absent."""
+    monkeypatch.setenv("FOCALOOP_BUILD_NATIVE_DIR", str(tmp_path / "native"))
+    monkeypatch.delenv("GLCORE_BIN", raising=False)
+    monkeypatch.delenv("ORF_SCOUT_LIB", raising=False)
+
+    out_gff3 = tmp_path / "annotation.gff3"
+    out_prot = tmp_path / "proteins.faa"
+    out_gtf = tmp_path / "transcripts.gtf"
+    out_sum = tmp_path / "locus_summary.tsv"
+    out_rep = tmp_path / "focaloop_report.html"
+    state_dir = tmp_path / "state_dir"
+    state_arc = tmp_path / "state.focaloop.tar.zst"
+
+    import shutil as _shutil
+
+    tmp_genome = tmp_path / "input_genome.fa"
+    _shutil.copy2(TEST_DATA / "genome.fa", tmp_genome)
+
+    res = run_geneloop_galaxy(
+        genome_fasta=tmp_genome,
+        out_gff3=out_gff3,
+        out_proteins=out_prot,
+        out_gtf=out_gtf,
+        out_summary=out_sum,
+        out_report=out_rep,
+        state_dir=state_dir,
+        state_archive=state_arc,
+        proteins_fasta=TEST_DATA / "proteins.faa",
+        clade="vertebrates",
+        mode="fast_evidence",
+        short_reads_1=[TEST_DATA / "reads_1.fastq.gz"],
+        short_reads_2=[TEST_DATA / "reads_2.fastq.gz"],
+        short_read_ids=["test_pe"],
+        structural_ncrna="off",
+        threads=2,
+    )
+    _assert_geneloop_outputs_valid(res, out_gff3, out_prot, out_gtf, out_sum, out_rep, state_arc)
 
 
 def test_galaxy_xml_udt_test_data_and_strict_no_sieve() -> None:

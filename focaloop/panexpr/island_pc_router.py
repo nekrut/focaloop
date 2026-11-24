@@ -120,6 +120,12 @@ class _CProbeResult(ctypes.Structure):
         ("kr_hat", ctypes.c_double),
         ("high_divergence_merged_islands", ctypes.c_int),
         ("used_high_div_fallback", ctypes.c_int),
+        ("n_anchored_reads", ctypes.c_uint64),
+        ("n_unanchored_reads", ctypes.c_uint64),
+        ("anchored_kmer_windows", ctypes.c_uint64),
+        ("anchored_ocean_kmers", ctypes.c_uint64),
+        ("anchored_novel_kmers", ctypes.c_uint64),
+        ("unanchored_read_fraction", ctypes.c_double),
     ]
 
 
@@ -301,6 +307,12 @@ class IslandProbeSummary:
     high_divergence_merged_islands: bool
     used_high_div_fallback: bool
     routing: MapperRoutingVerdict
+    n_anchored_reads: int = 0
+    n_unanchored_reads: int = 0
+    anchored_kmer_windows: int = 0
+    anchored_ocean_kmers: int = 0
+    anchored_novel_kmers: int = 0
+    unanchored_read_fraction: float = 0.0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -791,6 +803,12 @@ class ReferenceIslandPCIndex:
             high_divergence_merged_islands=bool(cout.high_divergence_merged_islands),
             used_high_div_fallback=bool(cout.used_high_div_fallback),
             routing=verdict,
+            n_anchored_reads=int(cout.n_anchored_reads),
+            n_unanchored_reads=int(cout.n_unanchored_reads),
+            anchored_kmer_windows=int(cout.anchored_kmer_windows),
+            anchored_ocean_kmers=int(cout.anchored_ocean_kmers),
+            anchored_novel_kmers=int(cout.anchored_novel_kmers),
+            unanchored_read_fraction=float(cout.unanchored_read_fraction),
         )
 
     def compute_baselines(self, query_seqs: Sequence[str] | str, sketch_size: int = 2000) -> dict:

@@ -25,8 +25,10 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import time
 import xml.etree.ElementTree as ET
 
@@ -91,8 +93,57 @@ class RfamEntry:
 
 
 def default_rfam_dir() -> Path:
-    env_dir = os.environ.get("GENELOOP_RFAM_DIR")
-    return Path(env_dir) if env_dir else (seedmod.BUILD_ROOT / "rfam")
+    env_dir = os.environ.get("GENELOOP_RFAM_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    for cand in (
+        Path("/opt/focaloop/rfam"),
+        Path("/cvmfs/data.galaxyproject.org/byhand/rfam"),
+        seedmod.BUILD_ROOT / "rfam",
+    ):
+        if cand.is_dir():
+            return cand
+    return seedmod.BUILD_ROOT / "rfam"
+
+
+def _read_log_tail(log_path: Path, max_lines: int = 40, max_chars: int = 4096) -> str:
+    try:
+        if not log_path.is_file():
+            return ""
+        txt = log_path.read_text(encoding="utf-8", errors="replace").strip()
+        if not txt:
+            return ""
+        lines = txt.splitlines()[-max_lines:]
+        joined = "\n".join(lines)
+        return joined[-max_chars:]
+    except OSError:
+        return ""
+
+
+def _run_ncrna_cmd(
+    cmd: list[str],
+    *,
+    log_path: Path,
+    stage_label: str,
+    stdout_path: Path | None = None,
+) -> tuple[int, float, float, float]:
+    """Execute a structural ncRNA tool and surface log tail to stderr + RuntimeError before temp cleanup."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if stdout_path is not None:
+        with open(stdout_path, "w") as f_out, open(log_path, "w") as f_err:
+            rc, w, u, s = run_cmd(cmd, stdout=f_out, stderr=f_err, check=False)
+    else:
+        with open(log_path, "w") as f_log:
+            rc, w, u, s = run_cmd(cmd, stdout=f_log, stderr=f_log, check=False)
+    if rc != 0:
+        tail = _read_log_tail(log_path)
+        cmd_str = shlex.join(cmd)
+        msg = f"{stage_label} failed (rc={rc}): {cmd_str}"
+        if tail:
+            msg = f"{msg}\n--- {stage_label} stderr/log tail ---\n{tail}"
+        print(f"[focaloop-geneloop] {msg}", file=sys.stderr)
+        raise RuntimeError(msg)
+    return rc, w, u, s
 
 
 def _sha256_cached(path: Path) -> str:
@@ -183,6 +234,7 @@ def check_ncrna_assets(rfam_dir: Path | None = None, mode: str = "auto") -> dict
         return {
             "available": False,
             "status": "disabled",
+            "stages": {"trnascan": False, "barrnap": False, "rfam": False},
             "rfam_dir": str(rdir),
             "rfam_version": RFAM_PINNED_VERSION,
             "missing": [],
@@ -228,15 +280,37 @@ def check_ncrna_assets(rfam_dir: Path | None = None, mode: str = "auto") -> dict
     else:
         missing.append("binary:cmsearch(Infernal>=1.1 --rfam)")
 
+    stages = {
+        "trnascan": "tRNAscan-SE" in bins,
+        "barrnap": "barrnap" in bins,
+        "rfam": (
+            "nhmmer" in bins
+            and "cmsearch" in bins
+            and len(asset_shas) == len(PINNED_RFAM_ASSETS)
+        ),
+    }
+
     if missing:
         if mode == "on":
             raise FileNotFoundError(
                 f"enable_structural_ncrna='on' requires Rfam {RFAM_PINNED_VERSION} assets and binaries; "
                 f"missing: {', '.join(missing)}"
             )
+        if any(stages.values()):
+            return {
+                "available": True,
+                "status": "partial",
+                "stages": stages,
+                "rfam_dir": str(rdir),
+                "rfam_version": RFAM_PINNED_VERSION,
+                "missing": missing,
+                "binaries": bins,
+                "asset_sha256": asset_shas,
+            }
         return {
             "available": False,
             "status": "skipped_missing_assets",
+            "stages": stages,
             "rfam_dir": str(rdir),
             "rfam_version": RFAM_PINNED_VERSION,
             "missing": missing,
@@ -247,6 +321,7 @@ def check_ncrna_assets(rfam_dir: Path | None = None, mode: str = "auto") -> dict
     return {
         "available": True,
         "status": "ok",
+        "stages": stages,
         "rfam_dir": str(rdir),
         "rfam_version": RFAM_PINNED_VERSION,
         "missing": [],
@@ -1346,8 +1421,13 @@ def reconcile_rrna_and_rfam_candidates(barrnap_hits: list[dict], cmsearch_hits: 
 # ----------------------------------------------------------------------------------------------
 
 
-def compute_ncrna_raw_cache_key(genome_identity: dict, taxon_group: str) -> str:
-    payload = {
+def compute_ncrna_raw_cache_key(
+    genome_identity: dict,
+    taxon_group: str,
+    stages: dict[str, bool] | None = None,
+) -> str:
+    eff_stages = {"trnascan": True, "barrnap": True, "rfam": True} if stages is None else dict(stages)
+    payload: dict[str, object] = {
         "ncrna_raw_version": NCRNA_RAW_VERSION,
         "rfam_version": RFAM_PINNED_VERSION,
         "allowed_rfam_classes": sorted(ALLOWED_RFAM_CLASSES),
@@ -1356,6 +1436,8 @@ def compute_ncrna_raw_cache_key(genome_identity: dict, taxon_group: str) -> str:
         "taxon_group": taxon_group,
         "genome_identity": genome_identity,
     }
+    if not all(eff_stages.values()):
+        payload["stages"] = {k: bool(eff_stages.get(k, False)) for k in ("trnascan", "barrnap", "rfam")}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -1378,6 +1460,8 @@ def ensure_structural_ncrna_raw(
     if mode == "off":
         return {
             "status": "disabled",
+            "stages": {"trnascan": False, "barrnap": False, "rfam": False},
+            "stages_run": [],
             "rfam_version": RFAM_PINNED_VERSION,
             "ncrna_raw_version": NCRNA_RAW_VERSION,
             "missing": [],
@@ -1397,10 +1481,27 @@ def ensure_structural_ncrna_raw(
                     f"expected {exp_sha}, got {got_sha}"
                 )
 
+    asset_info = check_ncrna_assets(rfam_dir=rfam_dir, mode=mode)
+    stages = asset_info.get("stages") or {"trnascan": True, "barrnap": True, "rfam": True}
+    stages_run = [k for k in ("trnascan", "barrnap", "rfam") if stages.get(k)]
+    if not asset_info["available"]:
+        return {
+            "status": asset_info["status"],
+            "stages": stages,
+            "stages_run": [],
+            "rfam_version": RFAM_PINNED_VERSION,
+            "ncrna_raw_version": NCRNA_RAW_VERSION,
+            "missing": asset_info["missing"],
+            "raw_candidates_path": "",
+            "raw_candidates_sha256": asset_info["status"],
+            "n_raw_candidates": 0,
+        }
+
     raw_json_p = out_dir / "raw_ncrna_candidates.json"
     done_json_p = out_dir / "done.json"
     taxon_group = resolve_rfam_taxon_group(gate)
-    cache_key = compute_ncrna_raw_cache_key(genome_identity, taxon_group)
+    cache_key = compute_ncrna_raw_cache_key(genome_identity, taxon_group, stages=stages)
+    expected_shas = PINNED_RFAM_ASSETS if stages.get("rfam") else asset_info["asset_sha256"]
 
     if done_json_p.exists() and raw_json_p.exists():
         try:
@@ -1410,28 +1511,16 @@ def ensure_structural_ncrna_raw(
         if (
             isinstance(done_old, dict)
             and done_old.get("cache_key") == cache_key
-            and done_old.get("asset_sha256") == PINNED_RFAM_ASSETS
+            and done_old.get("asset_sha256") == expected_shas
         ):
             actual_sha = _sha256_cached(raw_json_p)
             if done_old.get("raw_candidates_sha256") == actual_sha:
                 return {
                     **done_old,
-                    "status": "ok",
+                    "status": asset_info["status"],
                     "cached": True,
                     "raw_candidates_path": str(raw_json_p),
                 }
-
-    asset_info = check_ncrna_assets(rfam_dir=rfam_dir, mode=mode)
-    if not asset_info["available"]:
-        return {
-            "status": asset_info["status"],
-            "rfam_version": RFAM_PINNED_VERSION,
-            "ncrna_raw_version": NCRNA_RAW_VERSION,
-            "missing": asset_info["missing"],
-            "raw_candidates_path": "",
-            "raw_candidates_sha256": asset_info["status"],
-            "n_raw_candidates": 0,
-        }
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1469,173 +1558,203 @@ def ensure_structural_ncrna_raw(
             tot_u = 0.0
             tot_s = 0.0
         else:
-            # 1. Extract taxon-filtered 3-class Rfam 15.1 subset (.cm + .hmm)
-            selected_entries = load_rfam_amendments(rdir / "rfam151_amendments.xml", taxon_group)
-            clan_by_acc = load_clan_membership(rdir / "clan_membership.txt.gz")
-            sub_cm, sub_hmm, model_clen, _model_acc = ensure_rfam_subset_files(
-                rdir / "Rfam.cm.gz", work_dir / "models", selected_entries
-            )
+            # 1. Sharded tRNAscan-SE 2.0.12 + genome-wide anticodon repeat filter (when available)
+            trna_wall = 0.0
+            trna_u = 0.0
+            trna_s = 0.0
+            kept_trnas: list[dict] = []
+            trna_rf_stats = {"n_initial": 0, "n_kept": 0, "gmean": 0.0, "max_per_anticodon": 20}
+            if stages.get("trnascan"):
+                t0 = time.time()
+                trna_chunks = split_nuclear_chunks(genome, nuclear_contigs, max_chunk_bp=25_000_000, overlap_bp=2_000)
+                trna_lookup = {ch["chunk_id"]: ch for ch in trna_chunks}
+                w_trna = min(14, max(1, n_threads // 4))
+                trna_shards = pack_chunks_lpt(trna_chunks, w_trna)
+                w_trna_eff = max(1, len(trna_shards))
+                t_per_trna = max(1, min(4, n_threads // w_trna_eff))
+                trna_dir = work_dir / "trnascan"
+                trna_dir.mkdir(parents=True, exist_ok=True)
 
-            # 2. Sharded tRNAscan-SE 2.0.12 + genome-wide anticodon repeat filter
-            t0 = time.time()
-            trna_chunks = split_nuclear_chunks(genome, nuclear_contigs, max_chunk_bp=25_000_000, overlap_bp=2_000)
-            trna_lookup = {ch["chunk_id"]: ch for ch in trna_chunks}
-            w_trna = min(14, max(1, n_threads // 4))
-            trna_shards = pack_chunks_lpt(trna_chunks, w_trna)
-            w_trna_eff = max(1, len(trna_shards))
-            t_per_trna = max(1, min(4, n_threads // w_trna_eff))
-            trna_dir = work_dir / "trnascan"
-            trna_dir.mkdir(parents=True, exist_ok=True)
-
-            def _run_trna_shard(item: tuple[int, list[dict]]) -> tuple[Path, float, float]:
-                si, schunks = item
-                s_fa = trna_dir / f"shard_{si}.fa"
-                s_gff = trna_dir / f"shard_{si}.gff3"
-                s_tsv = trna_dir / f"shard_{si}.tsv"
-                _write_chunk_fasta(genome, schunks, s_fa)
-                cmd = build_trnascan_cmd(bins["tRNAscan-SE"], t_per_trna, s_gff, s_tsv, s_fa)
-                with open(trna_dir / f"shard_{si}.log", "w") as lf:
-                    _, _w, u, s = run_cmd(cmd, stdout=lf, stderr=lf)
-                s_fa.unlink(missing_ok=True)
-                return s_gff, u, s
-
-            with ThreadPoolExecutor(max_workers=w_trna_eff) as ex:
-                trna_outs = list(ex.map(_run_trna_shard, enumerate(trna_shards)))
-            trna_wall = time.time() - t0
-            trna_u = sum(x[1] for x in trna_outs)
-            trna_s = sum(x[2] for x in trna_outs)
-            raw_trnas: list[dict] = []
-            for s_gff, _u, _s in trna_outs:
-                raw_trnas.extend(parse_trnascan_gff(s_gff, chunk_lookup=trna_lookup))
-            dedup_trnas = dedup_trna_overlap_hits(raw_trnas)
-            kept_trnas, trna_rf_stats = apply_trnascan_repeat_filter(dedup_trnas, contig_order=contig_order)
-
-            # 3. Step A: Unsplit 18S / 28S / 5.8S scan via barrnap
-            t1 = time.time()
-            t_bar = max(1, min(16, n_threads))
-            if organelle_contigs:
-                nuc_fa = work_dir / "nuclear.fa"
-                with open(nuc_fa, "w") as fh:
-                    for ctg in nuclear_contigs:
-                        seq = genome.fetch(ctg, 0, genome.lengths[ctg])
-                        fh.write(f">{ctg}\n")
-                        for i in range(0, len(seq), 80):
-                            fh.write(seq[i : i + 80] + "\n")
-            else:
-                nuc_fa = genome_fa
-            bar_gff = work_dir / "barrnap.gff3"
-            bar_err = work_dir / "barrnap.err"
-            with open(bar_gff, "w") as f_out, open(bar_err, "w") as f_err:
-                _, _wb, bar_u, bar_s = run_cmd(
-                    [
-                        bins["barrnap"],
-                        "--kingdom",
-                        "euk",
-                        "--threads",
-                        str(t_bar),
-                        "--reject",
-                        "0.25",
-                        "--quiet",
-                        str(nuc_fa),
-                    ],
-                    stdout=f_out,
-                    stderr=f_err,
-                )
-            if nuc_fa != genome_fa:
-                nuc_fa.unlink(missing_ok=True)
-            bar_wall = time.time() - t1
-            euk_leng = read_barrnap_euk_lengths(bins["barrnap"])
-            barrnap_hits = parse_barrnap_gff(bar_gff.read_text(), euk_hmm_leng=euk_leng)
-
-            # 4. Step B: Stage-1 vectorized nhmmer -Z 160 -E 10.0 prefilter
-            t2 = time.time()
-            hmm_chunks = split_nuclear_chunks(genome, nuclear_contigs, max_chunk_bp=25_000_000, overlap_bp=2_500)
-            hmm_lookup = {ch["chunk_id"]: ch for ch in hmm_chunks}
-            w_hmm = min(7, max(1, n_threads // 8))
-            hmm_shards = pack_chunks_lpt(hmm_chunks, w_hmm)
-            w_hmm_eff = max(1, len(hmm_shards))
-            t_hmm = max(1, min(8, n_threads // w_hmm_eff))
-            hmm_dir = work_dir / "nhmmer"
-            hmm_dir.mkdir(parents=True, exist_ok=True)
-
-            def _run_nhmmer_shard(item: tuple[int, list[dict]]) -> tuple[Path, float, float]:
-                si, schunks = item
-                s_fa = hmm_dir / f"shard_{si}.fa"
-                s_tbl = hmm_dir / f"shard_{si}.nhmmer.tbl"
-                _write_chunk_fasta(genome, schunks, s_fa)
-                cmd = build_nhmmer_cmd(bins["nhmmer"], t_hmm, s_tbl, sub_hmm, s_fa)
-                try:
-                    with open(hmm_dir / f"shard_{si}.err", "w") as lf:
-                        _, _wh, u, s = run_cmd(cmd, stderr=lf)
-                finally:
-                    s_fa.unlink(missing_ok=True)
-                return s_tbl, u, s
-
-            with ThreadPoolExecutor(max_workers=w_hmm_eff) as ex:
-                hmm_outs = list(ex.map(_run_nhmmer_shard, enumerate(hmm_shards)))
-            hmm_wall = time.time() - t2
-            hmm_u = sum(x[1] for x in hmm_outs)
-            hmm_s = sum(x[2] for x in hmm_outs)
-            nuc_lengths = {c: int(genome.lengths[c]) for c in nuclear_contigs}
-            merged_windows = parse_nhmmer_tblout_to_windows(
-                [x[0] for x in hmm_outs], hmm_lookup, model_clen, nuc_lengths
-            )
-            cand_bp = sum(b - a for _, a, b in merged_windows)
-
-            # 5. Step C: Stage-2 sharded cmsearch --nohmmonly & strict A1+F5 classification
-            t3 = time.time()
-            cm_u = 0.0
-            cm_s = 0.0
-            if merged_windows:
-                w_cm = min(4, max(1, n_threads // 14)) if len(merged_windows) >= 64 else 1
-                win_dicts = [
-                    {"chunk_id": f"glwin_{wi}", "contig": ctg, "lo": a, "hi": b}
-                    for wi, (ctg, a, b) in enumerate(merged_windows)
-                ]
-                win_lookup = {wd["chunk_id"]: (wd["contig"], int(wd["lo"]), int(wd["hi"])) for wd in win_dicts}
-                cm_shards = pack_chunks_lpt(win_dicts, w_cm)
-                w_cm_eff = max(1, len(cm_shards))
-                t_cm = max(1, min(16, n_threads // w_cm_eff))
-                cm_dir = work_dir / "cmsearch"
-                cm_dir.mkdir(parents=True, exist_ok=True)
-
-                def _run_cm_shard(
-                    item: tuple[int, list[dict]],
-                ) -> tuple[Path, set[tuple[str, str, str, int, int]], float, float]:
-                    si, swins = item
-                    s_fa = cm_dir / f"batch_{si}.fa"
-                    s_tbl = cm_dir / f"batch_{si}.cm.tbl"
-                    s_out = cm_dir / f"batch_{si}.cm.out"
-                    _write_chunk_fasta(genome, swins, s_fa)
-                    cmd = build_cmsearch_cmd(bins["cmsearch"], t_cm, s_tbl, s_out, sub_cm, s_fa)
+                def _run_trna_shard(item: tuple[int, list[dict]]) -> tuple[Path, float, float]:
+                    si, schunks = item
+                    s_fa = trna_dir / f"shard_{si}.fa"
+                    s_gff = trna_dir / f"shard_{si}.gff3"
+                    s_tsv = trna_dir / f"shard_{si}.tsv"
+                    _write_chunk_fasta(genome, schunks, s_fa)
+                    cmd = build_trnascan_cmd(bins["tRNAscan-SE"], t_per_trna, s_gff, s_tsv, s_fa)
                     try:
-                        with open(cm_dir / f"batch_{si}.err", "w") as lf:
-                            _, _wc, u, s = run_cmd(cmd, stderr=lf)
-                        elisions = parse_cmsearch_local_end_elisions([s_out], window_lookup=win_lookup)
+                        _, _w, u, s = _run_ncrna_cmd(
+                            cmd,
+                            log_path=trna_dir / f"shard_{si}.log",
+                            stage_label=f"tRNAscan-SE[shard_{si}]",
+                        )
                     finally:
                         s_fa.unlink(missing_ok=True)
-                        s_out.unlink(missing_ok=True)
-                    return s_tbl, elisions, u, s
+                    return s_gff, u, s
 
-                with ThreadPoolExecutor(max_workers=w_cm_eff) as ex:
-                    cm_outs = list(ex.map(_run_cm_shard, enumerate(cm_shards)))
-                cm_u = sum(x[2] for x in cm_outs)
-                cm_s = sum(x[3] for x in cm_outs)
-                all_elisions: set[tuple[str, str, str, int, int]] = set()
-                for _tbl, elis, _u, _s in cm_outs:
-                    all_elisions |= elis
-                cm_hits = parse_and_classify_cmsearch_hits(
-                    [x[0] for x in cm_outs],
-                    win_lookup,
-                    selected_entries,
-                    model_clen,
-                    clan_by_acc,
-                    genome,
-                    local_end_elisions=all_elisions,
+                with ThreadPoolExecutor(max_workers=w_trna_eff) as ex:
+                    trna_outs = list(ex.map(_run_trna_shard, enumerate(trna_shards)))
+                trna_wall = time.time() - t0
+                trna_u = sum(x[1] for x in trna_outs)
+                trna_s = sum(x[2] for x in trna_outs)
+                raw_trnas: list[dict] = []
+                for s_gff, _u, _s in trna_outs:
+                    raw_trnas.extend(parse_trnascan_gff(s_gff, chunk_lookup=trna_lookup))
+                dedup_trnas = dedup_trna_overlap_hits(raw_trnas)
+                kept_trnas, trna_rf_stats = apply_trnascan_repeat_filter(dedup_trnas, contig_order=contig_order)
+
+            # 2. Step A: Unsplit 18S / 28S / 5.8S scan via barrnap (when available)
+            bar_wall = 0.0
+            bar_u = 0.0
+            bar_s = 0.0
+            barrnap_hits: list[dict] = []
+            if stages.get("barrnap"):
+                t1 = time.time()
+                t_bar = max(1, min(16, n_threads))
+                if organelle_contigs:
+                    nuc_fa = work_dir / "nuclear.fa"
+                    with open(nuc_fa, "w") as fh:
+                        for ctg in nuclear_contigs:
+                            seq = genome.fetch(ctg, 0, genome.lengths[ctg])
+                            fh.write(f">{ctg}\n")
+                            for i in range(0, len(seq), 80):
+                                fh.write(seq[i : i + 80] + "\n")
+                else:
+                    nuc_fa = genome_fa
+                bar_gff = work_dir / "barrnap.gff3"
+                bar_err = work_dir / "barrnap.err"
+                try:
+                    _, _wb, bar_u, bar_s = _run_ncrna_cmd(
+                        [
+                            bins["barrnap"],
+                            "--kingdom",
+                            "euk",
+                            "--threads",
+                            str(t_bar),
+                            "--reject",
+                            "0.25",
+                            "--quiet",
+                            str(nuc_fa),
+                        ],
+                        stdout_path=bar_gff,
+                        log_path=bar_err,
+                        stage_label="barrnap",
+                    )
+                finally:
+                    if nuc_fa != genome_fa:
+                        nuc_fa.unlink(missing_ok=True)
+                bar_wall = time.time() - t1
+                euk_leng = read_barrnap_euk_lengths(bins["barrnap"])
+                barrnap_hits = parse_barrnap_gff(bar_gff.read_text(), euk_hmm_leng=euk_leng)
+
+            # 3. Step B + Step C: Rfam 15.1 nhmmer prefilter + cmsearch (when Rfam assets + Infernal/HMMER available)
+            n_selected_models = 0
+            hmm_wall = 0.0
+            hmm_u = 0.0
+            hmm_s = 0.0
+            cm_wall = 0.0
+            cm_u = 0.0
+            cm_s = 0.0
+            merged_windows: list[tuple[str, int, int]] = []
+            cand_bp = 0
+            cm_hits: list[dict] = []
+            if stages.get("rfam"):
+                selected_entries = load_rfam_amendments(rdir / "rfam151_amendments.xml", taxon_group)
+                n_selected_models = len(selected_entries)
+                clan_by_acc = load_clan_membership(rdir / "clan_membership.txt.gz")
+                sub_cm, sub_hmm, model_clen, _model_acc = ensure_rfam_subset_files(
+                    rdir / "Rfam.cm.gz", work_dir / "models", selected_entries
                 )
-            else:
-                cm_hits = []
-            cm_wall = time.time() - t3
+
+                t2 = time.time()
+                hmm_chunks = split_nuclear_chunks(genome, nuclear_contigs, max_chunk_bp=25_000_000, overlap_bp=2_500)
+                hmm_lookup = {ch["chunk_id"]: ch for ch in hmm_chunks}
+                w_hmm = min(7, max(1, n_threads // 8))
+                hmm_shards = pack_chunks_lpt(hmm_chunks, w_hmm)
+                w_hmm_eff = max(1, len(hmm_shards))
+                t_hmm = max(1, min(8, n_threads // w_hmm_eff))
+                hmm_dir = work_dir / "nhmmer"
+                hmm_dir.mkdir(parents=True, exist_ok=True)
+
+                def _run_nhmmer_shard(item: tuple[int, list[dict]]) -> tuple[Path, float, float]:
+                    si, schunks = item
+                    s_fa = hmm_dir / f"shard_{si}.fa"
+                    s_tbl = hmm_dir / f"shard_{si}.nhmmer.tbl"
+                    _write_chunk_fasta(genome, schunks, s_fa)
+                    cmd = build_nhmmer_cmd(bins["nhmmer"], t_hmm, s_tbl, sub_hmm, s_fa)
+                    try:
+                        _, _wh, u, s = _run_ncrna_cmd(
+                            cmd,
+                            log_path=hmm_dir / f"shard_{si}.err",
+                            stage_label=f"nhmmer[shard_{si}]",
+                        )
+                    finally:
+                        s_fa.unlink(missing_ok=True)
+                    return s_tbl, u, s
+
+                with ThreadPoolExecutor(max_workers=w_hmm_eff) as ex:
+                    hmm_outs = list(ex.map(_run_nhmmer_shard, enumerate(hmm_shards)))
+                hmm_wall = time.time() - t2
+                hmm_u = sum(x[1] for x in hmm_outs)
+                hmm_s = sum(x[2] for x in hmm_outs)
+                nuc_lengths = {c: int(genome.lengths[c]) for c in nuclear_contigs}
+                merged_windows = parse_nhmmer_tblout_to_windows(
+                    [x[0] for x in hmm_outs], hmm_lookup, model_clen, nuc_lengths
+                )
+                cand_bp = sum(b - a for _, a, b in merged_windows)
+
+                t3 = time.time()
+                if merged_windows:
+                    w_cm = min(4, max(1, n_threads // 14)) if len(merged_windows) >= 64 else 1
+                    win_dicts = [
+                        {"chunk_id": f"glwin_{wi}", "contig": ctg, "lo": a, "hi": b}
+                        for wi, (ctg, a, b) in enumerate(merged_windows)
+                    ]
+                    win_lookup = {wd["chunk_id"]: (wd["contig"], int(wd["lo"]), int(wd["hi"])) for wd in win_dicts}
+                    cm_shards = pack_chunks_lpt(win_dicts, w_cm)
+                    w_cm_eff = max(1, len(cm_shards))
+                    t_cm = max(1, min(16, n_threads // w_cm_eff))
+                    cm_dir = work_dir / "cmsearch"
+                    cm_dir.mkdir(parents=True, exist_ok=True)
+
+                    def _run_cm_shard(
+                        item: tuple[int, list[dict]],
+                    ) -> tuple[Path, set[tuple[str, str, str, int, int]], float, float]:
+                        si, swins = item
+                        s_fa = cm_dir / f"batch_{si}.fa"
+                        s_tbl = cm_dir / f"batch_{si}.cm.tbl"
+                        s_out = cm_dir / f"batch_{si}.cm.out"
+                        _write_chunk_fasta(genome, swins, s_fa)
+                        cmd = build_cmsearch_cmd(bins["cmsearch"], t_cm, s_tbl, s_out, sub_cm, s_fa)
+                        try:
+                            _, _wc, u, s = _run_ncrna_cmd(
+                                cmd,
+                                log_path=cm_dir / f"batch_{si}.err",
+                                stage_label=f"cmsearch[batch_{si}]",
+                            )
+                            elisions = parse_cmsearch_local_end_elisions([s_out], window_lookup=win_lookup)
+                        finally:
+                            s_fa.unlink(missing_ok=True)
+                            s_out.unlink(missing_ok=True)
+                        return s_tbl, elisions, u, s
+
+                    with ThreadPoolExecutor(max_workers=w_cm_eff) as ex:
+                        cm_outs = list(ex.map(_run_cm_shard, enumerate(cm_shards)))
+                    cm_u = sum(x[2] for x in cm_outs)
+                    cm_s = sum(x[3] for x in cm_outs)
+                    all_elisions: set[tuple[str, str, str, int, int]] = set()
+                    for _tbl, elis, _u, _s in cm_outs:
+                        all_elisions |= elis
+                    cm_hits = parse_and_classify_cmsearch_hits(
+                        [x[0] for x in cm_outs],
+                        win_lookup,
+                        selected_entries,
+                        model_clen,
+                        clan_by_acc,
+                        genome,
+                        local_end_elisions=all_elisions,
+                    )
+                cm_wall = time.time() - t3
 
             rrna_and_rfam = reconcile_rrna_and_rfam_candidates(barrnap_hits, cm_hits)
             raw_candidates = sorted(
@@ -1651,7 +1770,7 @@ def ensure_structural_ncrna_raw(
             tot_u = trna_u + bar_u + hmm_u + cm_u
             tot_s = trna_s + bar_s + hmm_s + cm_s
             stage_stats = {
-                "n_selected_models": len(selected_entries),
+                "n_selected_models": n_selected_models,
                 "trnascan_wall_s": round(trna_wall, 3),
                 "trnascan_cpu_s": round(trna_u + trna_s, 3),
                 "barrnap_wall_s": round(bar_wall, 3),
@@ -1675,7 +1794,10 @@ def ensure_structural_ncrna_raw(
         raw_sha = _sha256_cached(raw_json_p)
         tot_wall = time.time() - t_total0
         done_payload = {
-            "status": "ok",
+            "status": asset_info["status"],
+            "stages": stages,
+            "stages_run": stages_run,
+            "missing": asset_info["missing"],
             "ncrna_raw_version": NCRNA_RAW_VERSION,
             "rfam_version": RFAM_PINNED_VERSION,
             "taxon_group": taxon_group,

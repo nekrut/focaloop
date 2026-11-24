@@ -327,7 +327,9 @@ def read_models(path: str | Path, fmt: str | None = None, keep_types: set[str] |
                     t = Transcript(tid=tid, contig=ctg, strand=strand, gid=at.get("gene_id", tid), source=src)
                     tx[tid] = t
                     order.append(tid)
-                gbt = normalize_biotype(at.get("gene_biotype", "") or at.get("transcript_biotype", "") or at.get("biotype", ""))
+                gbt = normalize_biotype(
+                    at.get("transcript_biotype", "") or at.get("gene_biotype", "") or at.get("biotype", "")
+                )
                 if gbt and not t.biotype:
                     t.biotype = gbt
                 if at.get("pseudo", "").lower() == "true":
@@ -342,6 +344,8 @@ def read_models(path: str | Path, fmt: str | None = None, keep_types: set[str] |
                     stops.setdefault(tid, []).append((a, b))
                 elif ftype == "transcript":
                     t.attrs.update(at)
+                    if gbt:
+                        t.biotype = gbt
             else:
                 fid = at.get("ID", "")
                 if fid and "Parent" in at:
@@ -441,7 +445,9 @@ def read_models(path: str | Path, fmt: str | None = None, keep_types: set[str] |
         elif t.biotype:
             t.biotype = normalize_biotype(t.biotype)
         else:
-            t.biotype = normalize_biotype(t.attrs.get("gene_biotype", "") or t.attrs.get("biotype", ""))
+            t.biotype = normalize_biotype(
+                t.attrs.get("transcript_biotype", "") or t.attrs.get("gene_biotype", "") or t.attrs.get("biotype", "")
+            )
         if not t.cds and is_pseudogene_model(t) and not t.biotype.endswith("pseudogene"):
             t.biotype = effective_biotype(t)
         elif not t.cds and not t.biotype:
@@ -577,7 +583,7 @@ def write_gff3(models: Iterable[Transcript], path: str | Path, source: str = "Ge
 
 
 def write_gtf(models: Iterable[Transcript], path: str | Path, cds_only: bool = False, source: str = "GeneLoop") -> int:
-    """Write GTF; with cds_only=True the CDS segments become the exons (CDS-level benchmark)."""
+    """Write GTF with gene_biotype, transcript_biotype, and pseudo attributes."""
     n = 0
     with open(path, "w") as fh:
         for t in sorted(models, key=lambda x: (x.contig, x.start)):
@@ -586,7 +592,15 @@ def write_gtf(models: Iterable[Transcript], path: str | Path, cds_only: bool = F
                 continue
             gid = t.gid or t.tid
             a0, b0 = blocks[0][0], blocks[-1][1]
-            ga = f'gene_id "{gid}"; transcript_id "{t.tid}";'
+            biot = effective_biotype(t)
+            g_biot = normalize_biotype(t.attrs.get("gene_biotype", "")) or biot
+            is_pseudo = is_pseudogene_model(t)
+            ga = (
+                f'gene_id "{gid}"; transcript_id "{t.tid}"; '
+                f'gene_biotype "{g_biot}"; transcript_biotype "{biot}";'
+            )
+            if is_pseudo:
+                ga += ' pseudo "true";'
             fh.write(f"{t.contig}\t{source}\ttranscript\t{a0 + 1}\t{b0}\t.\t{t.strand}\t.\t{ga}\n")
             for a, b in blocks:
                 fh.write(f"{t.contig}\t{source}\texon\t{a + 1}\t{b}\t.\t{t.strand}\t.\t{ga}\n")

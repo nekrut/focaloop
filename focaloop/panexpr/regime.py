@@ -260,14 +260,16 @@ def _parse_chunk(text: str, is_gff3: bool, edge_trim: bool):
             if ftype in ("mRNA", "transcript", "ncRNA", "lnc_RNA", "rRNA", "tRNA", "snRNA", "snoRNA", "primary_transcript"):
                 m = _GFF_ID.search(p[8]); g = _GFF_PARENT.search(p[8])
                 if m:
-                    tx_gene[m.group(1)] = g.group(1).split(",")[0] if g else m.group(1)
+                    tx_gene[m.group(1)] = g.group(1).split(",")[0].strip() if g else m.group(1)
                 continue
             if ftype not in ("exon", "CDS"):
                 continue
             m = _GFF_PARENT.search(p[8])
             if not m:
                 continue
-            tx = m.group(1).split(",")[0]
+            txs = [x.strip() for x in m.group(1).split(",") if x.strip()]
+            if not txs:
+                continue
         else:
             if ftype not in ("exon", "CDS"):
                 continue
@@ -277,14 +279,16 @@ def _parse_chunk(text: str, is_gff3: bool, edge_trim: bool):
             if not tx:
                 continue
             tx_gene.setdefault(tx, gene or tx)
+            txs = [tx]
         try:
             iv = (int(p[3]), int(p[4]))
         except ValueError:
             continue
-        key = f"{p[0]}|{tx}"
-        if key not in exons and key not in cds:
-            order.append(key)
-        (exons if ftype == "exon" else cds).setdefault(key, []).append(iv)
+        for tx in txs:
+            key = f"{p[0]}|{tx}"
+            if key not in exons and key not in cds:
+                order.append(key)
+            (exons if ftype == "exon" else cds).setdefault(key, []).append(iv)
     if edge_trim and len(order) > 2:      # first / last transcript of a sampled chunk may be cut
         order = order[1:-1]
     out = {}
@@ -543,32 +547,115 @@ def read_profile(r1: str | Path | list[str], r2: str | Path | list[str] | None =
 # ---------------------------------------------------------------------------
 
 
-def available_ram_bytes() -> int:
-    """min(cgroup memory.max, SLURM_MEM_PER_NODE, MemAvailable)."""
-    vals = []
-    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
-        try:
-            v = Path(p).read_text().strip()
-            if v.isdigit() and int(v) < (1 << 60):
-                vals.append(int(v))
-        except OSError:
-            pass
+def _parse_mem_mb_env(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    mult = 1 << 20
+    if s[-1] in ("K", "k"):
+        mult = 1 << 10
+        s = s[:-1]
+    elif s[-1] in ("M", "m"):
+        mult = 1 << 20
+        s = s[:-1]
+    elif s[-1] in ("G", "g"):
+        mult = 1 << 30
+        s = s[:-1]
+    elif s[-1] in ("T", "t"):
+        mult = 1 << 40
+        s = s[:-1]
     try:
-        cg = Path("/proc/self/cgroup").read_text().strip().splitlines()
-        for line in cg:
-            rel = line.split(":", 2)[-1]
-            p = Path("/sys/fs/cgroup") / rel.lstrip("/") / "memory.max"
-            if p.exists():
-                v = p.read_text().strip()
-                if v.isdigit():
-                    vals.append(int(v))
+        v = int(float(s) * mult)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
+def _read_cgroup_limit_file(p: Path) -> int | None:
+    try:
+        v = p.read_text().strip()
     except OSError:
-        pass
-    sm = os.environ.get("SLURM_MEM_PER_NODE")
-    if sm and sm.isdigit():
-        vals.append(int(sm) << 20)
+        return None
+    if v.isdigit():
+        iv = int(v)
+        if 0 < iv < (1 << 60):
+            return iv
+    return None
+
+
+def available_ram_bytes(
+    *,
+    _cgroup_root: str | Path = "/sys/fs/cgroup",
+    _proc_cgroup: str | Path = "/proc/self/cgroup",
+    _meminfo: str | Path = "/proc/meminfo",
+    _env: dict[str, str] | None = None,
+) -> int:
+    """min(ancestor cgroup memory.{max,high}, GALAXY_MEMORY_MB, Slurm mem vars, MemAvailable)."""
+    env = os.environ if _env is None else _env
+    vals: list[int] = []
+
+    raw_b = env.get("FOCALOOP_RAM_BYTES")
+    if raw_b and raw_b.strip().isdigit() and int(raw_b.strip()) > 0:
+        vals.append(int(raw_b.strip()))
+    for mb_var in ("FOCALOOP_MEMORY_MB", "GALAXY_MEMORY_MB", "SLURM_MEM_PER_NODE"):
+        parsed_mb = _parse_mem_mb_env(env.get(mb_var))
+        if parsed_mb is not None:
+            vals.append(parsed_mb)
+    per_cpu_b = _parse_mem_mb_env(env.get("SLURM_MEM_PER_CPU"))
+    if per_cpu_b is not None:
+        cpus = 1
+        for cpu_var in ("SLURM_CPUS_PER_TASK", "GALAXY_SLOTS", "SLURM_JOB_CPUS_PER_NODE"):
+            cv = env.get(cpu_var, "").strip()
+            m_cpu = re.match(r"^(\d+)", cv)
+            if m_cpu and int(m_cpu.group(1)) > 0:
+                cpus = int(m_cpu.group(1))
+                break
+        vals.append(per_cpu_b * cpus)
+
+    cg_root = Path(_cgroup_root)
+    for root_file in (
+        cg_root / "memory.max",
+        cg_root / "memory.high",
+        cg_root / "memory" / "memory.limit_in_bytes",
+    ):
+        lim = _read_cgroup_limit_file(root_file)
+        if lim is not None:
+            vals.append(lim)
+
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
+        cg_lines = Path(_proc_cgroup).read_text().strip().splitlines()
+    except OSError:
+        cg_lines = []
+
+    seen_dirs: set[Path] = set()
+    for line in cg_lines:
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        subsys, rel = parts[1], parts[2].strip()
+        if subsys and "memory" not in subsys.split(","):
+            # cgroup v1 non-memory controller line (v2 unified lines have subsys == "")
+            continue
+        roots_to_walk = [cg_root]
+        if (cg_root / "memory").is_dir():
+            roots_to_walk.append(cg_root / "memory")
+        for base in roots_to_walk:
+            cur = (base / rel.lstrip("/")) if rel not in ("", "/") else base
+            while True:
+                if cur not in seen_dirs:
+                    seen_dirs.add(cur)
+                    for fname in ("memory.max", "memory.high", "memory.limit_in_bytes"):
+                        lim = _read_cgroup_limit_file(cur / fname)
+                        if lim is not None:
+                            vals.append(lim)
+                if cur == base or cur.parent == cur:
+                    break
+                cur = cur.parent
+
+    try:
+        for line in Path(_meminfo).read_text().splitlines():
             if line.startswith("MemAvailable:"):
                 vals.append(int(line.split()[1]) << 10)
     except OSError:
@@ -662,16 +749,25 @@ def _resolve_probe_reads(
     return _first_reads_with_quals(r1, n_probe)
 
 
-def _find_transcript_sibling(fasta_path: Path, ipc_index_dir: Path | None) -> Path | None:
-    candidates = [
+def _find_transcript_sibling(
+    fasta_path: Path,
+    ipc_index_dir: Path | None,
+    transcript_fasta: str | Path | None = None,
+) -> Path | None:
+    candidates: list[Path] = []
+    if transcript_fasta is not None:
+        candidates.append(Path(transcript_fasta))
+    candidates.extend([
         fasta_path.parent / "transcripts.fa",
         fasta_path.parent / "transcripts.fa.gz",
         fasta_path.parent / "cdna.fa",
         fasta_path.parent / "cdna.fa.gz",
-    ]
+    ])
     if ipc_index_dir is not None:
         candidates.extend([
+            ipc_index_dir / "targets.fna",
             ipc_index_dir / "transcripts.fa",
+            ipc_index_dir.parent / "targets.fna",
             ipc_index_dir.parent / "transcripts.fa",
         ])
     for cand in candidates:
@@ -680,23 +776,58 @@ def _find_transcript_sibling(fasta_path: Path, ipc_index_dir: Path | None) -> Pa
     return None
 
 
+def _estimate_ipc_index_ram_bytes(seq_bp: int) -> int:
+    """Conservative upper bound on in-process ReferenceIslandPCIndex build RSS (~64 B/bp + 32 MiB)."""
+    return int(64 * max(0, int(seq_bp)) + (32 << 20))
+
+
+def _spliced_contigs_for_probe(
+    asm: AssemblyInput,
+    idx_dir: Path | None,
+    transcript_fasta: str | Path | None,
+    max_bp: int,
+) -> tuple[list[str], str]:
+    tx_fa = _find_transcript_sibling(Path(asm.fasta), idx_dir, transcript_fasta=transcript_fasta)
+    if tx_fa is not None:
+        contigs = _read_all_fasta_contigs(tx_fa, max_total_bp=max_bp)
+        if contigs:
+            return contigs, "built_transcript_sibling"
+    annot_p = Path(asm.annotation)
+    if annot_p.exists():
+        from .catalog import AssemblySpec, build_spliced_transcripts
+
+        txs = build_spliced_transcripts(AssemblySpec(assembly_id=asm.assembly_id, fasta=asm.fasta, annotation=asm.annotation))
+        contigs = [t.seq for t in txs if len(t.seq) >= 31]
+        if sum(len(c) for c in contigs) <= max_bp and contigs:
+            return contigs, "built_spliced_transcripts"
+    return [], "none"
+
+
 def _run_island_pc_router(
     assemblies: Sequence[AssemblyInput],
     genomes: list[GenomeFeatures],
     r1: str | Path | list[str],
     r2: str | Path | list[str] | None,
     *,
+    annots: Sequence[AnnotationFeatures] | None = None,
     spliced: bool,
     strict: bool,
     n_probe: int = 2000,
     ipc_index: object = None,
     ipc_index_dir: str | Path | None = None,
+    ram_budget_bytes: int | None = None,
+    transcript_fasta: str | Path | None = None,
+    persist_ipc_cache: bool = False,
 ) -> dict:
     from .island_pc_router import (
+        K_DEFAULT,
+        S_DEFAULT,
         ReferenceIslandPCIndex,
+        blanca_variance_ci,
         pack_read_batch,
         route_pangenome_wave0,
     )
+    import numpy as np
 
     t0 = time.perf_counter()
     seqs, quals = _resolve_probe_reads(r1, r2, n_probe=n_probe)
@@ -704,13 +835,16 @@ def _run_island_pc_router(
         return {"status": "skipped_no_reads", "pseudoaligners_disqualified": False}
     batch = pack_read_batch(seqs, quals=quals)
     idx_dir = Path(ipc_index_dir) if ipc_index_dir is not None else None
-    if idx_dir is not None:
+    if idx_dir is not None and persist_ipc_cache:
         idx_dir.mkdir(parents=True, exist_ok=True)
+
+    budget = int(ram_budget_bytes if ram_budget_bytes is not None else available_ram_bytes())
+    max_probe_ram = max(32 << 20, int(0.35 * budget))
+    max_auto_build_bp = 120_000_000
 
     loaded_indices: dict[str, ReferenceIslandPCIndex] = {}
     owned_indices: list[ReferenceIslandPCIndex] = []
     index_source = "none"
-    max_auto_build_bp = 120_000_000
 
     try:
         if isinstance(ipc_index, ReferenceIslandPCIndex):
@@ -731,7 +865,6 @@ def _run_island_pc_router(
                     owned_indices.append(idx)
             index_source = "pre_serialized_map"
         else:
-            # Check pre-serialized cache first (<5 ms load), otherwise build when compact.
             single_idx = (idx_dir / "island_pc.idx") if (idx_dir is not None and len(assemblies) == 1) else None
             all_cached = idx_dir is not None and all(
                 (idx_dir / f"{a.assembly_id}.ipc.idx").exists() for a in assemblies
@@ -747,40 +880,151 @@ def _run_island_pc_router(
                 loaded_indices[assemblies[0].assembly_id] = idx
                 owned_indices.append(idx)
                 index_source = "pre_serialized_cache"
-            elif all(g.genome_bp <= max_auto_build_bp for g in genomes):
-                for a in assemblies:
-                    cache_p = (idx_dir / f"{a.assembly_id}.ipc.idx") if idx_dir is not None else None
-                    if cache_p is not None and cache_p.exists():
-                        idx = ReferenceIslandPCIndex.load(cache_p)
+            else:
+                # Stream assembly-by-assembly so multi-strain probes never hold N native hash tables simultaneously
+                lag_pairs = np.zeros(K_DEFAULT - 1, dtype=np.uint64)
+                if batch.n_reads > 0:
+                    if batch.offsets is None:
+                        m_w = max(0, int(batch.lengths[0]) - K_DEFAULT + 1)
+                        for d in range(1, K_DEFAULT):
+                            lag_pairs[d - 1] = batch.n_reads * max(0, m_w - d)
                     else:
-                        contigs = _read_all_fasta_contigs(Path(a.fasta), max_total_bp=max_auto_build_bp)
-                        if not contigs:
-                            continue
-                        idx = ReferenceIslandPCIndex(contigs, compute_dense_d1=False)
-                        if cache_p is not None:
-                            idx.save(cache_p)
-                    loaded_indices[a.assembly_id] = idx
-                    owned_indices.append(idx)
-                index_source = "built_compact_genome"
-            elif spliced:
-                prim_a = assemblies[0]
-                cache_p = (idx_dir / f"{prim_a.assembly_id}.ipc.idx") if idx_dir is not None else None
-                if cache_p is not None and cache_p.exists():
-                    idx = ReferenceIslandPCIndex.load(cache_p)
-                    loaded_indices[prim_a.assembly_id] = idx
-                    owned_indices.append(idx)
-                    index_source = "pre_serialized_cache"
+                        m_wins = np.maximum(0, batch.lengths.astype(np.int64) - K_DEFAULT + 1)
+                        for d in range(1, K_DEFAULT):
+                            lag_pairs[d - 1] = int(np.maximum(0, m_wins - d).sum())
+
+                per_asm_stream: dict[str, dict] = {}
+                skipped_ram_need: int | None = None
+                for i_a, (a, g) in enumerate(zip(assemblies, genomes)):
+                    est_bp = (
+                        annots[i_a].cdna_bp
+                        if (spliced and annots is not None and i_a < len(annots) and annots[i_a].cdna_bp > 0)
+                        else g.genome_bp
+                    )
+                    need_ram = _estimate_ipc_index_ram_bytes(est_bp)
+                    if need_ram > max_probe_ram:
+                        skipped_ram_need = max(skipped_ram_need or 0, need_ram)
+                        continue
+                    cache_p = (idx_dir / f"{a.assembly_id}.ipc.idx") if (idx_dir is not None and idx_dir.exists()) else None
+                    idx_one: ReferenceIslandPCIndex | None = None
+                    try:
+                        if cache_p is not None and cache_p.exists():
+                            idx_one = ReferenceIslandPCIndex.load(cache_p)
+                            src_one = "pre_serialized_cache"
+                        elif spliced:
+                            # Never probe spliced RNA-seq reads against intron-containing genomic contigs (L24)
+                            if g.genome_bp > max_auto_build_bp and transcript_fasta is None and _find_transcript_sibling(Path(a.fasta), idx_dir) is None:
+                                continue
+                            contigs, src_one = _spliced_contigs_for_probe(
+                                a,
+                                idx_dir,
+                                transcript_fasta=(transcript_fasta if i_a == 0 else None),
+                                max_bp=min(700_000_000, max(1, (max_probe_ram - (32 << 20)) // 64)),
+                            )
+                            if not contigs:
+                                continue
+                            actual_ram = _estimate_ipc_index_ram_bytes(sum(len(c) for c in contigs))
+                            if actual_ram > max_probe_ram:
+                                skipped_ram_need = max(skipped_ram_need or 0, actual_ram)
+                                continue
+                            idx_one = ReferenceIslandPCIndex(contigs, compute_dense_d1=False)
+                            if persist_ipc_cache and idx_dir is not None:
+                                idx_one.save(idx_dir / f"{a.assembly_id}.ipc.idx")
+                        else:
+                            if g.genome_bp > max_auto_build_bp:
+                                continue
+                            contigs = _read_all_fasta_contigs(
+                                Path(a.fasta),
+                                max_total_bp=min(max_auto_build_bp, max(1, (max_probe_ram - (32 << 20)) // 64)),
+                            )
+                            if not contigs:
+                                continue
+                            actual_ram = _estimate_ipc_index_ram_bytes(sum(len(c) for c in contigs))
+                            if actual_ram > max_probe_ram:
+                                skipped_ram_need = max(skipped_ram_need or 0, actual_ram)
+                                continue
+                            idx_one = ReferenceIslandPCIndex(contigs, compute_dense_d1=False)
+                            src_one = "built_compact_genome"
+                            if persist_ipc_cache and idx_dir is not None:
+                                idx_one.save(idx_dir / f"{a.assembly_id}.ipc.idx")
+
+                        index_source = src_one
+                        sum_one = idx_one.classify_reads(
+                            batch, spliced=spliced, strict_tie_gate=(strict or len(assemblies) > 1),
+                        )
+                        ci_one = blanca_variance_ci(
+                            sum_one.syncmer_probe_novel,
+                            sum_one.syncmer_probe_total,
+                            k=K_DEFAULT,
+                            s=S_DEFAULT,
+                            is_syncmer=True,
+                            d1_bar=idx_one.info.d1_sync_bar,
+                            lag_pairs=lag_pairs,
+                            total_windows=sum_one.total_kmer_windows,
+                        )
+                        per_asm_stream[a.assembly_id] = {
+                            "r_hat": ci_one.r_hat,
+                            "ci_low": ci_one.ci_low_overlap,
+                            "ci_high": ci_one.ci_high_overlap,
+                            "ci_overlap": (ci_one.ci_low_overlap, ci_one.ci_high_overlap),
+                            "ci_binom": (ci_one.ci_low_binom, ci_one.ci_high_binom),
+                            "summary": sum_one,
+                        }
+                    finally:
+                        if idx_one is not None:
+                            idx_one.close()
+
+                if not per_asm_stream:
+                    if skipped_ram_need is not None:
+                        return {
+                            "status": "skipped_ram_budget",
+                            "pseudoaligners_disqualified": False,
+                            "predicted_ipc_ram_bytes": int(skipped_ram_need),
+                            "ram_budget_bytes": int(budget),
+                            "wall_ms": round((time.perf_counter() - t0) * 1e3, 3),
+                        }
+                    return {
+                        "status": "skipped_large_genome_no_preserialized_index",
+                        "pseudoaligners_disqualified": False,
+                        "wall_ms": round((time.perf_counter() - t0) * 1e3, 3),
+                    }
+
+                pangenome_verdict = None
+                if len(per_asm_stream) > 1:
+                    leader = min(per_asm_stream, key=lambda aid: per_asm_stream[aid]["r_hat"])
+                    leader_hi = per_asm_stream[leader]["ci_high"]
+                    retained = [aid for aid, st in per_asm_stream.items() if st["ci_low"] <= leader_hi]
+                    eliminated = [aid for aid in per_asm_stream if aid not in retained]
+                    strictly_sep = len(retained) == 1
+                    summary = per_asm_stream[leader]["summary"]
+                    pangenome_verdict = {
+                        "leader": leader,
+                        "retained_assemblies": retained,
+                        "eliminated_assemblies": eliminated,
+                        "strictly_separated": strictly_sep,
+                        "multi_assembly_zoom_triggered": not strictly_sep,
+                        "assemblies": {
+                            aid: {
+                                "r_hat": float(st["r_hat"]),
+                                "ci_low": float(st["ci_low"]),
+                                "ci_high": float(st["ci_high"]),
+                                "ci_overlap": [float(st["ci_overlap"][0]), float(st["ci_overlap"][1])],
+                                "ci_binom": [float(st["ci_binom"][0]), float(st["ci_binom"][1])],
+                            }
+                            for aid, st in per_asm_stream.items()
+                        },
+                    }
                 else:
-                    tx_fa = _find_transcript_sibling(Path(prim_a.fasta), idx_dir)
-                    if tx_fa is not None:
-                        contigs = _read_all_fasta_contigs(tx_fa, max_total_bp=700_000_000)
-                        if contigs:
-                            idx = ReferenceIslandPCIndex(contigs, compute_dense_d1=False)
-                            if cache_p is not None:
-                                idx.save(cache_p)
-                            loaded_indices[prim_a.assembly_id] = idx
-                            owned_indices.append(idx)
-                            index_source = "built_transcript_sibling"
+                    summary = next(iter(per_asm_stream.values()))["summary"]
+
+                verdict_dict = summary.as_dict()
+                verdict_dict["status"] = "ok"
+                verdict_dict["index_source"] = index_source
+                verdict_dict["total_router_wall_ms"] = round((time.perf_counter() - t0) * 1e3, 3)
+                verdict_dict["pseudoaligners_disqualified"] = bool(summary.routing.pseudoaligners_disqualified)
+                if pangenome_verdict is not None:
+                    verdict_dict["pangenome_wave0"] = pangenome_verdict
+                return verdict_dict
 
         if not loaded_indices:
             return {
@@ -837,6 +1081,8 @@ def classify(
     use_island_pc_router: bool = False,
     ipc_index: object = None,
     ipc_index_dir: str | Path | None = None,
+    transcript_fasta: str | Path | None = None,
+    persist_ipc_cache: bool = False,
 ) -> RegimeDecision:
     """Measure the five regimes and return catalog settings + the pre-tournament candidate list."""
     t0 = time.time()
@@ -883,11 +1129,15 @@ def classify(
             genomes,
             r1,
             r2,
+            annots=annots,
             spliced=spliced,
             strict=strict,
             n_probe=max(2000, int(n_reads)),
             ipc_index=ipc_index,
             ipc_index_dir=ipc_index_dir,
+            ram_budget_bytes=budget,
+            transcript_fasta=transcript_fasta,
+            persist_ipc_cache=persist_ipc_cache,
         )
         pseudoaligners_disqualified = bool(router_verdict.get("pseudoaligners_disqualified", False))
         if router_verdict.get("status") == "ok":

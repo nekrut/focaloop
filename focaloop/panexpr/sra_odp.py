@@ -214,6 +214,9 @@ class XsraRunStream:
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
         self.retries = 0
+        self.total_retries = 0
+        self.failed = False
+        self.last_stderr = ""
         self.used_fallback = False
         self.consumed_spots = 0          # discovery spots served to the loop
         self.dropped_holdout_spots = 0   # spots read from the pipe and discarded (holdout partition)
@@ -223,6 +226,8 @@ class XsraRunStream:
         self._custom_line_source = line_source is not None
         self._lines = line_source        # iterator of FASTQ lines (tests); default: xsra subprocess stdout
         self._proc = None
+        self._stderr_fh = None
+        self._spot_at_spawn = 0
         self._in_advance = False
         self._done = False
         self._last_dropped = -1
@@ -257,13 +262,37 @@ class XsraRunStream:
     def exhausted(self) -> bool:
         if self._fallback_stream is not None:
             return self._fallback_stream.exhausted
-        return self._done and not self._carry
+        return self._done and not self.failed and not self._carry
+
+    def _capture_stderr_tail(self) -> None:
+        fh = self._stderr_fh
+        self._stderr_fh = None
+        if fh is None:
+            return
+        try:
+            fh.seek(0)
+            raw = fh.read()
+            txt = (raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)).strip()
+            if txt:
+                self.last_stderr = " | ".join(txt.splitlines()[-6:])[-600:]
+        except Exception:
+            pass
+        finally:
+            try:
+                fh.close()
+            except Exception:
+                pass
 
     def _spawn_proc(self):
+        import tempfile as _tf
+
+        self._capture_stderr_tail()
+        self._stderr_fh = _tf.SpooledTemporaryFile(max_size=65536, mode="w+b")
+        self._spot_at_spawn = self._last_raw_spot
         return subprocess.Popen(
             xsra_dump_command(self.run.run_id, None, self.threads),
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._stderr_fh,
             bufsize=0,
         )
 
@@ -337,6 +366,7 @@ class XsraRunStream:
         proc = self._proc
         self._proc = None
         if proc is None:
+            self._capture_stderr_tail()
             return
         try:
             if proc.stdout is not None:
@@ -349,6 +379,7 @@ class XsraRunStream:
             proc.wait(timeout=2)
         except Exception:
             pass
+        self._capture_stderr_tail()
 
     def _reap_proc(self) -> int | None:
         with XsraRunStream._PROC_COND:
@@ -356,6 +387,7 @@ class XsraRunStream:
                 XsraRunStream._ACTIVE_STREAMS.remove(self)
                 XsraRunStream._PROC_COND.notify_all()
         if self._proc is None:
+            self._capture_stderr_tail()
             return None
         proc = self._proc
         self._proc = None
@@ -365,13 +397,15 @@ class XsraRunStream:
         except Exception:
             pass
         try:
-            return proc.wait(timeout=5)
+            rc = proc.wait(timeout=5)
         except Exception:
             try:
                 proc.kill()
-                return proc.wait(timeout=2)
+                rc = proc.wait(timeout=2)
             except Exception:
-                return -1
+                rc = -1
+        self._capture_stderr_tail()
+        return rc
 
     def _activate_fallback_if_available(self) -> bool:
         if self._last_raw_spot > 0:
@@ -425,30 +459,52 @@ class XsraRunStream:
             if not batch or idx + 3 >= len(batch):
                 rem_lines = batch[idx:] if batch and idx < len(batch) else []
                 nxt = self._read_pipe_chunk()
+                max_total_restarts = max(32, self.max_retries * 16)
                 if nxt == b"__TIMEOUT__":
                     self._bin_batch = []
                     self._bin_idx = 0
-                    if self.retries < self.max_retries:
+                    if self._last_raw_spot > self._spot_at_spawn:
+                        self.retries = 0
+                        self._spot_at_spawn = self._last_raw_spot
+                    if self.retries < self.max_retries and self.total_retries < max_total_restarts:
                         self.retries += 1
+                        self.total_retries += 1
                         if self.retry_backoff_s > 0:
                             time.sleep(min(2.0, self.retry_backoff_s * (2 ** (self.retries - 1))))
                         continue
                     if self._activate_fallback_if_available():
                         return None
-                    self._done = True
-                    return None
+                    self.failed = True
+                    err_note = f": {self.last_stderr}" if self.last_stderr else ""
+                    raise RuntimeError(
+                        f"xsra stream stalled/timed out for {self.run.run_id} at spot {self._last_raw_spot}/{self.plan.n_spots} "
+                        f"after {self.retries} consecutive retries{err_note}"
+                    )
                 if nxt is None:
                     rc = self._reap_proc()
                     self._bin_batch = []
                     self._bin_idx = 0
-                    premature = (rc not in (0, None)) or (self._last_raw_spot == 0 and self.plan.n_spots > 0)
-                    if premature and self.retries < self.max_retries:
+                    if self._last_raw_spot > self._spot_at_spawn:
+                        self.retries = 0
+                        self._spot_at_spawn = self._last_raw_spot
+                    spots_seen = max(self._last_raw_spot, self.consumed_spots + self.dropped_holdout_spots)
+                    short_eof = self.plan.n_spots >= 20 and spots_seen < int(0.90 * self.plan.n_spots)
+                    premature = (rc not in (0, None)) or (self._last_raw_spot == 0 and self.plan.n_spots > 0) or short_eof
+                    if premature and self.retries < self.max_retries and self.total_retries < max_total_restarts:
                         self.retries += 1
+                        self.total_retries += 1
                         if self.retry_backoff_s > 0:
                             time.sleep(min(2.0, self.retry_backoff_s * (2 ** (self.retries - 1))))
                         continue
                     if premature and self._activate_fallback_if_available():
                         return None
+                    if premature:
+                        self.failed = True
+                        err_note = f": {self.last_stderr}" if self.last_stderr else ""
+                        raise RuntimeError(
+                            f"xsra stream ended prematurely for {self.run.run_id} (rc={rc}, spot {spots_seen}/{self.plan.n_spots}) "
+                            f"after {self.retries} consecutive retries{err_note}"
+                        )
                     self._done = True
                     return None
                 batch = (rem_lines + nxt) if rem_lines else nxt
@@ -518,6 +574,9 @@ class XsraRunStream:
                     self._last_dropped = spot
                 if spot > self._last_raw_spot:
                     self._last_raw_spot = spot
+                    if spot > self._spot_at_spawn:
+                        self.retries = 0
+                        self._spot_at_spawn = spot
                 self._mark_spot_done(spot)
                 continue                                    # holdout: never leaves this class
             if pending:
@@ -557,6 +616,9 @@ class XsraRunStream:
             self.served_spot_ids.append(spot)
         if spot > self._last_raw_spot:
             self._last_raw_spot = spot
+            if spot > self._spot_at_spawn:
+                self.retries = 0
+                self._spot_at_spawn = spot
         self._mark_spot_done(spot)
         if paired:
             if len(recs) >= 2:

@@ -14,6 +14,7 @@
     <expand macro="requirements"/>
     <version_command>focaloop --version</version_command>
     <command detect_errors="aggressive"><![CDATA[
+FOCALOOP_DEDUP_MODE='$calling_options.dedup'
 focaloop variationloop
     --analysis-mode 'auto'
     #if str($ref_source.source) == "cached"
@@ -37,7 +38,7 @@ focaloop variationloop
         #end for
         --read-ids
         #for $pair in $input_source.paired_reads
-            '${str($pair.element_identifier).replace("'", "_")}'
+            '${(str($pair.element_identifier).replace("'", "_").lstrip("-") or "sample")}'
         #end for
         #if $input_source.group_sheet
             --manifest '$input_source.group_sheet'
@@ -50,7 +51,7 @@ focaloop variationloop
         #end for
         --bam-ids
         #for $b in $input_source.bam
-            '${str($b.element_identifier).replace("'", "_")}'
+            '${(str($b.element_identifier).replace("'", "_").lstrip("-") or "sample")}'
         #end for
         --crai
         #for $idx, $b in enumerate($input_source.bam)
@@ -95,6 +96,9 @@ focaloop variationloop
     --min-bq $calling_options.min_bq
     --snv-min-qual $calling_options.snv_min_qual
     --indel-min-qual $calling_options.indel_min_qual
+    #if str($calling_options.dedup) == "off"
+        --dedup-bits 0
+    #end if
     @THREADS@
     --state-dir variationloop_state_dir
     --state-archive '$variationloop_state'
@@ -105,10 +109,12 @@ focaloop variationloop
     <configfiles>
         <configfile name="inline_var_manifest_tsv"><![CDATA[#if str($input_source.source_type) == "public_sra" and str($input_source.sra_input.mode) == "accessions"
 sample_id	group	source
+#set $seen_accs = set()
 #set $raw_accs = str($input_source.sra_input.sra_accessions).replace('__cn__', ' ').replace('__cr__', ' ').replace('__tt__', ' ').replace(',', ' ').replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
 #for $acc in $raw_accs.split()
 #set $a = $acc.strip().upper()
-#if $a
+#if $a and $a not in $seen_accs
+#silent $seen_accs.add($a)
 ${a}	cohort	${a}
 #end if
 #end for
@@ -116,10 +122,12 @@ ${a}	cohort	${a}
 sample_id	group	source
 #for $grp in $input_source.sra_input.sample_groups
 #set $gname = str($grp.group_name).strip()
+#set $seen_grp = set()
 #set $raw_accs = str($grp.accessions).replace('__cn__', ' ').replace('__cr__', ' ').replace('__tt__', ' ').replace(',', ' ').replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
 #for $acc in $raw_accs.split()
 #set $a = $acc.strip().upper()
-#if $a
+#if $a and $a not in $seen_grp
+#silent $seen_grp.add($a)
 ${a}	${gname}	${a}
 #end if
 #end for
@@ -261,6 +269,11 @@ ${a}	${gname}	${a}
             <param argument="--min-bq" type="integer" min="0" max="45" value="13" label="Minimum base quality (Phred)" help="Individual read bases with Phred quality below this cutoff are excluded from allele counts."/>
             <param argument="--snv-min-qual" type="float" min="0.0" max="200.0" value="20.0" label="Minimum SNV quality score (QUAL)" help="Minimum Phred-scaled variant quality required to report a single-nucleotide variant."/>
             <param argument="--indel-min-qual" type="float" min="0.0" max="200.0" value="15.0" label="Minimum indel quality score (QUAL)" help="Minimum Phred-scaled variant quality required to report an insertion or deletion."/>
+            <param name="dedup" type="select" label="PCR duplicate removal" help="Removes optical and PCR duplicate read pairs sharing identical alignment coordinates and template length. Set to Off for targeted PCR amplicon sequencing where distinct molecules share identical primer endpoints.">
+                <option value="auto" selected="true">Automatic (remove duplicates and warn on amplicon-like libraries)</option>
+                <option value="on">On (always remove PCR duplicates)</option>
+                <option value="off">Off (keep all fragments for targeted PCR amplicon libraries)</option>
+            </param>
         </section>
     </inputs>
     <outputs>
