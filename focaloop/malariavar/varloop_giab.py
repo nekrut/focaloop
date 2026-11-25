@@ -1766,7 +1766,7 @@ def write_diploid_vcf(
     n_written = 0
     with open(tmp_vcf, "w") as f:
         f.write("##fileformat=VCFv4.2\n")
-        f.write("##source=FocaloopVariationLoop-0.4.0\n")
+        f.write("##source=FocaloopVariationLoop-0.4.1\n")
         f.write('##FILTER=<ID=PASS,Description="All filters passed">\n')
         for cid in range(len(g.names)):
             f.write(f"##contig=<ID={g.names[cid]},length={int(g.lengths[cid])}>\n")

@@ -1,4 +1,4 @@
-# Pinned conda environment for Focaloop 0.4.0 (ghcr.io/nekrut/focaloop:0.4.0 / focaloop_0.4.0.sif)
+# Pinned conda environment for Focaloop 0.4.1 (ghcr.io/nekrut/focaloop:0.4.1 / focaloop_0.4.1.sif)
 name: focaloop
 channels:
   - conda-forge

@@ -335,7 +335,7 @@ def test_variationloop_logan_unitigs_end_to_end_and_warm_query(tmp_path):
         out_vcf=vcf_out,
         out_report=rep_out,
     )
-    assert meta["version"] == "0.4.0"
+    assert meta["version"] == "0.4.1"
     assert meta["mode"] == "logan_unitigs"
     tsv = var_out.read_text(encoding="utf-8")
     assert "SNV" in tsv

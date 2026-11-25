@@ -417,7 +417,7 @@ def _ipv4_session():
 
     _conn.allowed_gai_family = lambda: socket.AF_INET  # type: ignore[assignment]
     s = requests.Session()
-    s.headers["User-Agent"] = "focaloop/0.4.0"
+    s.headers["User-Agent"] = "focaloop/0.4.1"
     return s
 
 
@@ -871,7 +871,7 @@ def _write_pathogen_vcf(
     samples = sorted(calls_df["sample_id"].astype(str).unique().tolist()) if not calls_df.empty else ["SAMPLE"]
     lines: list[str] = [
         "##fileformat=VCFv4.2",
-        "##source=Focaloop_VariationLoop_v0.4.0",
+        "##source=Focaloop_VariationLoop_v0.4.1",
         '##FILTER=<ID=PASS,Description="All filters passed">',
     ]
     for cid in range(len(g.names)):
@@ -1797,7 +1797,7 @@ def _run_pf3d7_surveillance(
     tel_by_sample = tel_df.drop_duplicates("sample", keep="last").set_index("sample").to_dict(orient="index") if not tel_df.empty else {}
     state_meta = {
         "engine": "malariavar",
-        "version": "0.4.0",
+        "version": "0.4.1",
         "blueprint_id": "malariavar",
         "mode": eff_mode,
         "summary": summary_stats,
@@ -2769,7 +2769,7 @@ def run_variationloop_galaxy(
             )
         state_meta = {
             "engine": "variationloop",
-            "version": "0.4.0",
+            "version": "0.4.1",
             "blueprint_id": "variationloop",
             "mode": eff_mode,
             "ploidy": eff_ploidy,

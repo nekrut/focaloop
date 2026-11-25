@@ -1,6 +1,6 @@
 """Shared 5-stage Focaloop core schemas and next-horizon capability hooks."""
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 from .hooks import (
     BaitHitSummary,

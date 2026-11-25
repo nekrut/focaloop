@@ -1,11 +1,11 @@
-# ghcr.io/nekrut/focaloop:0.4.0
+# ghcr.io/nekrut/focaloop:0.4.1
 #
 # Standalone multi-stage Docker build (no host-staged files required):
-#   docker build -f container/Dockerfile -t ghcr.io/nekrut/focaloop:0.4.0 .
+#   docker build -f container/Dockerfile -t ghcr.io/nekrut/focaloop:0.4.1 .
 # Convert to Apptainer/Singularity SIF for CVMFS/Galaxy:
-#   apptainer build focaloop_0.4.0.sif docker-daemon://ghcr.io/nekrut/focaloop:0.4.0
+#   apptainer build focaloop_0.4.1.sif docker-daemon://ghcr.io/nekrut/focaloop:0.4.1
 # Or build the SIF directly from container/Apptainer.def:
-#   apptainer build focaloop_0.4.0.sif container/Apptainer.def
+#   apptainer build focaloop_0.4.1.sif container/Apptainer.def
 
 FROM ubuntu:24.04 AS xsra_builder
 
@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 FROM mambaorg/micromamba:2.0.5-ubuntu24.04
 
 LABEL org.opencontainers.image.title="focaloop" \
-      org.opencontainers.image.version="0.4.0" \
+      org.opencontainers.image.version="0.4.1" \
       org.opencontainers.image.description="Adaptive streaming genomics tools for ExpressionLoop, VariationLoop, GeneLoop, and Focaloop Query" \
       org.opencontainers.image.source="https://github.com/nekrut/focaloop" \
       org.opencontainers.image.licenses="MIT"
@@ -91,7 +91,7 @@ RUN set -eu; \
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/chlorophyta.tar.gz" "chlorophyta_weights"; \
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/diatoms_unmasked.tar.gz" "diatoms_weights"
 
-# Install Focaloop 0.4.0 and precompile all portable (-msse4.2 -mpopcnt) C99/OpenMP binaries & libs
+# Install Focaloop 0.4.1 and precompile all portable (-msse4.2 -mpopcnt) C99/OpenMP binaries & libs
 COPY --chown=$MAMBA_USER:$MAMBA_USER pyproject.toml MANIFEST.in README.md Makefile /opt/focaloop/src/
 COPY --chown=$MAMBA_USER:$MAMBA_USER scripts /opt/focaloop/src/scripts
 COPY --chown=$MAMBA_USER:$MAMBA_USER blueprints /opt/focaloop/src/blueprints

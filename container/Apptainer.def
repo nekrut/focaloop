@@ -2,9 +2,9 @@ Bootstrap: docker
 From: ubuntu:24.04
 Stage: xsra_builder
 
-# Standalone multi-stage Apptainer definition for Focaloop 0.4.0 (usegalaxy.org / CVMFS ready).
+# Standalone multi-stage Apptainer definition for Focaloop 0.4.1 (usegalaxy.org / CVMFS ready).
 # Build from repository root with zero host-staged dependencies:
-#   APPTAINER_TMPDIR=/tmp apptainer build focaloop_0.4.0.sif container/Apptainer.def
+#   APPTAINER_TMPDIR=/tmp apptainer build focaloop_0.4.1.sif container/Apptainer.def
 
 %post
     set -eux
@@ -24,7 +24,7 @@ Stage: runtime
 
 %labels
     Title focaloop
-    Version 0.4.0
+    Version 0.4.1
     Description Adaptive streaming genomics tools for ExpressionLoop, VariationLoop, GeneLoop, and Focaloop Query
     Source https://github.com/nekrut/focaloop
     License MIT
@@ -115,7 +115,7 @@ Stage: runtime
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/chlorophyta.tar.gz" "chlorophyta_weights"
     unpack_weights "https://bioinf.uni-greifswald.de/bioinf/tiberius/models/diatoms_unmasked.tar.gz" "diatoms_weights"
 
-    # Install Focaloop 0.4.0 and precompile all portable (-msse4.2 -mpopcnt) C99/OpenMP binaries & libs
+    # Install Focaloop 0.4.1 and precompile all portable (-msse4.2 -mpopcnt) C99/OpenMP binaries & libs
     mkdir -p /opt/focaloop/native_cache
     (cd /opt/focaloop/src && FOCALOOP_PORTABLE_ISA=1 make install-native PREFIX=/opt/conda PYTHON=python)
     python -m pip install --no-deps --no-cache-dir /opt/focaloop/src

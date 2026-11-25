@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "focaloop"
-version = "0.4.0"
+version = "0.4.1"
 description = "Byte-budgeted focal-loop analysis of INSDC reads: blueprints, 3-tier range streaming, kernel tournament, EM conditioning, stop gate, and Galaxy packaging."
 readme = "README.md"
 requires-python = ">=3.10"

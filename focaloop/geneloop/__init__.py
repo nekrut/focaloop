@@ -31,7 +31,7 @@ from .seed import (
     safe_lock_miniprot_loci,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 def prebuild_native_libs() -> dict[str, str]:

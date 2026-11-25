@@ -214,7 +214,7 @@ def _ipv4_session():
 
     _conn.allowed_gai_family = lambda: socket.AF_INET  # type: ignore[assignment]
     s = requests.Session()
-    s.headers["User-Agent"] = "focaloop/0.4.0"
+    s.headers["User-Agent"] = "focaloop/0.4.1"
     return s
 
 
@@ -1120,7 +1120,7 @@ def run_expressionloop_galaxy(
         catalog.save(cat_dir)
         write_json(cat_dir / "link_stats.json", catalog.link_stats)
 
-        # 0.4.0 Logan unitig streaming branch for genuine public INSDC SRA/ENA cohorts (L14)
+        # 0.4.1 Logan unitig streaming branch for genuine public INSDC SRA/ENA cohorts (L14)
         eff_logan_mode = str(logan_mode or "auto").strip().lower()
         if eff_logan_mode not in ("auto", "logan_only", "off"):
             raise ValueError(f"Unsupported logan_mode {logan_mode!r} - expected 'auto', 'logan_only', or 'off'")
@@ -1236,7 +1236,7 @@ def run_expressionloop_galaxy(
                         _init_empty_ledger(store, alpha_budget=0.05)
                         state_meta = {
                             "engine": "panexpr",
-                            "version": "0.4.0",
+                            "version": "0.4.1",
                             "blueprint_id": "panexpr",
                             "primary_contrast": contrast_list,
                             "design": design,
@@ -1604,7 +1604,7 @@ def run_expressionloop_galaxy(
         _init_empty_ledger(store, alpha_budget=0.05)
         state_meta = {
             "engine": "panexpr",
-            "version": "0.4.0",
+            "version": "0.4.1",
             "blueprint_id": "panexpr",
             "primary_contrast": contrast_list,
             "design": design,
